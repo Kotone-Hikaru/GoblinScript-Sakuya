@@ -1299,6 +1299,9 @@ struct FunMeta<'a> {
     filler: Vec<[i64; 2]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     artifacts: Vec<[i64; 2]>,
+    /// the run-share phase reading of a composed decode (style::PhaseRuns)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_runs: Option<style::PhaseRuns>,
 }
 
 /// The seed a style decodes at on this model: the params' own, or the
@@ -1389,6 +1392,8 @@ struct Styled {
     /// ms ranges whose action sequence reads hot under the rarity prior
     artifacts: Vec<[i64; 2]>,
     art_rate: f64,
+    /// the composed decode's run-share phase reading
+    phase_runs: Option<style::PhaseRuns>,
 }
 
 /// Compose + shape + write: everything downstream of the head's tracks.
@@ -1419,6 +1424,7 @@ fn write_styled(path: &Path, s: &Styled, man: &bundle::Manifest, p: &style::Para
             settings: style::flags_line(p),
             filler: s.filler.clone(),
             artifacts: s.artifacts.clone(),
+            phase_runs: s.phase_runs,
         },
         actions: &s.actions,
     };
@@ -1462,7 +1468,7 @@ fn style_draft(
     let cfg = style_cfg(man, params);
     // Level styling is carrier-only: no event segmentation, no sub-frame
     // times, no forced apexes -- exactly jepa_infer's non-composed path.
-    let (p, sub, force, filled) = match params.style {
+    let (p, sub, force, filled, phase_runs) = match params.style {
         style::Style::Composed => style::compose(&d.tracks, &d.shot_edges, &cfg, &d.times),
         style::Style::Level => {
             // carrier-only decode, but the carrier-agnostic authorship
@@ -1470,7 +1476,7 @@ fn style_draft(
             // a level draft must not silently ignore those knobs
             let (p, filled) =
                 style::compose_level_full(&d.tracks, &d.shot_edges, &cfg, &d.times);
-            (p, std::collections::HashMap::new(), Vec::new(), filled)
+            (p, std::collections::HashMap::new(), Vec::new(), filled, None)
         }
     };
     let mut actions = style::extrema_actions(
@@ -1514,7 +1520,7 @@ fn style_draft(
     // the rarity instrument runs on the final written list (post-shape,
     // source clock), exactly what jepa_infer's panel line scores
     let (artifacts, art_rate) = artifacts::artifact_events(&actions);
-    Styled { actions, filler, artifacts, art_rate }
+    Styled { actions, filler, artifacts, art_rate, phase_runs }
 }
 
 /// One video, end to end.
@@ -3895,6 +3901,7 @@ mod funscript_tests {
                 settings: style::flags_line(&style::Params { env_seed: 7, ..Default::default() }),
                 filler: Vec::new(),
                 artifacts: Vec::new(),
+                phase_runs: None,
             },
             actions: &acts,
         };

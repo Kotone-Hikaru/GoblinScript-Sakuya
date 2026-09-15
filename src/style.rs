@@ -51,6 +51,12 @@ fn rows_at(seconds: f64, row_hz: f64, odd: bool) -> usize {
     if odd { n | 1 } else { n }
 }
 
+/// `jepa_infer.REV_SUPPORT_S`: the reach around a called apex the phase
+/// reading looks for a marginal crossing in, the scorer's reversal tolerance.
+const REV_SUPPORT_S: f64 = 0.0667;
+/// `jepa_infer.PHASE_RUN_K`: the run length of the run-share phase reading.
+const PHASE_RUN_K: usize = 3;
+
 fn sign(x: f64) -> f64 {
     if x > 0.0 {
         1.0
@@ -61,15 +67,83 @@ fn sign(x: f64) -> f64 {
     }
 }
 
+/// The smoothed track's sign as the decode reads it: an exact zero reads +1.
+fn sign_track(s: &[f64]) -> Vec<f64> {
+    s.iter()
+        .map(|&v| if sign(v) == 0.0 { 1.0 } else { sign(v) }) // numpy: sg[sg == 0] = 1
+        .collect()
+}
+
 /// Sign flips of the 3-frame-smoothed track: where a stroke reverses.
 fn crossings(s: &[f64]) -> Vec<usize> {
-    let mut sg: Vec<f64> = s.iter().map(|&v| sign(v)).collect();
-    for v in sg.iter_mut() {
-        if *v == 0.0 {
-            *v = 1.0; // numpy: sg[sg == 0] = 1
-        }
-    }
+    let sg = sign_track(s);
     (1..s.len()).filter(|&i| sg[i] * sg[i - 1] < 0.0).collect()
+}
+
+/// Port of `jepa_infer.contradicting_runs`: the called apexes whose kind
+/// contradicts the sign track `sg` (a crossing of the opposite direction
+/// within `w` rows of the apex's event row and none of its own direction;
+/// a peak's crossing is falling, a valley's rising, both at the crossing's
+/// last row of the old sign), as the spans `[i, j)` of runs of at least `k`
+/// consecutive ones.
+fn contradicting_runs(vrows: &[usize], vkinds: &[i8], sg: &[f64], w: usize, k: usize) -> Vec<(usize, usize)> {
+    let pairs = 0..sg.len().saturating_sub(1);
+    let down: Vec<usize> = pairs.clone().filter(|&i| sg[i] > 0.0 && sg[i + 1] < 0.0).collect();
+    let up: Vec<usize> = pairs.filter(|&i| sg[i] < 0.0 && sg[i + 1] > 0.0).collect();
+    let near = |c: &[usize], f: usize| {
+        let j = c.partition_point(|&x| x + w < f);
+        j < c.len() && c[j] <= f + w
+    };
+    let contra: Vec<bool> = vrows
+        .iter()
+        .zip(vkinds)
+        .map(|(&f, &kd)| {
+            let (own, opp) = if kd > 0 { (&down, &up) } else { (&up, &down) };
+            near(opp, f) && !near(own, f)
+        })
+        .collect();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < contra.len() {
+        if !contra[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < contra.len() && contra[j] {
+            j += 1;
+        }
+        if j - i >= k {
+            runs.push((i, j));
+        }
+        i = j;
+    }
+    runs
+}
+
+/// The run-share phase reading of a composed decode, the written
+/// funscript's `metadata.phase_runs`: over shots, the called apexes before
+/// any run flag and the apexes inside their contradicting runs of
+/// `PHASE_RUN_K`. An observation for the human beside the polarity and drift
+/// alarms; nothing reads it back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct PhaseRuns {
+    pub apexes: usize,
+    pub in_runs: usize,
+    /// `in_runs / apexes`, null with no apex
+    pub share: Option<f64>,
+}
+
+impl PhaseRuns {
+    fn add(&mut self, vrows: &[usize], vkinds: &[i8], sg: &[f64], fps: f64) {
+        let w = rows_at(REV_SUPPORT_S, fps, false);
+        self.apexes += vrows.len();
+        self.in_runs += contradicting_runs(vrows, vkinds, sg, w, PHASE_RUN_K)
+            .iter()
+            .map(|(i, j)| j - i)
+            .sum::<usize>();
+        self.share = (self.apexes > 0).then(|| self.in_runs as f64 / self.apexes as f64);
+    }
 }
 
 /// Most-likely ALTERNATING reversal sequence from the rev head's per-row
@@ -1530,7 +1604,13 @@ pub fn compose(
     shot_edges: &[usize],
     cfg: &StyleCfg,
     times_ms: &[f64],
-) -> (Vec<f64>, std::collections::HashMap<usize, f64>, Vec<usize>, Vec<(usize, usize)>) {
+) -> (
+    Vec<f64>,
+    std::collections::HashMap<usize, f64>,
+    Vec<usize>,
+    Vec<(usize, usize)>,
+    Option<PhaseRuns>,
+) {
     let dt = 1.0 / cfg.fps;
     let n_all = t.vmarg.len();
     let mut p = vec![50.0; n_all];
@@ -1554,6 +1634,7 @@ pub fn compose(
     // decode that will run -- the refractory changes the emitted rate at a
     // given prior.
     let viterbi = cfg.rev_viterbi && t.rev.is_some();
+    let mut phase = viterbi.then(PhaseRuns::default);
     // Per-row, because a band-fitted prior differs row to row; a global fit
     // fills it with one value and the decode cannot tell the two apart.
     let rev_bias: Vec<f64> = if viterbi {
@@ -1666,6 +1747,11 @@ pub fn compose(
                 .filter(|&(_, r)| r + 1 <= n - 1)
                 .map(|(i, _)| i)
                 .collect();
+            if let Some(ph) = phase.as_mut() {
+                let rows: Vec<usize> = keep.iter().map(|&i| vrows[i]).collect();
+                let kinds: Vec<i8> = keep.iter().map(|&i| vkinds[i]).collect();
+                ph.add(&rows, &kinds, &sign_track(&s), cfg.fps);
+            }
             if !keep.is_empty() {
                 cross = keep.iter().map(|&i| vrows[i] + 1).collect();
                 let mut d: Vec<f64> =
@@ -1870,7 +1956,7 @@ pub fn compose(
     } else {
         (p, Vec::new())
     };
-    (p, sub, force, filled)
+    (p, sub, force, filled, phase)
 }
 
 /// Background filler rhythm (port of jepa_infer `fill_still_spans`):
@@ -2508,6 +2594,96 @@ mod tests {
         g: usize,
     ) -> (Vec<usize>, Vec<i8>) {
         alternating_events_rows(p_peak, p_valley, &vec![bias; p_peak.len()], g)
+    }
+
+    /// `grid_check.check_phase_runs_fixture` pins the same table through
+    /// `jepa_infer.contradicting_runs`: crossings and apexes compared at
+    /// their event rows, the reach endpoint inside, agreement winning over
+    /// a crossing of each direction, an exact zero reading +1, runs of three
+    /// counted and a run of two not, a run at the list's end counted.
+    #[test]
+    fn contradicting_runs_match_the_decoder_table() {
+        let rise: Vec<f64> = [-1.0; 5].iter().chain([1.0; 5].iter()).copied().collect();
+        assert_eq!(contradicting_runs(&[2], &[1], &rise, 2, 1), vec![(0, 1)]);
+        assert_eq!(contradicting_runs(&[6], &[1], &rise, 2, 1), vec![(0, 1)]);
+        assert!(contradicting_runs(&[7], &[1], &rise, 2, 1).is_empty());
+        assert!(contradicting_runs(&[4], &[-1], &rise, 2, 1).is_empty());
+        let bump = [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0];
+        assert!(contradicting_runs(&[4], &[1], &bump, 2, 1).is_empty());
+        let zero = sign_track(&[-1.0, -1.0, 0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(zero, vec![-1.0, -1.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(contradicting_runs(&[3], &[1], &zero, 2, 1), vec![(0, 1)]);
+        assert!(contradicting_runs(&[4], &[1], &zero, 2, 1).is_empty());
+        let mut valleys = vec![1.0; 60];
+        for v in [5usize, 15, 25, 35, 45, 55] {
+            valleys[v - 2..=v].fill(-1.0);
+        }
+        let rows = [5usize, 15, 25, 31, 35, 45, 55];
+        assert_eq!(contradicting_runs(&rows, &[1; 7], &valleys, 2, 3), vec![(0, 3), (4, 7)]);
+        assert_eq!(contradicting_runs(&rows[..6], &[1; 6], &valleys, 2, 3), vec![(0, 3)]);
+        // the reading itself: counts over shots, a null share with no apex
+        let mut ph = PhaseRuns::default();
+        ph.add(&[], &[], &valleys, 30.0);
+        assert_eq!(ph, PhaseRuns { apexes: 0, in_runs: 0, share: None });
+        ph.add(&rows, &[1; 7], &valleys, 30.0);
+        ph.add(&rows[..6], &[1; 6], &valleys, 30.0);
+        assert_eq!((ph.apexes, ph.in_runs), (13, 9));
+        assert_eq!(ph.share, Some(9.0 / 13.0));
+    }
+
+    /// The phase reading on identical input: `probes/apex_phase.py parity`
+    /// writes each rank clip's stored reversal tracks, marginal and fitted
+    /// per-row prior with Python's counts, and this replays the shot loop of
+    /// `compose` (the Viterbi, the kept apexes, the smoothed sign) over them.
+    /// Both counts must be exact.
+    /// `PHASE_RUNS_PARITY=<dir> cargo test --release -- --ignored phase_runs_parity --nocapture`
+    #[test]
+    #[ignore]
+    fn phase_runs_parity_on_stored_tracks() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("PHASE_RUNS_PARITY").expect("PHASE_RUNS_PARITY names the parity directory"),
+        );
+        let mut metas: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        metas.sort();
+        assert!(!metas.is_empty(), "no parity clips under {}", dir.display());
+        let (mut total, mut in_runs) = (0usize, 0usize);
+        for path in &metas {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let n = m["rows"].as_u64().unwrap() as usize;
+            let x: Vec<f64> = std::fs::read(path.with_extension("f64"))
+                .unwrap()
+                .chunks_exact(8)
+                .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            assert_eq!(x.len(), 4 * n, "{}", path.display());
+            let (rt, rb, vel, bias) = (&x[..n], &x[n..2 * n], &x[2 * n..3 * n], &x[3 * n..]);
+            let fps = m["fps"].as_f64().unwrap();
+            let gap = m["gap"].as_u64().unwrap() as usize;
+            let kr = rows_at(m["rev_smooth_s"].as_f64().unwrap(), fps, true);
+            let shots: Vec<usize> =
+                m["shots"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+            let mut ph = PhaseRuns::default();
+            for w in shots.windows(2) {
+                let (lo, hi) = (w[0], w[1]);
+                if hi - lo < 2 {
+                    continue;
+                }
+                let (vrows, vkinds) = alternating_events_rows(&rt[lo..hi], &rb[lo..hi], &bias[lo..hi], gap);
+                let keep: Vec<usize> = (0..vrows.len()).filter(|&i| vrows[i] + 1 <= hi - lo - 1).collect();
+                let rows: Vec<usize> = keep.iter().map(|&i| vrows[i]).collect();
+                let kinds: Vec<i8> = keep.iter().map(|&i| vkinds[i]).collect();
+                ph.add(&rows, &kinds, &sign_track(&box_same(&vel[lo..hi], kr)), fps);
+            }
+            let want = (m["apexes"].as_u64().unwrap() as usize, m["in_runs"].as_u64().unwrap() as usize);
+            assert_eq!((ph.apexes, ph.in_runs), want, "{}", path.display());
+            total += ph.apexes;
+            in_runs += ph.in_runs;
+        }
+        println!("phase runs parity: {} clips, {total} apexes, {in_runs} in runs, exact", metas.len());
     }
 
     /// `grid_check.check_pin_fixture` pins the same two literal lists:
