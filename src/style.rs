@@ -1038,24 +1038,24 @@ pub fn flags_line(p: &Params) -> String {
     } else {
         format!("--style {} ", p.style.label())
     };
+    // The device cap and the seam ease always echo: 0 turns each off, which
+    // is not their default, so leaving it out would reproduce another style.
     format!(
-        "{sty}{dwell} {still} --intensity {:.2}{}{}{}{depth}{filler}",
+        "{sty}{dwell} {still} --intensity {:.2}{}{} --max-speed {:.0} --cut-ease {:.0}{depth}{filler}",
         p.intensity,
+        // the bundle's own seed does not echo
+        if p.env_seed != u64::MAX {
+            format!(" --env-seed {}", p.env_seed)
+        } else {
+            String::new()
+        },
         if p.range != (0.0, 100.0) {
             format!(" --range {:.0}-{:.0}", p.range.0, p.range.1)
         } else {
             String::new()
         },
-        if p.max_speed > 0.0 {
-            format!(" --max-speed {:.0}", p.max_speed)
-        } else {
-            String::new()
-        },
-        if p.cut_ease > 0.0 {
-            format!(" --cut-ease {:.0}", p.cut_ease)
-        } else {
-            String::new()
-        },
+        p.max_speed,
+        p.cut_ease,
     )
 }
 
@@ -2135,7 +2135,7 @@ pub fn compose_level(t: &Tracks, shot_edges: &[usize], cfg: &StyleCfg) -> Vec<f6
     p
 }
 
-#[derive(serde::Serialize, Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Action {
     pub at: i64,
     pub pos: i64,
@@ -2367,6 +2367,91 @@ pub const MAX_POS_RATE: f64 = 600.0;
 /// bound to it by `grid_check`. Artifact layer, like `RDP_EPS`.
 pub const CUT_EASE: f64 = 250.0;
 
+/// A vertex placed by a hand wins the model's vertices this close to it,
+/// milliseconds -- `common.PIN_TOL_MS`, bound by `grid_check`. Two rows at
+/// 30 rows/s: a reversal's label jitters by one row, so a model crossing
+/// inside this distance of a pin IS that reversal, placed by the author.
+pub const PIN_TOL_MS: f64 = 60.0;
+
+/// How far a lone pin's level correction reaches, milliseconds --
+/// `common.PIN_HORIZON_MS`. Between two pins the correction interpolates
+/// linearly; outside the outermost pins it fades to nothing over this span,
+/// so a single corrected stroke does not shift the whole clip.
+pub const PIN_HORIZON_MS: f64 = 2000.0;
+
+/// The author's pins laid over the model's written list. Port of
+/// `common.pin_actions`, vertex for vertex.
+///
+/// A pin is a vertex the author placed: its time and level are final. Every
+/// model vertex within `PIN_TOL_MS` of a pin goes, because it is the same
+/// reversal the model placed a row or two off. The survivors take a LEVEL
+/// correction: at each pin the model's own level is read off its written
+/// list, the difference to the pin's level is the correction there, and it
+/// interpolates between pins and fades past the outermost ones. Timing
+/// never moves -- a pin fixes where its own reversal is, and the stretch
+/// between pins keeps the model's reversal times.
+pub fn pin_actions(actions: &[Action], pins: &[Action]) -> Vec<Action> {
+    if pins.is_empty() {
+        return actions.to_vec();
+    }
+    let mut sorted = pins.to_vec();
+    sorted.sort_by_key(|p| p.at);
+    // one vertex per millisecond: the last pin placed at a time wins
+    let mut pins: Vec<Action> = Vec::with_capacity(sorted.len());
+    for p in sorted {
+        match pins.last_mut() {
+            Some(l) if l.at == p.at => *l = p,
+            _ => pins.push(p),
+        }
+    }
+    let off: Vec<f64> = pins
+        .iter()
+        .map(|p| p.pos as f64 - level_at(actions, p.at as f64))
+        .collect();
+    let mut out: Vec<Action> = Vec::with_capacity(actions.len() + pins.len());
+    for a in actions {
+        if pins.iter().any(|p| (a.at - p.at).abs() as f64 <= PIN_TOL_MS) {
+            continue;
+        }
+        let t = a.at as f64;
+        let i = pins.partition_point(|p| p.at <= a.at);
+        let o = if i == 0 {
+            off[0] * (1.0 - (pins[0].at as f64 - t) / PIN_HORIZON_MS).max(0.0)
+        } else if i < pins.len() {
+            let (t0, t1) = (pins[i - 1].at as f64, pins[i].at as f64);
+            let w = (t - t0) / (t1 - t0);
+            off[i - 1] * (1.0 - w) + off[i] * w
+        } else {
+            off[i - 1] * (1.0 - (t - pins[i - 1].at as f64) / PIN_HORIZON_MS).max(0.0)
+        };
+        out.push(Action {
+            at: a.at,
+            pos: ((a.pos as f64 + o + 0.5).floor() as i64).clamp(0, 100),
+        });
+    }
+    out.extend(pins.iter().copied());
+    out.sort_by_key(|a| a.at);
+    out
+}
+
+/// The written list's level at `t`, linear between vertices and flat past
+/// the ends.
+fn level_at(actions: &[Action], t: f64) -> f64 {
+    if actions.is_empty() {
+        return 50.0;
+    }
+    let i = actions.partition_point(|a| (a.at as f64) <= t);
+    if i == 0 {
+        return actions[0].pos as f64;
+    }
+    if i == actions.len() {
+        return actions[i - 1].pos as f64;
+    }
+    let (a, b) = (&actions[i - 1], &actions[i]);
+    let (t0, t1) = (a.at as f64, b.at as f64);
+    a.pos as f64 + (b.pos - a.pos) as f64 * (t - t0) / (t1 - t0)
+}
+
 /// Vertical-deviation Douglas-Peucker over a sorted action list.
 fn rdp(actions: &[Action], eps: f64) -> Vec<Action> {
     if actions.len() < 3 {
@@ -2423,6 +2508,27 @@ mod tests {
         g: usize,
     ) -> (Vec<usize>, Vec<i8>) {
         alternating_events_rows(p_peak, p_valley, &vec![bias; p_peak.len()], g)
+    }
+
+    /// `grid_check.check_pin_fixture` pins the same two literal lists:
+    /// the pin beside a model reversal replaces it, the level correction
+    /// interpolates between pins and fades past a lone one, and the
+    /// model's own reversal times stay where they were.
+    #[test]
+    fn a_pin_replaces_the_reversal_beside_it_and_bends_the_level_toward_it() {
+        let acts = |v: &[(i64, i64)]| -> Vec<Action> {
+            v.iter().map(|&(at, pos)| Action { at, pos }).collect()
+        };
+        let model = acts(&[(0, 20), (500, 80), (1000, 20), (1500, 80), (2000, 20), (4000, 80)]);
+        let got = pin_actions(&model, &acts(&[(520, 88), (3000, 50)]));
+        assert_eq!(
+            got,
+            acts(&[(0, 28), (520, 88), (1000, 28), (1500, 86), (2000, 24), (3000, 50), (4000, 80)])
+        );
+        let got = pin_actions(&acts(&[(0, 50), (5000, 50)]), &acts(&[(1000, 70)]));
+        assert_eq!(got, acts(&[(0, 60), (1000, 70), (5000, 50)]));
+        // no pins: the list is the model's, untouched
+        assert_eq!(pin_actions(&model, &[]), model);
     }
 
     /// What the emission-prior fit costs at the length that hurts, printed

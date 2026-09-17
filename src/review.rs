@@ -38,11 +38,8 @@ pub struct Clip {
     /// False when the page is showing the 480p working copy (it says so).
     pub is_original: bool,
     pub duration_ms: f64,
-    /// Per-row model confidence [0,1] over the whole timeline (NaN = unknown);
-    /// empty when the bundle has no conf head. Served once per clip, not part of
-    /// `/state`: it is fixed by the frozen trunk, so a re-style never touches it.
-    pub conf: Vec<f64>,
-    /// Row clock for `conf`, as the rate and where row 0 sits: row i is at
+    /// Row clock for the confidence track (`Restyled::conf`, per-row [0,1],
+    /// NaN = unknown), as the rate and where row 0 sits: row i is at
     /// `row0_ms + i * 1000 / row_hz`. Both halves travel because the offset
     /// is not zero -- a row is its tubelet pair's midpoint, half a tubelet
     /// after the frame it is indexed by (`Manifest::row_ms`).
@@ -60,6 +57,23 @@ pub struct Clip {
     /// actually looked at. `None` = the whole frame was drafted, and no crop
     /// UI appears at all.
     pub crop: Option<crate::autocrop::View>,
+    /// The model that drafted it, the bundle's pack name: the page's model
+    /// menu starts here.
+    pub model: String,
+    /// Every model the page may switch this script to, with its trunk.
+    pub models: Vec<crate::bundle::ModelInfo>,
+    /// Where the compared model's line is written: served as `/compare/N`,
+    /// never the script itself.
+    pub compare: PathBuf,
+}
+
+/// Which model writes a script, and which other model's line the page lays
+/// under it. Both are part of the ask the styler works on: switching either
+/// is a re-style, and a switch onto a trunk without tracks is a head pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Choice {
+    pub model: String,
+    pub compare: Option<String>,
 }
 
 /// The manifest's "normal" values for the two preset axes. The page shows each
@@ -80,15 +94,20 @@ pub struct Presets {
 const RANGE_CHUNK: u64 = 8 << 20;
 
 /// Serve the review until the user finishes (Done in the page, or
-/// Enter/Q/Esc in the console). `apply(i, params)` re-styles clip `i` and
-/// returns its action count -- same contract as the terminal review screen.
-/// `open` launches the default browser (off only in development).
+/// Enter/Q/Esc in the console). `params` and `choices` start as the draft's
+/// and end as what the page settled. `apply(i, params, choice)` re-styles clip `i`
+/// under the chosen model (and writes the compared model's line) and returns
+/// its action count. `page` hears the URL once the page is up -- the console
+/// prints it, an API session reports it -- and `open` also launches the
+/// default browser here.
 pub fn review(
     clips: &[Clip],
     params: &mut [style::Params],
+    choices: &mut [Choice],
     presets: Presets,
     open: bool,
-    apply: impl Fn(usize, &style::Params) -> Result<usize> + Send + Sync,
+    page: &dyn Fn(&str),
+    apply: impl Fn(usize, &style::Params, &Choice) -> Result<Restyled> + Send + Sync,
 ) -> Result<()> {
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|e| anyhow::anyhow!("could not start the review server: {e}"))?;
@@ -102,23 +121,17 @@ pub fn review(
     // the draft's own params, snapshot before any re-style, so the page's
     // per-clip "reset" can restore exactly what the goblins first drafted.
     let defaults: Vec<style::Params> = params.to_vec();
-
-    let mut actions: Vec<usize> = Vec::with_capacity(clips.len());
+    let mut first: Vec<Restyled> = Vec::with_capacity(clips.len());
     for (i, p) in params.iter().enumerate() {
-        actions.push(apply(i, p)?);
+        first.push(apply(i, p, &choices[i])?);
     }
 
-    println!(
-        "\n  {} {}  {}",
-        crate::t!("console.review.label"),
-        console::style(&url).cyan().bold(),
-        console::style(crate::t!("console.review.hint")).dim()
-    );
+    page(&url);
     if open {
         open_browser(&url);
     }
 
-    let work = Arc::new(Work::new(actions));
+    let work = Arc::new(Work::new(first));
     // A scope, so the styler can borrow the draft's tracks rather than own a
     // copy of every clip's worth of them.
     std::thread::scope(|scope| {
@@ -127,7 +140,7 @@ pub fn review(
             let apply = &apply;
             scope.spawn(move || work.style_until_done(apply))
         };
-        let r = serve(&server, clips, params, &defaults, presets, &work);
+        let r = serve(&server, clips, params, choices, &defaults, presets, &work);
         // Whatever ended the review -- Done, a console key, an error -- the
         // styler is told before we leave, or the scope waits on it forever.
         work.finish();
@@ -146,6 +159,7 @@ fn serve(
     server: &tiny_http::Server,
     clips: &[Clip],
     params: &mut [style::Params],
+    choices: &mut [Choice],
     defaults: &[style::Params],
     presets: Presets,
     work: &Work,
@@ -177,7 +191,7 @@ fn serve(
             Some(r) => r,
             None => continue,
         };
-        if handle(req, clips, params, defaults, presets, work) == Flow::Finish {
+        if handle(req, clips, params, choices, defaults, presets, work) == Flow::Finish {
             return Ok(());
         }
     }
@@ -203,24 +217,37 @@ struct Work {
 }
 
 struct Queue {
-    /// clip -> the newest params asked for and not yet started.
-    want: std::collections::BTreeMap<usize, style::Params>,
+    /// clip -> the newest params and model choice asked for and not yet
+    /// started.
+    want: std::collections::BTreeMap<usize, (style::Params, Choice)>,
     /// The clip the styler has in hand, if any.
     running: Option<usize>,
     /// Action count per clip, from the last re-style that finished.
     actions: Vec<usize>,
+    /// Confidence track per clip, from the same re-style: the trunk's, so a
+    /// model switch moves it.
+    conf: Vec<Vec<f64>>,
     /// What the last failed re-style said, for the page's error line.
     error: Option<String>,
     done: bool,
 }
 
+/// What one re-style leaves for the page: the script's action count and the
+/// confidence track of the model that wrote it (empty without a conf head).
+pub struct Restyled {
+    pub actions: usize,
+    pub conf: Vec<f64>,
+}
+
 impl Work {
-    fn new(actions: Vec<usize>) -> Self {
+    fn new(first: Vec<Restyled>) -> Self {
+        let (actions, conf) = first.into_iter().map(|r| (r.actions, r.conf)).unzip();
         Work {
             state: Mutex::new(Queue {
                 want: std::collections::BTreeMap::new(),
                 running: None,
                 actions,
+                conf,
                 error: None,
                 done: false,
             }),
@@ -228,11 +255,15 @@ impl Work {
         }
     }
 
-    /// Ask for clip `i` to be re-styled with `p`, replacing any request for
-    /// that clip the styler has not picked up yet.
-    fn request(&self, i: usize, p: style::Params) {
+    fn conf(&self, i: usize) -> Option<Vec<f64>> {
+        self.state.lock().unwrap().conf.get(i).cloned()
+    }
+
+    /// Ask for clip `i` to be re-styled with `p` under `c`, replacing any
+    /// request for that clip the styler has not picked up yet.
+    fn request(&self, i: usize, p: style::Params, c: Choice) {
         let mut q = self.state.lock().unwrap();
-        q.want.insert(i, p);
+        q.want.insert(i, (p, c));
         q.error = None;
         drop(q);
         self.wake.notify_one();
@@ -261,15 +292,18 @@ impl Work {
 
     /// The styler thread: take the newest outstanding request, re-style it,
     /// publish the count, repeat until the review ends.
-    fn style_until_done(&self, apply: &(impl Fn(usize, &style::Params) -> Result<usize> + ?Sized)) {
+    fn style_until_done(
+        &self,
+        apply: &(impl Fn(usize, &style::Params, &Choice) -> Result<Restyled> + ?Sized),
+    ) {
         loop {
-            let (i, p) = {
+            let (i, p, c) = {
                 let mut q = self.state.lock().unwrap();
                 loop {
                     if let Some(i) = q.want.keys().next().copied() {
-                        let p = q.want.remove(&i).expect("key came from this map");
+                        let (p, c) = q.want.remove(&i).expect("key came from this map");
                         q.running = Some(i);
-                        break (i, p);
+                        break (i, p, c);
                     }
                     // The queue is checked BEFORE `done`, so the review ending
                     // drains rather than abandons: someone who turns a knob and
@@ -282,13 +316,15 @@ impl Work {
                     q = self.wake.wait(q).unwrap();
                 }
             };
-            let r = apply(i, &p);
+            let r = apply(i, &p, &c);
             let mut q = self.state.lock().unwrap();
             q.running = None;
             match r {
-                Ok(n) => {
-                    if let Some(slot) = q.actions.get_mut(i) {
-                        *slot = n;
+                Ok(r) => {
+                    let q = &mut *q;
+                    if let (Some(a), Some(c)) = (q.actions.get_mut(i), q.conf.get_mut(i)) {
+                        *a = r.actions;
+                        *c = r.conf;
                     }
                 }
                 // Kept for the page rather than printed: the console behind the
@@ -303,6 +339,7 @@ fn handle(
     mut req: tiny_http::Request,
     clips: &[Clip],
     params: &mut [style::Params],
+    choices: &mut [Choice],
     defaults: &[style::Params],
     presets: Presets,
     work: &Work,
@@ -318,7 +355,7 @@ fn handle(
         }
         (Method::Get, "state") => {
             let _ = req.respond(json_response(&state_json(
-                clips, params, defaults, presets, work,
+                clips, params, choices, defaults, presets, work,
             )));
         }
         // The active catalog, for the page to dress itself in. Separate from
@@ -334,10 +371,20 @@ fn handle(
                 let _ = req.respond(Response::from_string("no such clip").with_status_code(404));
             }
         }
+        // the compared model's line, written beside the script by the same
+        // re-style that wrote the script
+        (Method::Get, "compare") => {
+            if let Some(c) = parts.next().and_then(|i| i.parse::<usize>().ok()).and_then(|i| clips.get(i)) {
+                serve_file_threaded(req, c.compare.clone(), "application/json");
+            } else {
+                let _ = req.respond(Response::from_string("no such clip").with_status_code(404));
+            }
+        }
         (Method::Get, "conf") => {
-            match parts.next().and_then(|i| i.parse::<usize>().ok()).and_then(|i| clips.get(i)) {
-                Some(c) => {
-                    let _ = req.respond(json_response(&conf_json(c)));
+            let i = parts.next().and_then(|i| i.parse::<usize>().ok());
+            match i.and_then(|i| Some((clips.get(i)?, work.conf(i)?))) {
+                Some((c, conf)) => {
+                    let _ = req.respond(json_response(&conf_json(c, &conf)));
                 }
                 None => {
                     let _ = req.respond(Response::from_string("no such clip").with_status_code(404));
@@ -365,19 +412,27 @@ fn handle(
         (Method::Post, "params") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
-            match parse_params(&body) {
-                Ok((clip, p)) if clip < params.len() => {
+            let parsed = parse_params(&body, |i| params.get(i).copied()).and_then(|(clip, p)| {
+                let c = match (clips.get(clip), choices.get(clip)) {
+                    (Some(clip), Some(base)) => parse_choice(&body, clip, base)?,
+                    _ => anyhow::bail!("no clip {clip}"),
+                };
+                Ok((clip, p, c))
+            });
+            match parsed {
+                Ok((clip, p, c)) if clip < params.len() => {
                     // per clip: only the addressed script re-styles. The answer
                     // goes back NOW, with the clip marked styling -- the work
                     // itself is the styler's, and the page waits for it by
                     // watching that flag rather than by holding a socket open.
                     params[clip] = p;
-                    work.request(clip, p);
+                    choices[clip] = c.clone();
+                    work.request(clip, p, c);
                     let _ = req.respond(json_response(&state_json(
-                        clips, params, defaults, presets, work,
+                        clips, params, choices, defaults, presets, work,
                     )));
                 }
-                Ok((clip, _)) => {
+                Ok((clip, _, _)) => {
                     let _ = req.respond(
                         Response::from_string(format!("no clip {clip}")).with_status_code(400),
                     );
@@ -412,7 +467,7 @@ fn handle(
 /// back rounded UP past `u64::MAX` and every knob the page posts after that
 /// would be rejected. `null` is what the page already means by it, and what
 /// the inbound `Option<u64>` already reads.
-fn params_json(p: &style::Params) -> serde_json::Value {
+pub(crate) fn params_json(p: &style::Params) -> serde_json::Value {
     serde_json::json!({
         "style": p.style.label(),
         "dwells": p.dwells.label(),
@@ -448,7 +503,7 @@ fn params_json(p: &style::Params) -> serde_json::Value {
 /// Each preset's resolved number, so the page can label the dropdowns
 /// (`normal (0.65)`) and seed the expert inputs. Only "normal" is the
 /// manifest's; the rest are the fixed constants the enums carry.
-fn presets_json(presets: Presets) -> serde_json::Value {
+pub(crate) fn presets_json(presets: Presets) -> serde_json::Value {
     use style::{DepthUniformity, Dwells, Stillness};
     let depth = |d: DepthUniformity| {
         let p = d.base().expect("non-off depth preset");
@@ -495,6 +550,7 @@ fn filler_preset(p: style::FillerPreset) -> serde_json::Value {
 fn state_json(
     clips: &[Clip],
     params: &[style::Params],
+    choices: &[Choice],
     defaults: &[style::Params],
     presets: Presets,
     work: &Work,
@@ -510,6 +566,11 @@ fn state_json(
         "error": work.error(),
         "clips": clips.iter().enumerate().map(|(i, c)| serde_json::json!({
             "name": c.name,
+            // the model writing this script, the one whose line lies under
+            // it (null: none), and every model the menus offer
+            "model": choices[i].model,
+            "compare": choices[i].compare,
+            "models": c.models,
             "actions": actions[i],
             // This clip's script is still catching up with its knobs. The page
             // waits on it before re-reading the file, and says so meanwhile --
@@ -536,11 +597,11 @@ fn state_json(
 /// per-row [0,1] score, rounded to keep the payload small, with `null` for the
 /// unforwarded rows. `conf` is `null` (not `[]`) when the bundle has no conf
 /// head, so the page can tell "unavailable" from "all-unknown" and hide the UI.
-fn conf_json(c: &Clip) -> serde_json::Value {
-    let conf = if c.conf.is_empty() {
+fn conf_json(c: &Clip, conf: &[f64]) -> serde_json::Value {
+    let conf = if conf.is_empty() {
         serde_json::Value::Null
     } else {
-        c.conf
+        conf
             .iter()
             .map(|&v| {
                 if v.is_finite() {
@@ -555,38 +616,84 @@ fn conf_json(c: &Clip) -> serde_json::Value {
     serde_json::json!({ "fps": c.row_hz, "row0": c.row0_ms, "conf": conf })
 }
 
-/// The page's params message -> a clip index + a validated `Params`, same
-/// bounds as the CLI. The clip index says which script the change is for.
-fn parse_params(body: &str) -> Result<(usize, style::Params)> {
+/// The model choice a params message carries for `clip`: `model` absent keeps
+/// the clip's own, `compare` absent keeps it and `null` clears it. A name the
+/// clip does not offer is refused. A script switched onto the model it was
+/// compared with compares with nothing: the two lines would be one.
+fn parse_choice(body: &str, clip: &Clip, base: &Choice) -> Result<Choice> {
     #[derive(serde::Deserialize)]
     struct Msg {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default, deserialize_with = "nullable")]
+        compare: Option<Option<String>>,
+    }
+    let m: Msg = serde_json::from_str(body).context("bad params payload")?;
+    let model = m.model.unwrap_or_else(|| base.model.clone());
+    let compare = m.compare.unwrap_or_else(|| base.compare.clone()).filter(|c| *c != model);
+    for name in std::iter::once(&model).chain(compare.as_ref()) {
+        anyhow::ensure!(
+            clip.models.iter().any(|m| &m.name == name),
+            "no model {name:?} for this script"
+        );
+    }
+    Ok(Choice { model, compare })
+}
+
+/// The page's params message -> a clip index + a validated `Params`, same
+/// bounds as the CLI. The clip index says which script the change is for;
+/// `base(clip)` is what a field the message leaves out keeps.
+fn parse_params(
+    body: &str,
+    base: impl Fn(usize) -> Option<style::Params>,
+) -> Result<(usize, style::Params)> {
+    #[derive(serde::Deserialize)]
+    struct Which {
         clip: usize,
-        // absent = composed (the default synthesis)
+    }
+    let w: Which = serde_json::from_str(body).context("bad params payload")?;
+    let b = base(w.clip).with_context(|| format!("no clip {}", w.clip))?;
+    Ok((w.clip, params_from_json(body, &b)?))
+}
+
+/// A params message -> a validated `Params`, same bounds as the CLI. Every
+/// field is optional and falls back to `base`: the review page sends the
+/// whole set, an API client sends the knobs it moved. Unknown fields are
+/// ignored, so the message may carry more than params.
+pub(crate) fn params_from_json(body: &str, base: &style::Params) -> Result<style::Params> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
         #[serde(default)]
         style: Option<String>,
-        dwells: String,
-        stillness: String,
-        intensity: f64,
-        // absent on a page that predates the seed control: keep the clip's own
         #[serde(default)]
-        env_seed: Option<u64>,
-        range: [f64; 2],
-        max_speed: f64,
-        // absent on a page that predates the cut-ease control: keep it off
+        dwells: Option<String>,
+        #[serde(default)]
+        stillness: Option<String>,
+        #[serde(default)]
+        intensity: Option<f64>,
+        // absent keeps the base; `null` is the bundle's own seed
+        #[serde(default, deserialize_with = "nullable")]
+        env_seed: Option<Option<u64>>,
+        #[serde(default)]
+        range: Option<[f64; 2]>,
+        #[serde(default)]
+        max_speed: Option<f64>,
         #[serde(default)]
         cut_ease: Option<f64>,
-        // absent or null when the clip is on presets; a number in expert mode
-        #[serde(default)]
-        dwell_ramp: Option<f64>,
-        #[serde(default)]
-        still_eps: Option<f64>,
-        // depth uniformity (absent = off); dose/window are overrides on the preset
+        // absent keeps the base; `null` puts the clip back on its preset; a
+        // number is the expert override
+        #[serde(default, deserialize_with = "nullable")]
+        dwell_ramp: Option<Option<f64>>,
+        #[serde(default, deserialize_with = "nullable")]
+        still_eps: Option<Option<f64>>,
+        // depth uniformity; dose/window are overrides on the preset, with the
+        // same absent/null/number reading as the expert knobs above
         #[serde(default)]
         depth: Option<String>,
-        #[serde(default)]
-        depth_dose: Option<f64>,
-        #[serde(default)]
-        depth_window: Option<f64>,
+        #[serde(default, deserialize_with = "nullable")]
+        depth_dose: Option<Option<f64>>,
+        #[serde(default, deserialize_with = "nullable")]
+        depth_window: Option<Option<f64>>,
         // background filler rhythm (absent = off)
         #[serde(default)]
         filler_gap_s: Option<f64>,
@@ -617,72 +724,85 @@ fn parse_params(body: &str) -> Result<(usize, style::Params)> {
     }
     let m: Msg = serde_json::from_str(body).context("bad params payload")?;
     let sty = match m.style.as_deref() {
-        None => style::Style::Composed,
+        None => base.style,
         Some(s) => style::Style::from_label(s)
             .with_context(|| format!("bad style {s:?}"))?,
     };
-    let dwells =
-        style::Dwells::from_label(&m.dwells).with_context(|| format!("bad dwells {:?}", m.dwells))?;
-    let stillness = style::Stillness::from_label(&m.stillness)
-        .with_context(|| format!("bad stillness {:?}", m.stillness))?;
-    if !(0.5..=2.0).contains(&m.intensity) {
-        anyhow::bail!("intensity {} is out of range (0.5..2.0)", m.intensity);
+    let dwells = match m.dwells.as_deref() {
+        None => base.dwells,
+        Some(s) => style::Dwells::from_label(s).with_context(|| format!("bad dwells {s:?}"))?,
+    };
+    let stillness = match m.stillness.as_deref() {
+        None => base.stillness,
+        Some(s) => {
+            style::Stillness::from_label(s).with_context(|| format!("bad stillness {s:?}"))?
+        }
+    };
+    let intensity = m.intensity.unwrap_or(base.intensity);
+    if !(0.5..=2.0).contains(&intensity) {
+        anyhow::bail!("intensity {intensity} is out of range (0.5..2.0)");
     }
-    let (lo, hi) = (m.range[0], m.range[1]);
+    let (lo, hi) = m.range.map(|r| (r[0], r[1])).unwrap_or(base.range);
     if !(0.0..=100.0).contains(&lo) || !(0.0..=100.0).contains(&hi) || lo >= hi {
         anyhow::bail!("need 0 <= LO < HI <= 100, got {lo}-{hi}");
     }
-    if m.max_speed < 0.0 {
+    let max_speed = m.max_speed.unwrap_or(base.max_speed);
+    if max_speed < 0.0 {
         anyhow::bail!("max_speed must be >= 0");
     }
-    if m.cut_ease.is_some_and(|c| c < 0.0) {
+    let cut_ease = m.cut_ease.unwrap_or(base.cut_ease);
+    if cut_ease < 0.0 {
         anyhow::bail!("cut_ease must be >= 0");
     }
-    if let Some(pk) = m.dwell_ramp {
+    let dwell_ramp = m.dwell_ramp.unwrap_or(base.dwell_ramp);
+    if let Some(pk) = dwell_ramp {
         if !(0.0..=1.0).contains(&pk) {
             anyhow::bail!("dwell_ramp {pk} is out of range (0.0..1.0)");
         }
     }
-    if let Some(se) = m.still_eps {
+    let still_eps = m.still_eps.unwrap_or(base.still_eps);
+    if let Some(se) = still_eps {
         if !(0.0..=60.0).contains(&se) {
             anyhow::bail!("still_eps {se} is out of range (0.0..60.0)");
         }
     }
     let depth = match m.depth.as_deref() {
-        None => style::DepthUniformity::Off,
+        None => base.depth,
         Some(s) => style::DepthUniformity::from_label(s)
             .with_context(|| format!("bad depth {s:?}"))?,
     };
-    if let Some(v) = m.depth_dose {
+    let depth_dose = m.depth_dose.unwrap_or(base.depth_dose);
+    if let Some(v) = depth_dose {
         if !(0.0..=1.0).contains(&v) {
             anyhow::bail!("depth_dose {v} is out of range (0.0..1.0)");
         }
     }
-    if let Some(v) = m.depth_window {
+    let depth_window = m.depth_window.unwrap_or(base.depth_window);
+    if let Some(v) = depth_window {
         if !(0.0..=60.0).contains(&v) {
             anyhow::bail!("depth_window {v} is out of range (0.0..60.0 s)");
         }
     }
-    let filler_gap_s = m.filler_gap_s.unwrap_or(0.0);
+    let filler_gap_s = m.filler_gap_s.unwrap_or(base.filler_gap_s);
     if filler_gap_s < 0.0 {
         anyhow::bail!("filler_gap_s must be >= 0 (seconds; 0 = off)");
     }
-    let filler_min_real_s = m.filler_min_real_s.unwrap_or(1.0);
-    let filler_real_v = m.filler_real_v.unwrap_or(45.0);
-    let filler_model_w = m.filler_model_w.unwrap_or(1.0);
-    let filler_rate = m.filler_rate.unwrap_or(40.0);
-    let filler_amp = m.filler_amp.unwrap_or(15.0);
-    let filler_ramp_s = m.filler_ramp_s.unwrap_or(0.0);
-    let filler_max_bridge_s = m.filler_max_bridge_s.unwrap_or(5.0);
-    let filler_sway = m.filler_sway.unwrap_or(0.15);
-    let filler_sway_s = m.filler_sway_s.unwrap_or(16.0);
+    let filler_min_real_s = m.filler_min_real_s.unwrap_or(base.filler_min_real_s);
+    let filler_real_v = m.filler_real_v.unwrap_or(base.filler_real_v);
+    let filler_model_w = m.filler_model_w.unwrap_or(base.filler_model_w);
+    let filler_rate = m.filler_rate.unwrap_or(base.filler_rate);
+    let filler_amp = m.filler_amp.unwrap_or(base.filler_amp);
+    let filler_ramp_s = m.filler_ramp_s.unwrap_or(base.filler_ramp_s);
+    let filler_max_bridge_s = m.filler_max_bridge_s.unwrap_or(base.filler_max_bridge_s);
+    let filler_sway = m.filler_sway.unwrap_or(base.filler_sway);
+    let filler_sway_s = m.filler_sway_s.unwrap_or(base.filler_sway_s);
     let filler_pattern = match m.filler_pattern.as_deref() {
-        None => style::FillerPattern::Steady,
+        None => base.filler_pattern,
         Some(s) => style::FillerPattern::from_label(s)
             .with_context(|| format!("bad filler_pattern {s:?}"))?,
     };
-    let filler_burst = m.filler_burst.unwrap_or(4).max(1);
-    let filler_rest_s = m.filler_rest_s.unwrap_or(2.0);
+    let filler_burst = m.filler_burst.unwrap_or(base.filler_burst).max(1);
+    let filler_rest_s = m.filler_rest_s.unwrap_or(base.filler_rest_s);
     if filler_gap_s > 0.0 && !(1.0..=300.0).contains(&filler_rate) {
         anyhow::bail!("filler_rate {filler_rate} is out of range (1..300)");
     }
@@ -703,22 +823,20 @@ fn parse_params(body: &str) -> Result<(usize, style::Params)> {
     if !(0.0..=1.0).contains(&filler_model_w) {
         anyhow::bail!("filler_model_w must be 0..1 (1 = full model influence)");
     }
-    Ok((
-        m.clip,
-        style::Params {
+    Ok(style::Params {
             style: sty,
             dwells,
             stillness,
-            intensity: m.intensity,
-            env_seed: m.env_seed.unwrap_or(u64::MAX),
+            intensity,
+            env_seed: m.env_seed.map(|s| s.unwrap_or(u64::MAX)).unwrap_or(base.env_seed),
             range: (lo, hi),
-            max_speed: m.max_speed,
-            cut_ease: m.cut_ease.unwrap_or(style::CUT_EASE),
-            dwell_ramp: m.dwell_ramp,
-            still_eps: m.still_eps,
+            max_speed,
+            cut_ease,
+            dwell_ramp,
+            still_eps,
             depth,
-            depth_dose: m.depth_dose,
-            depth_window: m.depth_window,
+            depth_dose,
+            depth_window,
             filler_gap_s,
             filler_min_real_s,
             filler_real_v,
@@ -732,8 +850,18 @@ fn parse_params(body: &str) -> Result<(usize, style::Params)> {
             filler_pattern,
             filler_burst,
             filler_rest_s,
-        },
-    ))
+    })
+}
+
+/// Absent and `null` are two different answers -- absent keeps the base,
+/// `null` clears an override -- and serde folds both into `None` unless the
+/// field is nested one level deeper. This is that level.
+fn nullable<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 pub(crate) fn header(field: &str, value: &str) -> Header {
@@ -851,7 +979,7 @@ pub(crate) fn open_browser(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, Work};
+    use super::{parse_range, Choice, Work};
     use crate::style;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -867,7 +995,8 @@ mod tests {
     /// script on disk.
     #[test]
     fn the_queue_supersedes_in_flight_work_and_drains_on_the_way_out() {
-        let work = Arc::new(Work::new(vec![0, 0]));
+        let none = || super::Restyled { actions: 0, conf: Vec::new() };
+        let work = Arc::new(Work::new(vec![none(), none()]));
         let runs = Arc::new(AtomicUsize::new(0));
         // a styler that blocks on a gate, so "in flight" is a state the test
         // can actually hold the queue in
@@ -880,7 +1009,7 @@ mod tests {
             let (work, runs) = (Arc::clone(&work), Arc::clone(&runs));
             let (gate, entered) = (Arc::clone(&gate), Arc::clone(&entered));
             std::thread::spawn(move || {
-                work.style_until_done(&|_i: usize, p: &style::Params| {
+                work.style_until_done(&|_i: usize, p: &style::Params, _c: &Choice| {
                     entered.fetch_add(1, Ordering::SeqCst);
                     let (lk, cv) = &*gate;
                     let mut open = lk.lock().unwrap();
@@ -889,7 +1018,7 @@ mod tests {
                     }
                     runs.fetch_add(1, Ordering::SeqCst);
                     // the action count stands in for "which params ran"
-                    Ok((p.intensity * 100.0) as usize)
+                    Ok(super::Restyled { actions: (p.intensity * 100.0) as usize, conf: Vec::new() })
                 })
             })
         };
@@ -899,14 +1028,15 @@ mod tests {
             p.intensity = v;
             p
         };
-        work.request(0, at(0.1)); // the styler picks this up and blocks in it
+        let c = Choice { model: "m".into(), compare: None };
+        work.request(0, at(0.1), c.clone()); // the styler picks this up and blocks in it
         while entered.load(Ordering::SeqCst) < 1 {
             std::thread::yield_now();
         }
         // three more changes to the SAME clip while the first is running
-        work.request(0, at(0.2));
-        work.request(0, at(0.3));
-        work.request(0, at(0.4));
+        work.request(0, at(0.2), c.clone());
+        work.request(0, at(0.3), c.clone());
+        work.request(0, at(0.4), c);
 
         work.finish(); // Done, with work still outstanding
         let (lk, cv) = &*gate;
@@ -920,6 +1050,41 @@ mod tests {
         assert_eq!(work.actions()[0], 40, "the queue kept a stale change over the newest");
         assert!(!work.busy(0), "nothing is outstanding once the styler has drained");
         assert!(work.error().is_none());
+    }
+
+    /// The page posts the model and the compared model with every knob, so
+    /// absent keeps, `null` clears the compare, a script switched onto its
+    /// compared model compares with nothing, and a name the script does not
+    /// offer is refused before the styler sees it.
+    #[test]
+    fn a_choice_keeps_clears_and_refuses_as_the_page_means() {
+        let m = |n: &str, t: &str| crate::bundle::ModelInfo {
+            name: n.into(),
+            trunk: t.into(),
+        };
+        let clip = super::Clip {
+            name: "c".into(),
+            script: "s".into(),
+            video: "v".into(),
+            fallback: None,
+            is_original: true,
+            duration_ms: 0.0,
+            row_hz: 30.0,
+            row0_ms: 0.0,
+            t0_ms: 0.0,
+            crop: None,
+            model: "a".into(),
+            models: vec![m("a", "t1"), m("b", "t1"), m("c", "t2")],
+            compare: "k".into(),
+        };
+        let base = Choice { model: "a".into(), compare: Some("c".into()) };
+        let parse = |body: &str| super::parse_choice(body, &clip, &base);
+        assert_eq!(parse(r#"{"clip":0}"#).unwrap(), base);
+        assert_eq!(parse(r#"{"model":"b"}"#).unwrap(), Choice { model: "b".into(), compare: Some("c".into()) });
+        assert_eq!(parse(r#"{"compare":null}"#).unwrap().compare, None);
+        assert_eq!(parse(r#"{"model":"c"}"#).unwrap(), Choice { model: "c".into(), compare: None });
+        assert!(parse(r#"{"model":"z"}"#).is_err());
+        assert!(parse(r#"{"compare":"z"}"#).is_err());
     }
 
     #[test]

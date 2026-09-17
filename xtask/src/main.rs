@@ -415,17 +415,23 @@ fn readme(ver: &str, windows: bool, cuda: bool) -> String {
 
 /// NVIDIA's own runtime, packed beside the binary in every CUDA zip.
 ///
-/// This is the MINIMUM that draws a correct draft, measured against the
-/// runtime the CUDA packages actually carry by removing libraries until a
-/// graph broke. Three of them are direct imports of the CUDA provider --
-/// `cudart`, `cublas`, `cublasLt` -- and the rest are cuDNN, which the
-/// provider opens by name at the first node that needs it. Dropping
-/// `cudnn_engines_precompiled` fails the shot-cut detector's first
-/// convolution, and dropping cuDNN entirely fails its `ReduceL2`.
+/// This is the MEASURED MINIMUM that draws a correct draft, found by removing
+/// libraries until a graph broke, and one small spare beside it. Three of
+/// them are direct imports of the CUDA provider -- `cudart`, `cublas`,
+/// `cublasLt` -- and the rest are cuDNN, which the provider opens by name at
+/// the first node that needs it. Dropping `cudnn_engines_precompiled` fails
+/// the shot-cut detector's first convolution, and dropping cuDNN entirely
+/// fails its `ReduceL2`.
 ///
-/// What is NOT here is as measured as what is: `cudnn_adv`, `cudnn_cnn`,
-/// `cufft`, `curand` and `nvrtc` all ship with CUDA and none of them is
-/// reached -- 642 MB that changed no timing and broke no graph.
+/// The spare is `cudnn_cnn`, the one library here that no graph asks for. It
+/// weighs 4.4 MB, and it is the engine a reader expects a convolution to
+/// want, so it rides along and a graph that reaches for it finds it.
+///
+/// What is NOT here is as measured as what is: `cudnn_adv`, `cufft`, `curand`
+/// and `nvrtc` all ship with CUDA and none of them is reached -- 638 MB that
+/// changed no timing and broke no graph. That weight is also what an asset on
+/// a release page has no room for: either CUDA zip carrying it goes over the
+/// 2 GiB a release asset can weigh, so the four stay out for a second reason.
 ///
 /// They are IN the zip rather than a thing to go and install because ONNX
 /// Runtime loads its provider library in a way that does not resolve these
@@ -446,6 +452,7 @@ const CUDA_RUNTIME_WINDOWS: &[&str] = &[
     "cublas64_12.dll",
     "cublasLt64_12.dll",
     "cudnn64_9.dll",
+    "cudnn_cnn64_9.dll",
     "cudnn_engines_precompiled64_9.dll",
     "cudnn_engines_runtime_compiled64_9.dll",
     "cudnn_graph64_9.dll",
@@ -483,6 +490,7 @@ const CUDA_RUNTIME_LINUX: &[&str] = &[
     "libcublas.so.12",
     "libcublasLt.so.12",
     "libcudnn.so.9",
+    "libcudnn_cnn.so.9",
     "libcudnn_engines_precompiled.so.9",
     "libcudnn_engines_runtime_compiled.so.9",
     "libcudnn_graph.so.9",
@@ -651,57 +659,9 @@ fn main() -> Result<()> {
     }
 
     // what is about to be baked in -- a stale bundle should be seen, not shipped
-    let man = std::fs::read_to_string(root.join("bundle/manifest.json"))
-        .context("bundle/ is empty -- export a bundle from the training tree first")?;
-    let field = |key: &str| {
-        man.split(&format!("\"{key}\":"))
-            .nth(1)
-            .and_then(|s| s.split('"').nth(1))
-            .unwrap_or("?")
-            .to_string()
-    };
-    let enc_mb = std::fs::metadata(root.join("bundle/vjepa_pca.onnx"))?.len() / 1_000_000;
-    println!(
-        "bundle/: {} ({}, encoder graph {enc_mb} MB)",
-        field("checkpoint"),
-        field("enc_dtype"),
-    );
-    if field("enc_dtype") != "fp16" {
-        bail!("bundle/ is not fp16 -- only the fp16 model ships; re-export it");
+    for line in bundle_report(&root)? {
+        println!("{line}");
     }
-
-    // The row clock this bundle will write every action on. `bundle.rs` pins
-    // the arithmetic against a fixture and `grid_check.py` mirrors the constant
-    // from the training side, but neither of them ever sees the manifest that
-    // is about to be baked in -- a bundle exported on another grid would carry
-    // its own row_hz in here and be packed without a word. Row 0 is the
-    // midpoint of the tubelet pair (0, stride), and the clock is 1/row_hz.
-    let num = |key: &str| -> Option<f64> {
-        man.split(&format!("\"{key}\":"))
-            .nth(1)?
-            .trim_start()
-            .split([',', '\n', '}'])
-            .next()?
-            .trim()
-            .parse()
-            .ok()
-    };
-    let (stride, fps, row_hz) = match (num("tubelet_stride"), num("grid_fps"), num("row_hz")) {
-        (Some(s), Some(f), Some(r)) if f > 0.0 && r > 0.0 => (s, f, r),
-        _ => bail!("bundle/manifest.json has no readable row clock \
-                    (tubelet_stride / grid_fps / row_hz)"),
-    };
-    let row0 = 1000.0 * stride / 2.0 / fps;
-    // the same 33.333 ms `bundle.rs` calls SHIPPED_ROW0_MS
-    if (row0 - 33.333333).abs() >= 1e-4 || (row_hz - 30.0).abs() >= 1e-6 {
-        bail!(
-            "bundle/ is on a different row clock than the one the app decodes \
-             against: row 0 at {row0:.6} ms, {row_hz} rows/s (the shipped grid \
-             is 33.333333 ms and 30 rows/s). Every action would be written at \
-             the wrong time -- re-export from a checkpoint on the shipped grid."
-        );
-    }
-    println!("bundle/: row 0 at {row0:.3} ms, {row_hz} rows/s");
 
     // The language files ride BESIDE the exe rather than inside it: that is what
     // makes them editable, which is the whole point -- someone who does not read
@@ -866,4 +826,145 @@ fn main() -> Result<()> {
 
     println!("\ndist/ is ready.");
     Ok(())
+}
+
+/// What `bundle/` holds, as the lines the pack prints, and the refusals a
+/// bundle this build must not bake in: no bundle, a perception that is not
+/// fp16, a default pack the packs directory does not carry, or a row clock
+/// other than the one the app decodes against.
+///
+/// The manifest is read as TEXT: the perception's keys sit at the top level,
+/// each pack's under its name in `packs`, and the scrape takes the first
+/// occurrence of a key after its anchor -- so `checkpoint` is read after the
+/// default pack's own `"<name>": {` and never another pack's.
+fn bundle_report(root: &Path) -> Result<Vec<String>> {
+    let man = std::fs::read_to_string(root.join("bundle/manifest.json"))
+        .context("bundle/ is empty -- export a bundle from the training tree first")?;
+    let field = |text: &str, key: &str| {
+        text.split(&format!("\"{key}\":"))
+            .nth(1)
+            .and_then(|s| s.split('"').nth(1))
+            .unwrap_or("?")
+            .to_string()
+    };
+    let enc_mb = std::fs::metadata(root.join("bundle/vjepa_pca.onnx"))?.len() / 1_000_000;
+    // One perception, several models: every `bundle/packs/<name>/` is baked
+    // in, and the manifest's default is the one a draft with no `--model`
+    // runs. Named here with its checkpoint, so a stale pack is seen.
+    let default = field(&man, "default");
+    let mut packs: Vec<String> = std::fs::read_dir(root.join("bundle/packs"))
+        .context("bundle/packs/ is missing -- this build embeds a bundle of named packs")?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    packs.sort();
+    if !packs.contains(&default) {
+        bail!(
+            "bundle/manifest.json names default pack {default:?}, which bundle/packs/ \
+             does not hold ({})",
+            packs.join(", ")
+        );
+    }
+    // the default pack's own checkpoint: the scrape after its key
+    let ckpt = man
+        .split(&format!("\"{default}\": {{"))
+        .nth(1)
+        .map(|s| field(s, "checkpoint"))
+        .unwrap_or_else(|| "?".to_string());
+    let mut out = vec![format!(
+        "bundle/: default {default} ({ckpt}), packs {} ({}, encoder graph {enc_mb} MB)",
+        packs.join(", "),
+        field(&man, "enc_dtype"),
+    )];
+    if field(&man, "enc_dtype") != "fp16" {
+        bail!("bundle/ is not fp16 -- only the fp16 model ships; re-export it");
+    }
+
+    // The row clock this bundle will write every action on. `bundle.rs` pins
+    // the arithmetic against a fixture and `grid_check.py` mirrors the constant
+    // from the training side, but neither of them ever sees the manifest that
+    // is about to be baked in -- a bundle exported on another grid would carry
+    // its own row_hz in here and be packed without a word. Row 0 is the
+    // midpoint of the tubelet pair (0, stride), and the clock is 1/row_hz.
+    let num = |key: &str| -> Option<f64> {
+        man.split(&format!("\"{key}\":"))
+            .nth(1)?
+            .trim_start()
+            .split([',', '\n', '}'])
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let (stride, fps, row_hz) = match (num("tubelet_stride"), num("grid_fps"), num("row_hz")) {
+        (Some(s), Some(f), Some(r)) if f > 0.0 && r > 0.0 => (s, f, r),
+        _ => bail!("bundle/manifest.json has no readable row clock \
+                    (tubelet_stride / grid_fps / row_hz)"),
+    };
+    let row0 = 1000.0 * stride / 2.0 / fps;
+    // the same 33.333 ms `bundle.rs` calls SHIPPED_ROW0_MS
+    if (row0 - 33.333333).abs() >= 1e-4 || (row_hz - 30.0).abs() >= 1e-6 {
+        bail!(
+            "bundle/ is on a different row clock than the one the app decodes \
+             against: row 0 at {row0:.6} ms, {row_hz} rows/s (the shipped grid \
+             is 33.333333 ms and 30 rows/s). Every action would be written at \
+             the wrong time -- re-export from a checkpoint on the shipped grid."
+        );
+    }
+    out.push(format!("bundle/: row 0 at {row0:.3} ms, {row_hz} rows/s"));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::bundle_report;
+    use std::path::PathBuf;
+
+    /// A bundle of the shipped shape, written under the crate's own target
+    /// directory: the perception at the top level, two packs, the second
+    /// the default -- so the scrape has another pack's checkpoint to walk
+    /// past.
+    fn write(name: &str, default: &str, packs: &[&str]) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/xtask-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        for p in packs {
+            std::fs::create_dir_all(root.join("bundle/packs").join(p)).unwrap();
+        }
+        std::fs::write(root.join("bundle/vjepa_pca.onnx"), vec![0u8; 2_500_000]).unwrap();
+        let mut man = String::from(
+            "{\n  \"bundle_version\": 5,\n  \"enc_dtype\": \"fp16\",\n  \"grid_fps\": 30.0,\n  \
+             \"tubelet_stride\": 2,\n  \"row_hz\": 30.0,\n  \"packs\": {\n",
+        );
+        for p in packs {
+            man.push_str(&format!(
+                "    \"{p}\": {{\n      \"checkpoint\": \"runs/{p}/jepa_best.pt\",\n      \
+                 \"epoch\": 1\n    }},\n"
+            ));
+        }
+        man.push_str(&format!("    \"_\": {{}}\n  }},\n  \"default\": \"{default}\"\n}}\n"));
+        std::fs::write(root.join("bundle/manifest.json"), man).unwrap();
+        root
+    }
+
+    #[test]
+    fn the_report_names_the_default_pack_and_its_own_checkpoint() {
+        let root = write("two", "v0.5.1", &["v0.3.0", "v0.5.1"]);
+        let lines = bundle_report(&root).unwrap();
+        assert_eq!(
+            lines[0],
+            "bundle/: default v0.5.1 (runs/v0.5.1/jepa_best.pt), packs v0.3.0, v0.5.1 \
+             (fp16, encoder graph 2 MB)"
+        );
+        assert_eq!(lines[1], "bundle/: row 0 at 33.333 ms, 30 rows/s");
+    }
+
+    #[test]
+    fn a_default_the_packs_do_not_hold_refuses() {
+        let root = write("missing", "v0.9.0", &["v0.5.1"]);
+        let err = bundle_report(&root).unwrap_err().to_string();
+        assert!(err.contains("v0.9.0"), "{err}");
+    }
 }

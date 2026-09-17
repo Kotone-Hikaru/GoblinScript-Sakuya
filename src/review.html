@@ -112,6 +112,9 @@
              background: color-mix(in srgb, var(--hi) 34%, transparent); border-radius: 0; }
   #simhandle { position: absolute; left: -3px; right: -3px; height: 8px;
                background: var(--hi-bright); border-radius: 0; box-shadow: 0 0 0 1px #000; }
+  /* the compared model's position: a hollow mark on the same gauge */
+  #simghost { position: absolute; left: -3px; right: -3px; height: 8px; box-sizing: border-box;
+              border: 1px solid var(--ink-soft); background: rgba(0,0,0,.35); border-radius: 0; }
   #simpos { position: absolute; top: 100%; margin-top: 6px; width: 100%; text-align: center;
             font: 700 12px var(--chrome); color: var(--hi-bright); text-shadow: 0 0 4px #000; }
   #note { position: absolute; left: 12px; top: 10px; padding: 2px 8px; font-size: 11px;
@@ -146,9 +149,12 @@
      16px the video never gets back */
   #err { color: var(--danger-soft); font-size: 12px; }
   #err:empty { display: none; }
-  /* the wait a long video makes visible: a note, not a curtain -- the knobs
-     stay live because turning another one supersedes the style in flight */
-  #stylingNote { color: var(--hi); font-size: 12px; }
+  /* the wait a long video makes visible: a note over the frame, not a curtain --
+     the knobs stay live because turning another one supersedes the style in
+     flight */
+  #stylingNote { position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
+                 padding: 2px 8px; font-size: 12px; color: var(--hi); white-space: nowrap;
+                 background: rgba(0,0,0,.75); border: 1px solid var(--edge); pointer-events: none; }
   #stylingNote.hidden { display: none; }
   body.styling #strip, body.styling #timeline { opacity: .55; transition: opacity .12s; }
 
@@ -281,6 +287,12 @@
   /* strip caption: playback speed + the two heatmap legends */
   .stripcap { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
               font-size: 12px; color: var(--ink-soft); padding: 2px 2px 0; }
+  /* the model row: which line is the script and which lies under it, each
+     label wearing its own line's look */
+  #cmpcap { display: inline-flex; align-items: center; gap: 7px; }
+  #cmpcap .swatch { display: inline-block; width: 16px; vertical-align: middle;
+                    border-top: 2px solid var(--hi); }
+  #cmpcap .swatch.dash { border-top: 1px dashed var(--ink-soft); }
   .heatleg { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; }
   .heatbar { width: 96px; height: 8px; border-radius: 0; border: 1px solid var(--edge);
              background: linear-gradient(90deg,#33531d,#7cb342,#cddc39,#ffb300,#ef5350); }
@@ -347,12 +359,15 @@
       <div id="stage">
         <video id="vid" controls preload="metadata"></video>
         <div id="sim">
-          <div id="simtrack"><div id="simfill"></div><div id="simhandle"></div></div>
+          <div id="simtrack"><div id="simfill"></div><div id="simghost" class="hidden"></div><div id="simhandle"></div></div>
           <div id="simpos">–</div>
         </div>
         <div id="croprect" class="hidden"></div>
         <div id="note" class="hidden" data-t="page.workingcopy">480p working copy</div>
         <div id="confnote" class="hidden"></div>
+        <!-- over the frame rather than in the column, so the layout holds
+             still while the goblins work -->
+        <div id="stylingNote" class="hidden" data-t="page.styling">the goblins are re-scrawling this script&hellip;</div>
       </div>
       <canvas id="timeline" data-t-title="page.timeline.title" title="click or drag to scrub"></canvas>
       <canvas id="strip"></canvas>
@@ -369,6 +384,18 @@
           </select>
         </span>
         <span id="confcap" class="hidden"></span>
+        <span id="cmpcap" class="hidden">
+          <label for="model"><span class="swatch"></span> <span data-t="page.script">script</span></label>
+          <select id="model"></select>
+          <button type="button" id="cmpSwap" data-t-title="page.compare.swap.title"
+                  title="swap the script and the line under it (x)">⇄</button>
+          <label for="cmpSel"><span class="swatch dash"></span> <span data-t="page.compare">vs</span></label>
+          <select id="cmpSel"></select>
+          <button type="button" id="cmpPin" data-t-title="page.compare.pin.title"
+                  title="pin this script, its model and knobs, to compare with and come back to">📌 <span
+                  data-t="page.compare.pin">pin</span></button>
+          <button type="button" class="help" data-h="model">?</button>
+        </span>
         <span id="cropcap" class="hidden">
           <label for="cropShow"><input type="checkbox" id="cropShow" checked> <span
               data-t="page.crop">crop</span></label>
@@ -379,7 +406,6 @@
         <span class="heatleg"><span data-t="page.slow">slow</span> <span class="heatbar"></span> <span
             data-t="page.fast">fast</span></span>
       </div>
-      <div id="stylingNote" class="hidden" data-t="page.styling">the goblins are re-scrawling this script&hellip;</div>
       <div id="err"></div>
     </main>
 
@@ -563,6 +589,7 @@
           <div><kbd data-t="page.key.space">space</kbd> <span data-t="page.key.playpause">play / pause</span></div>
           <div><kbd>,</kbd> <kbd>.</kbd> <span data-t="page.key.speed">slower / faster</span></div>
           <div><kbd>c</kbd> <span data-t="page.key.crop">crop overlay</span></div>
+          <div><kbd>x</kbd> <span data-t="page.key.swap">swap the script and the line under it</span></div>
         </div>
       </div>
       <div class="rail-foot">
@@ -633,6 +660,10 @@ const timeline = $('timeline'), tlctx = timeline.getContext('2d');
 let state = null;     // /state payload
 let cur = 0;          // selected clip
 let actions = [];     // current clip's actions, sorted by .at
+let cmpActions = [];  // the line under the script: another model's or the pinned one, on the clip's clock
+// per clip: the pinned script (its model, knobs and line), and whether it is
+// the line under the script
+const pinned = {}, pinOn = {};
 let triedFallback = false;
 // model confidence for the current clip: the raw per-row [0,1] track (nulls
 // where unknown), a smoothed copy for display, its row clock, and the clip
@@ -964,6 +995,7 @@ function fillerPresetOf(p) {
 function syncControls() {
   const c = state.clips[cur];
   seedControls(c.params);
+  syncModels();
   $('flags').textContent = c.flags;
 }
 
@@ -1011,10 +1043,93 @@ async function selectClip(i) {
   cropSegs = (cropInfo && cropInfo.segs) || [];
   updateCropUI();
   renderTabs();
-  syncControls();  // this clip's own knobs + recipe
+  syncControls();  // this clip's own knobs, model + recipe
   updateStylingUI();
-  await Promise.all([fetchScript(), fetchConf()]);
+  await Promise.all([fetchScript(), fetchConf(), fetchCompare()]);
 }
+
+// ---- models ------------------------------------------------------------------
+// The row under the video: the model that writes this script, and the line
+// laid under it -- another model's, written with this script's knobs, or the
+// pinned script, which stays as it was pinned. Swap trades the two, so a
+// choice is made by flipping between them. A model on a trunk the draft has
+// not read the video with yet costs one wait, which the styling note covers.
+function syncModels() {
+  const c = state.clips[cur];
+  const models = (c && c.models) || [];
+  $('cmpcap').classList.toggle('hidden', !c);
+  const opt = (sel, value, text, off) => {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = text;
+    o.disabled = !!off;
+    sel.append(o);
+  };
+  const sel = $('model');
+  sel.innerHTML = '';
+  for (const m of models) opt(sel, m.name, m.name);
+  sel.value = c ? c.model : '';
+  // the script's own model stays listed, so the menu keeps its order
+  // through a swap, but a line cannot lie under itself
+  const cmp = $('cmpSel');
+  cmp.innerHTML = '';
+  opt(cmp, '', T('page.compare.none'));
+  for (const m of models) opt(cmp, m.name, m.name, c && m.name === c.model);
+  if (pinned[cur]) opt(cmp, '#pinned', T('page.compare.pinned'));
+  cmp.value = pinOn[cur] ? '#pinned' : ((c && c.compare) || '');
+  updateStylingUI();
+}
+async function fetchCompare() {
+  cmpActions = [];
+  if (pinOn[cur]) { cmpActions = pinned[cur].actions; return; }
+  const c = state.clips[cur];
+  if (!c || !c.compare) return;
+  const s = await (await fetch('/compare/' + cur)).json();
+  // the same clock rebase as the clip's own script
+  cmpActions = (s.actions || []).map(a => ({ ...a, at: a.at - (c.t0_ms || 0) }));
+}
+function pinNow() {
+  const c = state.clips[cur];
+  return { model: c.model, params: c.params, actions: actions.slice() };
+}
+// the script takes the line's place and the line the script's: a model
+// trades menus, the pinned script trades its model and knobs
+function swap() {
+  const c = state.clips[cur];
+  const v = $('cmpSel').value;
+  if (!c || !v || c.styling) return;
+  if (v === '#pinned') {
+    const p = pinned[cur];
+    pinned[cur] = pinNow();
+    cmpActions = pinned[cur].actions;
+    seedControls(p.params);
+    $('model').value = p.model;
+    postParams();
+  } else {
+    $('model').value = v;
+    postParams({ compare: c.model });
+  }
+}
+// choosing the compared model for the script is the same swap
+$('model').addEventListener('change', () => {
+  const c = state.clips[cur];
+  const back = !pinOn[cur] && $('model').value === $('cmpSel').value;
+  postParams(back ? { compare: c.model } : {});
+});
+$('cmpSel').addEventListener('change', () => {
+  pinOn[cur] = $('cmpSel').value === '#pinned';
+  postParams();
+});
+$('cmpSwap').addEventListener('click', swap);
+$('cmpPin').addEventListener('click', () => {
+  const c = state.clips[cur];
+  if (!c || c.styling) return;
+  pinned[cur] = pinNow();
+  pinOn[cur] = true;
+  syncModels();
+  cmpActions = pinned[cur].actions;
+  postParams();
+});
 // the probe can be wrong about one machine's browser: one retry on the
 // normalized copy, which plays everywhere
 vid.addEventListener('error', () => {
@@ -1048,11 +1163,13 @@ function depthBody() {
   return out;
 }
 
-async function postParams() {
+async function postParams(over = {}) {
   // the bank follows the switch on the click, not on the round trip
   syncFillerKnobs();
   const body = {
     clip: cur,  // the change is for the current script only
+    model: $('model').value || undefined,
+    compare: (!pinOn[cur] && $('cmpSel').value) || null,
     style: $('style').value,
     dwells: $('dwells').value,
     stillness: $('stillness').value,
@@ -1080,6 +1197,8 @@ async function postParams() {
     filler_pattern: $('fillPattern').value,
     filler_burst: parseInt($('fillBurst').value, 10) || 4,
     filler_rest_s: parseFloat($('fillRest').value) || 0,
+    // a swap names the compared model itself
+    ...over,
   };
   // The post RETURNS at once: styling a two-hour script is seconds of work, and
   // the goblins do it on their own thread so the video keeps streaming and Done
@@ -1114,7 +1233,9 @@ async function settle(epoch) {
   updateStylingUI();
   if (state.error) { $('err').textContent = state.error; return; }
   if (clip !== cur) return;             // the user moved to another script meanwhile
-  await fetchScript();  // the file on disk is this change's, now
+  // the file on disk is this change's, now -- and so are the compared line
+  // and the confidence, both of which follow the model
+  await Promise.all([fetchScript(), fetchCompare(), fetchConf()]);
 }
 // The one thing the page says while it waits: the knobs stay live (a change
 // mid-style is the supersede case, which is cheaper than making the user wait
@@ -1122,6 +1243,10 @@ async function settle(epoch) {
 function updateStylingUI() {
   const busy = !!(state.clips[cur] && state.clips[cur].styling);
   document.body.classList.toggle('styling', busy);
+  // pinning or swapping mid-style would take the knobs of one answer and the
+  // line of the one before it
+  $('cmpPin').disabled = busy;
+  $('cmpSwap').disabled = busy || !$('cmpSel').value;
   $('stylingNote').classList.toggle('hidden', !busy);
 }
 // the raw-number knobs + intensity/range restyle on change
@@ -1318,6 +1443,8 @@ document.addEventListener('keydown', e => {
       $('cropShow').checked = !$('cropShow').checked;
       drawCrop(vid.currentTime * 1000);
       break;
+    // judging two lines is flipping between them while the video plays
+    case 'x': case 'X': swap(); break;
     default: return;
   }
   e.preventDefault();
@@ -1326,8 +1453,8 @@ document.addEventListener('keydown', e => {
 // ---- simulator ----------------------------------------------------------------
 // position at time t, exactly how a player interpolates a funscript:
 // linear between neighbouring actions, held flat outside them
-function posAt(ms) {
-  const a = actions;
+function posAt(ms) { return posIn(actions, ms); }
+function posIn(a, ms) {
   if (!a.length) return null;
   if (ms <= a[0].at) return a[0].pos;
   if (ms >= a[a.length - 1].at) return a[a.length - 1].pos;
@@ -1347,6 +1474,10 @@ function drawSim(ms) {
   const y = (h - hh) * (1 - p / 100);
   $('simhandle').style.top = y + 'px';
   $('simfill').style.height = Math.max(0, h - y - hh) + 'px';
+  const g = $('simghost');
+  const q = cmpActions.length ? posIn(cmpActions, ms) : null;
+  g.classList.toggle('hidden', q === null);
+  if (q !== null) g.style.top = (h - hh) * (1 - q / 100) + 'px';
   $('simpos').textContent = Math.round(p);
 }
 
@@ -1529,6 +1660,21 @@ function drawStrip(ms) {
       sctx.fillStyle = coolA((0.1 + 0.5 * v).toFixed(3));
       sctx.fillRect(x, h - bh, 1, bh);
     }
+  }
+  // the compared model's line first, thin, dashed and unheated, so this
+  // clip's own heat line lies over it
+  if (cmpActions.length > 1) {
+    const a = cmpActions;
+    let lo = 0, hi = a.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (a[m].at < t0) lo = m; else hi = m; }
+    sctx.strokeStyle = hexA(C.inkSoft, .7);
+    sctx.lineWidth = 1;
+    sctx.setLineDash([3, 3]);
+    sctx.beginPath();
+    sctx.moveTo(X(a[lo].at), Y(a[lo].pos));
+    for (let i = lo + 1; i < a.length && a[i - 1].at <= t1 + 1000; i++) sctx.lineTo(X(a[i].at), Y(a[i].pos));
+    sctx.stroke();
+    sctx.setLineDash([]);
   }
   const a = actions;
   if (a.length > 1) {

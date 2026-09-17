@@ -1311,7 +1311,7 @@ mod tests {
     fn a_hand_drawn_plan_outlives_the_recipe_that_never_made_it() {
         // the fixture manifest, for the same reason `bundle.rs` uses it: a
         // bundle is a build product a source checkout does not have
-        let man: Manifest = serde_json::from_slice(
+        let file = crate::bundle::BundleFile::parse(
             &std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("tests/fixtures/manifest.json"),
@@ -1319,6 +1319,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let man: Manifest = file.resolve(&file.default).unwrap();
         let dir = std::env::temp_dir().join(format!("gs-croptest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let segs = vec![(0usize, (0.2, 0.1, 0.5, 0.5))];

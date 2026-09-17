@@ -447,11 +447,14 @@ fn run_chunk(
     let (rtop, rbot) = pair(man.heads.rev, "rev_top", "rev_bot")?;
     let period = if man.heads.period { take("period")? } else { Vec::new() };
 
-    // envelope: one step per row, buffer reseeded at the chunk boundary
+    // envelope: one step per row. The graph owns the recurrence: it takes
+    // every member's trunk features and every member's context buffer end
+    // to end, and hands back the voted value and the next state. The state
+    // is opaque here and reseeded with zeros at the chunk boundary
     let (hshape, h) = out["h"].try_extract_tensor::<f32>().map_err(ort_err)?;
     let c = hshape[1] as usize;
     let w = hshape[2] as usize;
-    let mut buf = vec![0.0f32; man.env_ctx];
+    let mut state = vec![0.0f32; man.env_state];
     let mut ht = vec![0.0f32; c];
     let mut eg = Vec::with_capacity(keep);
     for i in 0..w {
@@ -460,16 +463,16 @@ fn run_chunk(
         }
         let hv = ort::value::TensorRef::from_array_view((vec![1i64, c as i64, 1], &ht[..]))
             .map_err(ort_err)?;
-        let bv = ort::value::TensorRef::from_array_view((vec![1i64, man.env_ctx as i64], &buf[..]))
+        let sv = ort::value::TensorRef::from_array_view((vec![1i64, man.env_state as i64], &state[..]))
             .map_err(ort_err)?;
         let eo = if man.env_flow {
             let e0 = [env_base_draw((fs + i) as u64, man.env_seed, man.env_base_hi)];
             let ev0 = ort::value::TensorRef::from_array_view((vec![1i64, 1], &e0[..]))
                 .map_err(ort_err)?;
-            env.run(ort::inputs!["h_t" => hv, "buf" => bv, "e0" => ev0])
+            env.run(ort::inputs!["h_t" => hv, "state" => sv, "e0" => ev0])
                 .map_err(ort_err)?
         } else {
-            env.run(ort::inputs!["h_t" => hv, "buf" => bv])
+            env.run(ort::inputs!["h_t" => hv, "state" => sv])
                 .map_err(ort_err)?
         };
         let (_s, ev) = eo["env"].try_extract_tensor::<f32>().map_err(ort_err)?;
@@ -477,8 +480,14 @@ fn run_chunk(
         if i >= off && i < off + keep {
             eg.push(et as f64);
         }
-        buf.rotate_right(1);
-        buf[0] = et;
+        let (_s, next) = eo["state_next"].try_extract_tensor::<f32>().map_err(ort_err)?;
+        anyhow::ensure!(
+            next.len() == state.len(),
+            "env_step handed back a state of {} values for a manifest env_state of {}",
+            next.len(),
+            state.len()
+        );
+        state.copy_from_slice(next);
     }
 
     Ok(ChunkOut {

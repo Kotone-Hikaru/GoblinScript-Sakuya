@@ -24,6 +24,7 @@ mod ffmpeg;
 mod heads;
 mod lang;
 mod review;
+mod serve;
 mod settings;
 mod sound;
 mod style;
@@ -37,7 +38,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use console::style;
 use indicatif::ProgressBar;
 use theme::{con, theme};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,7 +66,7 @@ use std::time::Instant;
 use bundle::Bundle;
 use cache::{Cache, CacheMeta};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "goblinscript", version, about = "Video in, funscript out. Made by real goblins.")]
 struct Cli {
     /// Video file(s) to draft, a FOLDER (every video in it, sub-folders not
@@ -281,6 +282,21 @@ struct Cli {
     #[arg(long)]
     review: bool,
 
+    /// Run as an API server for another program -- a funscript editor, a
+    /// script -- instead of drafting a list of videos. Binds to localhost only
+    /// and prints one JSON line with the port and the access token, then
+    /// answers requests until its standard input closes or a client asks it
+    /// to quit. Every drafting option on this command line is the
+    /// configuration each session drafts under. `goblinscript --serve --help`
+    /// is this text; the routes are documented in README.md.
+    #[arg(long)]
+    serve: bool,
+
+    /// The port `--serve` listens on; 0 picks a free one, which the handshake
+    /// line then names.
+    #[arg(long, value_name = "PORT", default_value_t = 0)]
+    port: u16,
+
     /// Aim VR sources before drafting them, in a browser page: point one flat
     /// viewport at the action (and optionally trim the part worth drafting),
     /// and the goblins see ordinary 2D footage from there on.
@@ -400,6 +416,27 @@ struct Cli {
     /// Load the ONNX bundle from a directory instead of the baked-in one.
     #[arg(long, value_name = "DIR")]
     bundle: Option<PathBuf>,
+
+    /// Draft with this model instead of the bundle's default. A bundle
+    /// carries one perception and several models, each named for the
+    /// release that shipped it; `--dump-bundle` writes them out under
+    /// packs/, and the API's /health names them.
+    #[arg(long, value_name = "NAME")]
+    model: Option<String>,
+
+    /// Draft every named model over ONE encode of each video, comma
+    /// separated. The chosen model (`--model`, else the default) writes
+    /// <stem>.funscript as always, and every other one
+    /// <stem>.<model>.funscript beside it. A review has no use for it: the
+    /// page offers every model of the bundle, prepared while drafting.
+    #[arg(long, value_name = "A,B", value_delimiter = ',', conflicts_with = "review")]
+    models: Vec<String>,
+
+    /// The name a second model's draft carries between the stem and the
+    /// extension; set by the batch for every model after the chosen one,
+    /// never from the command line.
+    #[arg(skip)]
+    out_suffix: Option<String>,
 
     /// Write the goblins out to a folder and stop: the model baked into this
     /// exe, as the files it was packed from. A GoblinScript built from source
@@ -602,6 +639,20 @@ impl Drop for RawMode {
     }
 }
 
+/// Where a draft's stage events go besides the console. The API server
+/// (`serve`) hands one to `draft` so a client can read the stage in flight
+/// and the ones that cleared; a console run passes none. `stage` hands over
+/// the hidden bar the stage drives, so the listener reads progress off the
+/// same counter the live line does. `page` is a stage that waits on a
+/// person: the browser page at `url` is open, and the stage ends when its
+/// Done button is pressed.
+pub trait StageSink: Send + Sync {
+    fn setup(&self, key: &str);
+    fn stage(&self, key: &str, pb: &ProgressBar);
+    fn page(&self, key: &str, url: &str);
+    fn done(&self, key: &str, info: &str);
+}
+
 /// A single-line, resize-proof progress display. On a non-terminal (piped/logged)
 /// it degrades to plain permanent lines and draws no live line at all.
 struct Live {
@@ -609,10 +660,11 @@ struct Live {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
     tty: bool,
+    sink: Option<Arc<dyn StageSink>>,
 }
 
 impl Live {
-    fn new() -> Live {
+    fn new(sink: Option<Arc<dyn StageSink>>) -> Live {
         // A draft opens with no stage in flight. The marker is otherwise left
         // set by a stage that was interrupted rather than finished, and the
         // next failure would inherit it.
@@ -643,7 +695,7 @@ impl Live {
         } else {
             None
         };
-        Live { state, stop, handle, tty }
+        Live { state, stop, handle, tty, sink }
     }
 
     /// Open a stage that cannot be measured yet -- the graph it needs is still
@@ -656,6 +708,9 @@ impl Live {
     /// stages.
     fn setup(&self, key: &str, note: &str) {
         errlog::stage(Some(lang::en(key)));
+        if let Some(s) = &self.sink {
+            s.setup(key);
+        }
         self.state.lock().unwrap().stage = Some(Stage {
             label: lang::t(key).to_string(),
             pb: None,
@@ -673,6 +728,9 @@ impl Live {
         errlog::stage(Some(lang::en(key)));
         let pb = ProgressBar::hidden();
         pb.set_length(len.max(1));
+        if let Some(s) = &self.sink {
+            s.stage(key, &pb);
+        }
         self.state.lock().unwrap().stage = Some(Stage {
             label: lang::t(key).to_string(),
             pb: Some(pb.clone()),
@@ -682,12 +740,24 @@ impl Live {
         pb
     }
 
+    /// A stage that waits on a person at a browser page. The console prints
+    /// the URL itself; this tells the listener, which is how an editor learns
+    /// where the page is.
+    fn page(&self, key: &str, url: &str) {
+        if let Some(s) = &self.sink {
+            s.page(key, url);
+        }
+    }
+
     /// End the current stage and record its summary line, laid out with the
     /// same dot leader and right-hand chip as the startup report.
     fn done(&self, key: &str, info: &str) {
         // Between stages there is no stage: a failure in the gap belongs to
         // the draft, not to the stage that just cleared.
         errlog::stage(None);
+        if let Some(s) = &self.sink {
+            s.done(key, info);
+        }
         let line = done_line(lang::t(key), info);
         self.state.lock().unwrap().stage = None;
         self.println(line);
@@ -1044,15 +1114,26 @@ struct DraftOut {
     name: String,
     /// The source video -- the review page streams it when a browser can.
     src: PathBuf,
+    /// The shot cuts the tracks were decoded against, video milliseconds on
+    /// the draft's clock: what the flag channel and `shot_edges` were built
+    /// from. A re-decode at other cuts replaces both together.
+    cuts_ms: Vec<f64>,
     /// The one normalized file this draft decoded from, when a transcode
     /// happened -- the review page's fallback (and, for VR, only) picture.
     norm: Option<PathBuf>,
     dst: PathBuf,
     tracks: style::Tracks,
+    /// The trunk `tracks` were decoded by (`Bundle::trunk`). A model on
+    /// another trunk needs its own head pass; a model on this one is a
+    /// restyle.
+    trunk: String,
     /// The authorship seed `tracks` were decoded at. A review that moves the
     /// seed has to re-run the head stage -- styling cannot reach the
     /// envelope -- and this is what says whether it must.
     tracks_seed: u64,
+    /// Tracks this draft made and set aside, by (trunk, seed): what a switch
+    /// back to a model or a seed already visited takes instead of a head pass.
+    shelf: HashMap<(String, u64), style::Tracks>,
     shot_edges: Vec<usize>,
     times: Vec<f64>,
     cache_dir: PathBuf,
@@ -1072,6 +1153,41 @@ struct DraftOut {
     /// taken: what the review page draws over the video. `None` = the goblins
     /// saw the whole frame -- the probe skipped, or its answer was identity.
     crop: Option<autocrop::View>,
+    /// The model that drafted it, as the bundle's pack name: what the review
+    /// re-decodes and re-styles it with, and what its tab says beside a
+    /// name another model's draft shares.
+    pack: String,
+}
+
+/// A draft as the review page sees it. Probe-and-fallback source choice: the
+/// ORIGINAL when every browser plays it (full quality), the cache's
+/// normalized copy when not. A VR draft has exactly one matching picture,
+/// the reprojected copy: never the original, however playable -- it is two
+/// equirect eyes.
+fn review_clip(o: &DraftOut, b: &Bundle) -> Result<review::Clip> {
+    let man = &b.manifest;
+    let norm = o.norm.clone().filter(|p| p.exists());
+    let (video, fallback, is_original) = match norm {
+        Some(n) if o.is_vr => (n, None, false),
+        n if ffmpeg::browser_playable(&o.src) => (o.src.clone(), n, true),
+        Some(n) => (n, None, false),
+        None => (o.src.clone(), None, true), // --no-transcode dev runs
+    };
+    Ok(review::Clip {
+        name: o.name.clone(),
+        script: o.dst.clone(),
+        video,
+        fallback,
+        is_original,
+        duration_ms: o.dur_ms,
+        row_hz: man.row_hz(),
+        row0_ms: man.row_ms(0),
+        t0_ms: o.t0_ms,
+        crop: o.crop.clone(),
+        model: o.pack.clone(),
+        models: b.models()?,
+        compare: o.cache_dir.join("compare.funscript"),
+    })
 }
 
 /// One video's verdict. The payload is large next to `Skipped`, and boxing it
@@ -1163,7 +1279,7 @@ struct Funscript<'a> {
     version: &'static str,
     inverted: bool,
     range: i64,
-    metadata: FunMeta,
+    metadata: FunMeta<'a>,
     actions: &'a [style::Action],
 }
 
@@ -1173,42 +1289,86 @@ struct Funscript<'a> {
 /// sequence reads hot under the corpus rarity prior, artifacts.rs) when
 /// any exist. The review page reads both to draw timeline bands.
 #[derive(serde::Serialize)]
-struct FunMeta {
+struct FunMeta<'a> {
     author: &'static str,
     tags: &'static [&'static str],
+    /// the model and the flags that wrote the script, so it can be made again
+    model: &'a str,
+    settings: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     filler: Vec<[i64; 2]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     artifacts: Vec<[i64; 2]>,
 }
 
-/// Compose + shape + write: everything downstream of the head's tracks.
-/// This is the whole cost of changing a styling parameter -- milliseconds --
-/// so the review loop can rewrite on every keypress. Returns the action
-/// count plus the artifact-rarity spans/rate (artifacts.rs) of the
-/// written list, for the batch summary readout.
-/// Re-decode the envelope at a new authorship seed, from the latents the
+/// The seed a style decodes at on this model: the params' own, or the
+/// model's (`u64::MAX` is "whatever the bundle says").
+fn seed_for(b: &Bundle, p: &style::Params) -> u64 {
+    if p.env_seed == u64::MAX {
+        b.manifest.env_seed
+    } else {
+        p.env_seed
+    }
+}
+
+/// Put the tracks of `b`'s model at `seed` in hand, from the latents the
 /// draft left behind.
 ///
-/// The seed feeds `env_step`, which is the HEAD stage, so a restyle cannot
-/// reach it -- the tracks themselves have to be made again. Everything the
-/// re-run needs is already held: the latents sit in the draft's own cache
-/// until the review is finished, and the interior shot edges ARE the cut
-/// rows the flag channel was built from. Seconds to a minute per clip
-/// against milliseconds for a restyle, which is why the page treats it as
-/// work rather than as a knob.
-fn reseed(d: &mut DraftOut, b: &Bundle, man: &bundle::Manifest, seed: u64) -> Result<()> {
-    if d.tracks_seed == seed {
+/// A model is a trunk and a set of decode constants. The constants are the
+/// styler's, so a model on the trunk in hand is only a new name. The seed
+/// feeds `env_step` and the trunk is the head graph itself, so either one
+/// moving needs tracks made by the HEAD stage -- unless this draft made them
+/// before and shelved them. Everything the head pass needs is already held:
+/// the latents sit in the draft's own cache until the review is finished,
+/// and the cuts and the crop they were encoded under belong to the video,
+/// not to a model. Seconds to a minute per clip against milliseconds for a
+/// restyle, which is why the page and the API treat it as work rather than
+/// as a knob.
+fn retrack(d: &mut DraftOut, b: &Bundle, seed: u64) -> Result<()> {
+    d.pack = b.manifest.pack.clone();
+    let key = (b.trunk(), seed);
+    if d.trunk == key.0 && d.tracks_seed == seed {
         return Ok(());
     }
-    let mut man = man.clone();
+    let tracks = match d.shelf.remove(&key) {
+        Some(t) => t,
+        None => head_pass(d, b, seed)?,
+    };
+    let old = std::mem::replace(&mut d.tracks, tracks);
+    let old_key = (std::mem::replace(&mut d.trunk, key.0), d.tracks_seed);
+    d.shelf.insert(old_key, old);
+    d.tracks_seed = seed;
+    Ok(())
+}
+
+/// Shelve the tracks of every model of the bundle for a review: one head
+/// pass per trunk the draft does not hold yet, at the seed the page opens on,
+/// and the drafted model back in hand. What makes every model on the page a
+/// restyle rather than a wait.
+fn pretrack(d: &mut DraftOut, b: &Bundle, params: &style::Params) -> Result<()> {
+    for m in b.pack_names() {
+        let mb = b.select(&m)?;
+        let key = (mb.trunk(), seed_for(&mb, params));
+        if (d.trunk == key.0 && d.tracks_seed == key.1) || d.shelf.contains_key(&key) {
+            continue;
+        }
+        println!("  {}", style(t!("console.pretrack", model = m)).fg(con(theme().muted)));
+        retrack(d, &mb, key.1)?;
+    }
+    retrack(d, b, seed_for(b, params))
+}
+
+/// The head stage alone, over the draft's cached latents, on `b`'s trunk at
+/// `seed`: the tracks the encode stage would have made alongside them.
+fn head_pass(d: &DraftOut, b: &Bundle, seed: u64) -> Result<style::Tracks> {
+    let mut man = b.manifest.clone();
     man.env_seed = seed;
     let head = b.head_session()?;
     let env = b
         .env_session()?
         .context("this bundle has no envelope graph -- composed styling needs one")?;
     let n = d.shot_edges.last().copied().unwrap_or(0);
-    let cut_rows: Vec<usize> = d.shot_edges[1..d.shot_edges.len().saturating_sub(1)].to_vec();
+    let cut_rows = boundaries::cut_rows(&d.cuts_ms, |i| man.row_ms(i));
     let mut heads = heads::Heads::new(head, env, &man, cut_rows);
     let lat = encode::Latents {
         path: d.cache_dir.join("latents.i8"),
@@ -1217,16 +1377,88 @@ fn reseed(d: &mut DraftOut, b: &Bundle, man: &bundle::Manifest, seed: u64) -> Re
     };
     let pb = indicatif::ProgressBar::hidden();
     heads::stream_cache(&lat, &mut heads, None, &man, &pb)?;
-    d.tracks = heads.finish(n, &d.shot_edges)?;
-    d.tracks_seed = seed;
-    Ok(())
+    heads.finish(n, &d.shot_edges)
 }
 
+/// One styled list, on the SOURCE clock, with the readouts the file and the
+/// API carry beside it.
+struct Styled {
+    actions: Vec<style::Action>,
+    /// ms ranges the background rhythm replaced
+    filler: Vec<[i64; 2]>,
+    /// ms ranges whose action sequence reads hot under the rarity prior
+    artifacts: Vec<[i64; 2]>,
+    art_rate: f64,
+}
+
+/// Compose + shape + write: everything downstream of the head's tracks.
+/// This is the whole cost of changing a styling parameter -- milliseconds --
+/// so the review loop can rewrite on every keypress. Returns the action
+/// count plus the artifact-rarity spans/rate (artifacts.rs) of the
+/// written list, for the batch summary readout.
 fn restyle(
     d: &DraftOut,
     man: &bundle::Manifest,
     params: &style::Params,
 ) -> Result<(usize, Vec<[i64; 2]>, f64)> {
+    let s = style_draft(d, man, params, &[]);
+    write_styled(&d.dst, &s, man, params)?;
+    Ok((s.actions.len(), s.artifacts, s.art_rate))
+}
+
+/// One styled list as a funscript at `path`.
+fn write_styled(path: &Path, s: &Styled, man: &bundle::Manifest, p: &style::Params) -> Result<()> {
+    let script = Funscript {
+        version: "1.0",
+        inverted: false,
+        range: 100,
+        metadata: FunMeta {
+            author: AUTHOR,
+            tags: TAGS,
+            model: &man.pack,
+            settings: style::flags_line(p),
+            filler: s.filler.clone(),
+            artifacts: s.artifacts.clone(),
+        },
+        actions: &s.actions,
+    };
+    std::fs::write(path, serde_json::to_vec(&script)?)
+        .with_context(|| format!("could not write {}", path.display()))
+}
+
+/// The review's re-style of one draft: its model's tracks in hand at the
+/// params' seed, the script written, and -- when the page compares -- the
+/// other model's line at the same knobs, written to `compare`. The compared
+/// model is styled first so the draft ends with its own model's tracks in
+/// hand. Returns the script's action count and its model's confidence.
+fn review_style(
+    d: &mut DraftOut,
+    b: &Bundle,
+    p: &style::Params,
+    choice: &review::Choice,
+    compare: &Path,
+) -> Result<review::Restyled> {
+    if let Some(m) = &choice.compare {
+        let cb = b.select(m)?;
+        retrack(d, &cb, seed_for(&cb, p))?;
+        write_styled(compare, &style_draft(d, &cb.manifest, p, &[]), &cb.manifest, p)?;
+    }
+    let bb = b.select(&choice.model)?;
+    retrack(d, &bb, seed_for(&bb, p))?;
+    let (actions, _, _) = restyle(d, &bb.manifest, p)?;
+    Ok(review::Restyled { actions, conf: d.tracks.conf.clone() })
+}
+
+/// Compose + shape, and the author's pins over the result: the styled list
+/// itself, which `restyle` writes and the API answers with. `pins` are
+/// vertices on the source clock (`style::pin_actions`); a console draft has
+/// none.
+fn style_draft(
+    d: &DraftOut,
+    man: &bundle::Manifest,
+    params: &style::Params,
+    pins: &[style::Action],
+) -> Styled {
     let cfg = style_cfg(man, params);
     // Level styling is carrier-only: no event segmentation, no sub-frame
     // times, no forced apexes -- exactly jepa_infer's non-composed path.
@@ -1275,24 +1507,14 @@ fn restyle(
             ]
         })
         .collect();
+    // the author's pins, on the source clock like the actions they join --
+    // after the device cap on purpose: a pin is the author's placement, and
+    // a transition they asked for is theirs to keep
+    let actions = style::pin_actions(&actions, pins);
     // the rarity instrument runs on the final written list (post-shape,
     // source clock), exactly what jepa_infer's panel line scores
     let (artifacts, art_rate) = artifacts::artifact_events(&actions);
-    let script = Funscript {
-        version: "1.0",
-        inverted: false,
-        range: 100,
-        metadata: FunMeta {
-            author: AUTHOR,
-            tags: TAGS,
-            filler,
-            artifacts: artifacts.clone(),
-        },
-        actions: &actions,
-    };
-    std::fs::write(&d.dst, serde_json::to_vec(&script)?)
-        .with_context(|| format!("could not write {}", d.dst.display()))?;
-    Ok((actions.len(), artifacts, art_rate))
+    Styled { actions, filler, artifacts, art_rate }
 }
 
 /// One video, end to end.
@@ -1308,8 +1530,25 @@ fn script_dst(cli: &Cli, video: &Path) -> PathBuf {
     // name that is not the video's -- which is also the name the skip rule
     // looks for next run, so the draft would be made again every time.
     let mut name = video.file_stem().unwrap_or_default().to_os_string();
+    if let Some(model) = &cli.out_suffix {
+        name.push(".");
+        name.push(model);
+    }
     name.push(".funscript");
     out_dir.join(name)
+}
+
+/// The model the run drafts with: `--model`, else the bundle's default, and
+/// every `--models` name checked against the bundle before a video is
+/// touched, so a wrong name fails here and not after an encode.
+fn pick_model(b: Bundle, cli: &Cli) -> Result<Bundle> {
+    for m in &cli.models {
+        b.select(m)?;
+    }
+    match &cli.model {
+        Some(m) => b.select(m),
+        None => Ok(b),
+    }
 }
 
 /// What made the script already sitting beside a video. Shown wherever an
@@ -1389,10 +1628,11 @@ fn will_skip(cli: &Cli, video: &Path) -> bool {
 ///
 /// It opens by default, because the crop is the one decision in the pipeline
 /// a person can make better than the goblins in a glance -- they can see what
-/// the video is of. Two runs are skipped rather than asked: a PIPED one has
-/// nobody to answer the page (`--crop-edit` demands it anyway, for driving
-/// the endpoints), and a re-run whose plan came off the cache already carries
-/// the answer the first run gave, hand-drawn or accepted.
+/// the video is of. Two runs are skipped rather than asked: a PIPED one with
+/// no API client has nobody to answer the page (`--crop-edit` demands it
+/// anyway, for driving the endpoints), and a re-run whose plan came off the
+/// cache already carries the answer the first run gave, hand-drawn or
+/// accepted.
 fn crop_page(
     cli: &Cli,
     live: &Live,
@@ -1402,7 +1642,8 @@ fn crop_page(
     dur_ms: f64,
     man: &bundle::Manifest,
 ) -> Result<Option<autocrop::Plan>> {
-    if !(cli.crop_edit || (!cli.no_crop_edit && live.tty && probed)) {
+    let someone = live.tty || live.sink.is_some();
+    if !(cli.crop_edit || (!cli.no_crop_edit && someone && probed)) {
         return Ok(None);
     }
     let (w, h) = ffmpeg::dims(norm)?;
@@ -1414,7 +1655,15 @@ fn crop_page(
         man.grid_fps,
         w as f64 / h.max(1) as f64,
         !cli.no_browser,
-        &|line| live.println(line),
+        &|url| {
+            live.page("console.stage.cropedit", url);
+            live.println(format!(
+                "  {} {}  {}",
+                t!("console.cropedit.label"),
+                style(url).cyan().bold(),
+                style(t!("console.cropedit.hint")).dim()
+            ));
+        },
     )?;
     if edited.is_none() {
         live.done("console.stage.cropedit", t!("console.cropedit.kept"));
@@ -1580,64 +1829,25 @@ fn vr_prep(
         if will_skip(cli, v) {
             continue; // already scripted -- nothing here will be drafted
         }
-        let sidecar = match vr::sidecar_path(cache_root, v) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let saved = vr::load(&sidecar);
         let hand_marked = marked.contains(v);
-        // A saved sidecar is the user's own earlier answer -- including "not
-        // VR", which must keep meaning that on every later run. Marking the
-        // video VR in the picker just now is a NEWER answer, so it reopens the
-        // question: the aim (if it ever had one) is kept, the "not VR" is not.
-        let (cfg, dur_ms, w, h) = match (saved, vr::detect(v)) {
-            (Some(mut c), d) if hand_marked && c.skip => {
-                fresh += 1;
-                c.skip = false;
-                c.touched = false;
-                let (w, h, dur) = d
-                    .map(|d| (d.w, d.h, d.dur_ms))
-                    .unwrap_or((0, 0, ffmpeg::duration_ms(v).unwrap_or(0.0)));
-                (c, dur, w, h)
-            }
-            (Some(c), d) => {
-                let (w, h, dur) = d
-                    .map(|d| (d.w, d.h, d.dur_ms))
-                    .unwrap_or((0, 0, ffmpeg::duration_ms(v).unwrap_or(0.0)));
-                (c, dur, w, h)
-            }
-            (None, Some(d)) => {
-                fresh += 1;
-                println!(
-                    "  {} {}  {}",
-                    style("[ VR ]").fg(con(th.accent)).bold(),
-                    style(v.file_name().unwrap_or_default().to_string_lossy())
-                        .fg(con(th.accent)),
-                    style(&d.why).fg(con(th.muted))
-                );
-                (d.cfg, d.dur_ms, d.w, d.h)
-            }
-            // Not detected. A hand mark (or `--vr`) says the detector is wrong,
-            // so offer it anyway on whatever the probe could tell us.
-            (None, None) if cli.vr || hand_marked => {
-                fresh += 1;
-                let dur = ffmpeg::duration_ms(v).unwrap_or(0.0);
-                (vr::Config::default(), dur, 0, 0)
-            }
-            (None, None) => continue,
+        let Some(need) = vr_need(v, cache_root, hand_marked, cli.vr) else {
+            continue;
         };
+        if need.fresh {
+            fresh += 1;
+        }
+        if let Some(why) = &need.why {
+            println!(
+                "  {} {}  {}",
+                style("[ VR ]").fg(con(th.accent)).bold(),
+                style(v.file_name().unwrap_or_default().to_string_lossy()).fg(con(th.accent)),
+                style(why).fg(con(th.muted))
+            );
+        }
         if hand_marked {
             hand += 1;
         }
-        clips.push(vr::Clip {
-            name: v.file_name().unwrap_or_default().to_string_lossy().to_string(),
-            src: v.clone(),
-            sidecar,
-            cfg,
-            dur_ms,
-            src_w: w,
-            src_h: h,
-        });
+        clips.push(need.clip);
     }
 
     if clips.is_empty() {
@@ -1689,7 +1899,14 @@ fn vr_prep(
     // Music always stops for a browser step: the page is where the attention is.
     let was_music = sound::music_on();
     sound::set_music(false);
-    let done = vr::prep(clips, !cli.no_browser);
+    let done = vr::prep(clips, !cli.no_browser, &|url| {
+        println!(
+            "\n  {} {}  {}",
+            style("[ VR ]").fg(con(th.accent)).bold(),
+            style(url).fg(con(th.accent)).bold(),
+            style(t!("console.vr.hint")).fg(con(th.muted))
+        );
+    });
     if was_music {
         sound::set_music(true);
     }
@@ -1697,6 +1914,69 @@ fn vr_prep(
         map.insert(c.src.clone(), c.cfg);
     }
     Ok(map)
+}
+
+/// A video that wants the aiming page, or would if nobody had answered
+/// for it yet. `None` is a flat video: the detector saw nothing and nobody
+/// says otherwise.
+struct VrNeed {
+    clip: vr::Clip,
+    /// Nobody has answered for this video: no sidecar, or a "not VR" that a
+    /// hand mark just reopened.
+    fresh: bool,
+    /// The detector's reason, when this run is the first to see it as VR.
+    why: Option<String>,
+}
+
+/// What `video` needs before it is drafted. `marked` is a hand mark on the
+/// video -- the picker's, or an API client's -- and `force` is `--vr`: both
+/// say the video is VR whatever the detector thinks.
+///
+/// A saved sidecar is the user's own earlier answer -- including "not VR",
+/// which must keep meaning that on every later run. A hand mark just now is
+/// a NEWER answer, so it reopens the question: the aim (if it ever had one)
+/// is kept, the "not VR" is not.
+fn vr_need(video: &Path, cache_root: &Path, marked: bool, force: bool) -> Option<VrNeed> {
+    let sidecar = vr::sidecar_path(cache_root, video).ok()?;
+    let saved = vr::load(&sidecar);
+    let probe = |d: &Option<vr::Detected>| {
+        d.as_ref()
+            .map(|d| (d.w, d.h, d.dur_ms))
+            .unwrap_or((0, 0, ffmpeg::duration_ms(video).unwrap_or(0.0)))
+    };
+    let (cfg, dur_ms, w, h, fresh, why) = match (saved, vr::detect(video)) {
+        (Some(mut c), d) if marked && c.skip => {
+            c.skip = false;
+            c.touched = false;
+            let (w, h, dur) = probe(&d);
+            (c, dur, w, h, true, None)
+        }
+        (Some(c), d) => {
+            let (w, h, dur) = probe(&d);
+            (c, dur, w, h, false, None)
+        }
+        (None, Some(d)) => (d.cfg, d.dur_ms, d.w, d.h, true, Some(d.why)),
+        // Not detected. A hand mark (or `--vr`) says the detector is wrong,
+        // so offer it anyway on whatever the probe could tell us.
+        (None, None) if force || marked => {
+            let dur = ffmpeg::duration_ms(video).unwrap_or(0.0);
+            (vr::Config::default(), dur, 0, 0, true, None)
+        }
+        (None, None) => return None,
+    };
+    Some(VrNeed {
+        clip: vr::Clip {
+            name: video.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            src: video.to_path_buf(),
+            sidecar,
+            cfg,
+            dur_ms,
+            src_w: w,
+            src_h: h,
+        },
+        fresh,
+        why,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1715,6 +1995,9 @@ fn draft(
     // Every VR aim in the batch -- this video's, and the next one's, which the
     // head start needs before this video reaches the GPU.
     vrs: &VrMap,
+    // Where the stage events go besides the console: the API server's
+    // session, or nothing on a console run.
+    sink: Option<Arc<dyn StageSink>>,
 ) -> Result<Outcome> {
     let man = &b.manifest;
     let vr_cfg = vr_for(vrs, video);
@@ -1810,7 +2093,7 @@ fn draft(
     // `Live`). Every permanent line from here on goes through `live` so it
     // scrolls into history above the block instead of racing it.
     viz::clear(); // this video's viewport, never the last one's
-    let live = Live::new();
+    let live = Live::new(sink);
 
     let cache = Cache::open(cache_root, video, vr_cfg)?;
 
@@ -2148,10 +2431,13 @@ fn draft(
             .to_string_lossy()
             .to_string(),
         src: video.to_path_buf(),
+        cuts_ms: cuts,
         norm: (!cli.no_transcode).then(|| norm.clone()),
         dst,
         tracks,
+        trunk: b.trunk(),
         tracks_seed: man.env_seed,
+        shelf: HashMap::new(),
         shot_edges,
         times,
         cache_dir: cache.dir.clone(),
@@ -2161,6 +2447,7 @@ fn draft(
         // the plan is on the FRAME grid of the normalized clip, which is the
         // clock the review page's video runs on
         crop: plan.as_ref().map(|p| p.view(man.grid_fps)),
+        pack: man.pack.clone(),
     };
     let (n_actions, art_spans, art_rate) = restyle(&out, man, params)?;
 
@@ -2219,13 +2506,6 @@ fn draft(
 /// envelope through the manifest because that is the one place both this
 /// decoder and the training pipeline read it from, and it is a no-op on a
 /// bundle whose envelope publishes a mean (`env_flow` false).
-fn with_env_seed(mut b: Bundle, seed: Option<u64>) -> Bundle {
-    if let Some(s) = seed {
-        b.manifest.env_seed = s;
-    }
-    b
-}
-
 fn check_cpu_runnable(man: &bundle::Manifest) -> Result<()> {
     if bundle::force_cpu() && man.attn == "packed" {
         anyhow::bail!(
@@ -2786,7 +3066,7 @@ fn real_main() -> Result<()> {
     // the picker reopens for the next drop of videos -- the app closes only when
     // the user quits the picker (Q). A command line that names videos runs that
     // batch once and exits. The chosen style carries from one batch to the next.
-    let picker_mode = cli.videos.is_empty() && std::io::stdout().is_terminal();
+    let picker_mode = cli.videos.is_empty() && !cli.serve && std::io::stdout().is_terminal();
     let show_intro =
         picker_mode && !cli.bench && std::env::var_os("GOBLINSCRIPT_NO_INTRO").is_none();
 
@@ -2824,6 +3104,7 @@ fn real_main() -> Result<()> {
     // Before anything builds a session -- including the loader thread below and
     // the POST line that reports which chain it will walk.
     bundle::set_force_cpu(cli.cpu);
+    bundle::pin_attention_kernel();
 
     // Startup runs in boot order: self-test, then the demo, then the picker --
     // the machine wakes up before it shows off.
@@ -2845,9 +3126,10 @@ fn real_main() -> Result<()> {
         let b = loader
             .join()
             .map_err(|_| anyhow::anyhow!("the bundle-loading goblin panicked"))??;
+        let b = pick_model(b, &cli)?;
         check_cpu_runnable(&b.manifest)?;
         b.probe_gpu()?;
-        let b = with_env_seed(b, cli.env_seed);
+        let b = b.with_seed(cli.env_seed);
         if let Some(p) = &post {
             bios::devices(p, &b.manifest);
             bios::ready(p);
@@ -2855,10 +3137,10 @@ fn real_main() -> Result<()> {
         tui::intro()?;
         b
     } else {
-        let b = load_bundle(cli.bundle.as_deref())?;
+        let b = pick_model(load_bundle(cli.bundle.as_deref())?, &cli)?;
         check_cpu_runnable(&b.manifest)?;
         b.probe_gpu()?;
-        let b = with_env_seed(b, cli.env_seed);
+        let b = b.with_seed(cli.env_seed);
         if !cli.quiet {
             // no animation here: this user is driving a tool, not booting a
             // machine, and the report is a header rather than a ceremony
@@ -2876,6 +3158,10 @@ fn real_main() -> Result<()> {
 
     if let Some(p) = &cli.from_latents {
         return heads_only(&b, p, cli.cuts_json.as_deref(), &cli.dump_tracks);
+    }
+
+    if cli.serve {
+        return serve::serve(cli, b, cache_root, params);
     }
 
     // The record goes on once the boot sequence is over -- after the startup
@@ -3011,42 +3297,70 @@ fn real_main() -> Result<()> {
                 .iter()
                 .find(|n| !will_skip(&cli, n))
                 .map(|n| n.as_path());
-            match draft(
-                &cli, &b, v, &cache_root, &params, i, cli.videos.len(), &pf, next, &vrs,
-            ) {
-                Ok(Outcome::Drafted(out)) => {
-                    drafted += 1;
-                    if cli.review {
-                        outs.push(out); // cache + tracks live until the review closes
-                    } else {
-                        // working files exist for resume-after-interrupt; the
-                        // draft is done, so they are done too (a failure never
-                        // reaches this arm and keeps them)
-                        if !cli.keep_cache {
-                            let _ = std::fs::remove_dir_all(&out.cache_dir);
+            // The chosen model first, with the next video's transcode in its
+            // GPU-bound shadow; then every other `--models` model over the
+            // same encode as a script of its own. A review switches models on
+            // the page instead, so there every model's head pass runs onto the
+            // one draft's shelf below.
+            let mut runs: Vec<(Cli, Bundle, Option<&Path>)> =
+                vec![(cli.clone(), b.select(&b.manifest.pack)?, next)];
+            for m in cli.models.iter().filter(|m| m.as_str() != b.manifest.pack) {
+                let mut c2 = cli.clone();
+                c2.out_suffix = Some(m.clone());
+                runs.push((c2, b.select(m)?, None));
+            }
+            // The working files of a drafted video go once every model has
+            // read them: a second model over the same encode needs the cache
+            // the first one would otherwise have swept.
+            let mut sweep: Vec<PathBuf> = Vec::new();
+            for (c, bb, nx) in &runs {
+                match draft(c, bb, v, &cache_root, &params, i, cli.videos.len(), &pf, *nx, &vrs, None)
+                {
+                    Ok(Outcome::Drafted(mut out)) => {
+                        drafted += 1;
+                        if cli.review {
+                            if let Err(e) = pretrack(&mut out, bb, &params) {
+                                if cancel::is_cancel(&e) {
+                                    return Err(e);
+                                }
+                                // the draft stands; a model that could not be
+                                // prepared is prepared on the page instead
+                                eprintln!("  {} {e:#}", style("!").yellow().bold());
+                            }
+                            outs.push(out); // cache + tracks live until the review closes
+                        } else if !cli.keep_cache {
+                            // working files exist for resume-after-interrupt;
+                            // the draft is done, so they are done too (a
+                            // failure never reaches this arm and keeps them)
+                            sweep.push(out.cache_dir.clone());
                         }
                     }
+                    Ok(Outcome::Skipped) => skipped += 1,
+                    // The user stopped this one, so they have stopped the
+                    // batch -- carrying on to the next video is the opposite
+                    // of what Ctrl-C asked for.
+                    Err(e) if cancel::is_cancel(&e) => return Err(e),
+                    Err(e) => {
+                        // Recorded before it is printed: the console is about
+                        // to be taken back by the picker, and the log and the
+                        // report it reads are what outlive that.
+                        let f = errlog::Failure::of(&nice(v), &e);
+                        log = errlog::record(&f).or(log);
+                        failures.push(f);
+                        say_failed(&e, log.as_deref());
+                        eprintln!(
+                            "  {}",
+                            style(t!("console.failed.kept")).fg(con(theme().muted))
+                        );
+                        sound::play_error();
+                        failed += 1;
+                    }
                 }
-                Ok(Outcome::Skipped) => skipped += 1,
-                // The user stopped this one, so they have stopped the batch --
-                // carrying on to the next video is the opposite of what Ctrl-C
-                // asked for.
-                Err(e) if cancel::is_cancel(&e) => return Err(e),
-                Err(e) => {
-                    // Recorded before it is printed: the console is about to be
-                    // taken back by the picker, and the log and the report it
-                    // reads are what outlive that.
-                    let f = errlog::Failure::of(&nice(v), &e);
-                    log = errlog::record(&f).or(log);
-                    failures.push(f);
-                    say_failed(&e, log.as_deref());
-                    eprintln!(
-                        "  {}",
-                        style(t!("console.failed.kept")).fg(con(theme().muted))
-                    );
-                    sound::play_error();
-                    failed += 1;
-                }
+            }
+            sweep.sort();
+            sweep.dedup();
+            for d in sweep {
+                let _ = std::fs::remove_dir_all(&d);
             }
         }
         // The batch is over, so the screen goes back: the summary, the review
@@ -3078,62 +3392,47 @@ fn real_main() -> Result<()> {
             // not a pair of calls.
             let _quiet = sound::pause_music();
             let man = &b.manifest;
-            // Probe-and-fallback source choice, per clip: the ORIGINAL when every
-            // browser plays it (full quality), the cache's normalized copy when not.
-            let clips: Vec<review::Clip> = outs
-                .iter()
-                .map(|o| {
-                    let norm = o.norm.clone().filter(|p| p.exists());
-                    let (video, fallback, is_original) =
-                        // A VR draft has exactly one matching picture: the
-                        // reprojected copy. Never offer the original, however
-                        // playable -- it is two equirect eyes.
-                        match norm {
-                            Some(n) if o.is_vr => (n, None, false),
-                            n if ffmpeg::browser_playable(&o.src) => (o.src.clone(), n, true),
-                            Some(n) => (n, None, false),
-                            None => (o.src.clone(), None, true), // --no-transcode dev runs
-                        };
-                    review::Clip {
-                        name: o.name.clone(),
-                        script: o.dst.clone(),
-                        video,
-                        fallback,
-                        is_original,
-                        duration_ms: o.dur_ms,
-                        conf: o.tracks.conf.clone(),
-                        row_hz: man.row_hz(),
-                        row0_ms: man.row_ms(0),
-                        t0_ms: o.t0_ms,
-                        crop: o.crop.clone(),
-                    }
-                })
-                .collect();
+            let clips: Vec<review::Clip> =
+                outs.iter().map(|o| review_clip(o, &b)).collect::<Result<_>>()?;
             // one style per script -- reviewing is script-by-script
             let mut clip_params: Vec<style::Params> = vec![params; clips.len()];
+            let mut choices: Vec<review::Choice> = clips
+                .iter()
+                .map(|c| review::Choice { model: c.model.clone(), compare: None })
+                .collect();
             // the manifest's "normal" values, so the page can show every preset's
             // number in brackets and seed the expert inputs
             let presets = review::Presets {
                 dwell_ramp: man.plat_soft[0],
                 still_eps: man.still_eps,
             };
-            // the seed reaches the ENVELOPE, upstream of styling, so a clip
-            // whose seed moved is re-decoded from its own latents before it is
-            // styled. `reseed` is a no-op when the seed has not moved, which
-            // is every turn of every other knob.
-            let man_own = man.clone();
+            // the seed and the trunk reach the HEAD stage, upstream of styling,
+            // so a clip whose seed or model moved onto tracks it has not made
+            // runs the head pass over its own latents before it is styled.
+            // `retrack` is a no-op for every turn of every other knob.
             // a Mutex rather than a RefCell: the styler runs on its own
             // thread, so the closure has to be Send
             let outs_cell = std::sync::Mutex::new(&mut outs);
-            if let Err(e) =
-                review::review(&clips, &mut clip_params, presets, !cli.no_browser, |i, p| {
+            let page = |url: &str| {
+                println!(
+                    "\n  {} {}  {}",
+                    t!("console.review.label"),
+                    style(url).cyan().bold(),
+                    style(t!("console.review.hint")).dim()
+                );
+            };
+            if let Err(e) = review::review(
+                &clips,
+                &mut clip_params,
+                &mut choices,
+                presets,
+                !cli.no_browser,
+                &page,
+                |i, p, choice| {
                     let mut outs = outs_cell.lock().unwrap();
-                    if p.env_seed != u64::MAX {
-                        reseed(&mut outs[i], &b, &man_own, p.env_seed)?;
-                    }
-                    restyle(&outs[i], &man_own, p).map(|(n, _, _)| n)
-                })
-            {
+                    review_style(&mut outs[i], &b, p, choice, &clips[i].compare)
+                },
+            ) {
                 // no server, no browser -- the terminal review screen still works
                 eprintln!(
                     "  {} {}",
@@ -3145,13 +3444,18 @@ fn real_main() -> Result<()> {
                     .map(|o| tui::ReviewItem { name: o.name.clone(), actions: 0 })
                     .collect();
                 tui::review(&mut items, &mut clip_params, |i, p| {
-                    restyle(&outs[i], man, p).map(|(n, _, _)| n)
+                    let bb = b.select(&outs[i].pack)?;
+                    retrack(&mut outs[i], &bb, seed_for(&bb, p))?;
+                    restyle(&outs[i], &bb.manifest, p).map(|(n, _, _)| n)
                 })?;
             }
             // each script's accepted style, as flags that reproduce it; the
             // first carries forward as the next batch's seed
-            for (o, p) in outs.iter().zip(&clip_params) {
-                println!("{}", style(format!("  {}: {}", o.name, style::flags_line(p))).dim());
+            for ((o, p), c) in outs.iter().zip(&clip_params).zip(&choices) {
+                println!(
+                    "{}",
+                    style(format!("  {}: --model {} {}", o.name, c.model, style::flags_line(p))).dim()
+                );
             }
             if let Some(p0) = clip_params.first() {
                 params = *p0;
@@ -3587,6 +3891,8 @@ mod funscript_tests {
             metadata: FunMeta {
                 author: AUTHOR,
                 tags: TAGS,
+                model: "v0.5.1",
+                settings: style::flags_line(&style::Params { env_seed: 7, ..Default::default() }),
                 filler: Vec::new(),
                 artifacts: Vec::new(),
             },
@@ -3603,6 +3909,18 @@ mod funscript_tests {
         let m = out.find("\"metadata\"").expect("metadata key present");
         let a = out.find("\"actions\"").expect("actions key present");
         assert!(m < a, "metadata must serialize before actions: {out}");
+    }
+
+    // The model and the flags that wrote the script, seed included, so the
+    // file says how to make it again.
+    #[test]
+    fn model_and_settings_are_stamped() {
+        let out = render();
+        assert!(out.contains("\"model\":\"v0.5.1\""), "{out}");
+        assert!(out.contains("--env-seed 7"), "{out}");
+        // off is not the default, so it has to be written down
+        let off = style::flags_line(&style::Params { max_speed: 0.0, cut_ease: 0.0, ..Default::default() });
+        assert!(off.contains("--max-speed 0") && off.contains("--cut-ease 0"), "{off}");
     }
 
     // The author stamp is always written; it carries the tool + build number.
@@ -3664,5 +3982,128 @@ mod funscript_tests {
         let p = tmp("junk", "not json at all");
         assert_eq!(script_kind(&p), ScriptKind::Unknown);
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod retrack_tests {
+    use super::*;
+
+    /// Every value of a track set, as bits: equal means bit-identical.
+    fn bits(t: &style::Tracks) -> Vec<u64> {
+        let mut v: Vec<f64> = Vec::new();
+        for x in [&t.vmarg, &t.level, &t.env, &t.period, &t.conf] {
+            v.extend(x.iter());
+        }
+        for (a, b) in [&t.band, &t.plat, &t.rev].into_iter().flatten() {
+            v.extend(a.iter().chain(b.iter()));
+        }
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn empty() -> style::Tracks {
+        style::Tracks {
+            vmarg: Vec::new(),
+            level: Vec::new(),
+            env: Vec::new(),
+            band: None,
+            plat: None,
+            rev: None,
+            period: Vec::new(),
+            conf: Vec::new(),
+        }
+    }
+
+    /// A model switch in the review is only worth offering if it is the draft
+    /// the model would have made: the tracks a switch puts in hand are the
+    /// head pass's own, bit for bit, whether they were made on the spot or
+    /// taken off the shelf; a model on the trunk in hand changes the name
+    /// and not the tracks; and the compared line leaves the script's model
+    /// in hand.
+    ///
+    /// Synthetic latents through the real head graphs, on the CPU where the
+    /// head always runs: no media, no GPU.
+    #[test]
+    #[ignore = "runs the head graphs of ./bundle on the CPU: cargo test --release -- --ignored retrack"]
+    fn retrack_is_the_head_pass_whichever_way_it_arrives() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let b = Bundle::from_dir(&root.join("bundle")).unwrap();
+        let models = b.models().unwrap();
+        let a = models.iter().find(|m| m.name == b.default_pack()).unwrap().clone();
+        let other = models.iter().find(|m| m.trunk != a.trunk).expect("a model on another trunk").clone();
+        let sibling = models.iter().find(|m| m.trunk == a.trunk && m.name != a.name).cloned();
+        let (ba, bo) = (b.select(&a.name).unwrap(), b.select(&other.name).unwrap());
+        let man = &ba.manifest;
+
+        // 1500 rows: past one 1024-row chunk, with a cut inside the second
+        let dir = root.join("target/retrack_fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = 1500usize;
+        let row_bytes = man.dim * man.grid * man.grid;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let lat: Vec<u8> = (0..rows * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // latents sit near zero on the int8 grid, like the encoder's
+                ((((state >> 33) % 41) as i64) - 20) as i8 as u8
+            })
+            .collect();
+        std::fs::write(dir.join("latents.i8"), &lat).unwrap();
+        let cuts = vec![man.row_ms(1200)];
+        let shot_edges = boundaries::shot_edges(&cuts, rows, |i| man.row_ms(i));
+        let mut d = DraftOut {
+            name: "fixture".into(),
+            src: dir.join("fixture.mp4"),
+            cuts_ms: cuts,
+            norm: None,
+            dst: dir.join("fixture.funscript"),
+            tracks: empty(),
+            trunk: String::new(),
+            tracks_seed: man.env_seed,
+            shelf: HashMap::new(),
+            shot_edges,
+            times: (0..rows).map(|i| man.row_ms(i)).collect(),
+            cache_dir: dir.clone(),
+            dur_ms: man.row_ms(rows),
+            t0_ms: 0.0,
+            is_vr: false,
+            crop: None,
+            pack: a.name.clone(),
+        };
+        let seed = man.env_seed;
+        let fresh_a = bits(&head_pass(&d, &ba, seed).unwrap());
+        let fresh_o = bits(&head_pass(&d, &bo, bo.manifest.env_seed).unwrap());
+        assert_ne!(fresh_a, fresh_o, "two trunks wrote the same tracks");
+
+        d.tracks = head_pass(&d, &ba, seed).unwrap();
+        d.trunk = ba.trunk();
+        retrack(&mut d, &bo, bo.manifest.env_seed).unwrap();
+        assert_eq!(bits(&d.tracks), fresh_o, "a head pass on switch is not the head pass");
+        assert_eq!(d.pack, other.name);
+        retrack(&mut d, &ba, seed).unwrap();
+        assert_eq!(bits(&d.tracks), fresh_a, "the shelf did not give back the tracks it took");
+        assert!(d.shelf.contains_key(&(bo.trunk(), bo.manifest.env_seed)));
+
+        if let Some(s) = &sibling {
+            let bs = b.select(&s.name).unwrap();
+            retrack(&mut d, &bs, bs.manifest.env_seed).unwrap();
+            assert_eq!(bits(&d.tracks), fresh_a, "a model on the same trunk moved the tracks");
+            assert_eq!(d.pack, s.name);
+        }
+
+        // the review's style: the compared line first, the script's own model
+        // left in hand and its script the plain restyle's
+        let choice = review::Choice { model: a.name.clone(), compare: Some(other.name.clone()) };
+        let p = style::Params::default();
+        let compare = dir.join("compare.funscript");
+        let r = review_style(&mut d, &b, &p, &choice, &compare).unwrap();
+        assert_eq!(d.pack, a.name);
+        assert_eq!(bits(&d.tracks), fresh_a);
+        let script = std::fs::read(&d.dst).unwrap();
+        restyle(&d, man, &p).unwrap();
+        assert_eq!(std::fs::read(&d.dst).unwrap(), script, "the review's script is not the restyle's");
+        assert!(std::fs::metadata(&compare).unwrap().len() > 0);
+        assert_eq!(r.conf.len(), d.tracks.conf.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

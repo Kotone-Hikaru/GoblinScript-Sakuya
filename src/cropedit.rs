@@ -87,6 +87,8 @@ impl Session {
 ///
 /// `video` is the normalized copy: the picture the crop is actually applied
 /// to, so a rect drawn here is a rect of the frames the encoder will read.
+/// `page` hears the URL once the page is up; `open` also opens it in the
+/// browser here.
 pub fn edit(
     video: &Path,
     plan: &Plan,
@@ -94,7 +96,7 @@ pub fn edit(
     fps: f64,
     aspect: f64,
     open: bool,
-    announce: &dyn Fn(String),
+    page: &dyn Fn(&str),
 ) -> Result<Option<Plan>> {
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|e| anyhow::anyhow!("could not start the crop page: {e}"))?;
@@ -119,12 +121,7 @@ pub fn edit(
         done: false,
     }));
 
-    announce(format!(
-        "  {} {}  {}",
-        crate::t!("console.cropedit.label"),
-        console::style(&url).cyan().bold(),
-        console::style(crate::t!("console.cropedit.hint")).dim()
-    ));
+    page(&url);
     if open {
         open_browser(&url);
     }
@@ -359,18 +356,15 @@ mod tests {
         let (plan, _) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let worker = std::thread::spawn(move || {
-            edit(Path::new("no-such-video.mp4"), &plan, 60_000.0, 30.0, 16.0 / 9.0, false, &|line| {
-                let _ = tx.send(line);
+            edit(Path::new("no-such-video.mp4"), &plan, 60_000.0, 30.0, 16.0 / 9.0, false, &|url| {
+                let _ = tx.send(url.to_string());
             })
         });
-        // the announce line carries the URL, which is where the port is
-        let line = rx.recv_timeout(Duration::from_secs(5)).expect("the page announces itself");
-        let addr = line
-            .split_whitespace()
-            .find_map(|w| {
-                let w = console::strip_ansi_codes(w).to_string();
-                w.strip_prefix("http://").map(|a| a.trim_end_matches('/').to_string())
-            })
+        // the page hands over its URL, which is where the port is
+        let url = rx.recv_timeout(Duration::from_secs(5)).expect("the page announces itself");
+        let addr = url
+            .strip_prefix("http://")
+            .map(|a| a.trim_end_matches('/').to_string())
             .expect("an http address");
 
         // Lenient on purpose: the LAST request is Done, and the page tears

@@ -220,7 +220,8 @@ mod tests {
     fn manifest() -> Manifest {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/manifest.json");
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        let file = crate::bundle::BundleFile::parse(&std::fs::read(path).unwrap()).unwrap();
+        file.resolve(&file.default).unwrap()
     }
 
     /// A cache dir of its own, with a latent file of `rows` rows in it.

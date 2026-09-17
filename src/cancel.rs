@@ -56,8 +56,8 @@ pub fn check() -> anyhow::Result<()> {
 #[cfg(test)]
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Test-only: nobody has asked to stop.
-#[cfg(test)]
+/// Nobody has asked to stop. The API server calls this between jobs: a
+/// client that cancelled one session's draft has not cancelled the next one.
 pub fn reset() {
     ASKS.store(0, Ordering::Relaxed);
 }

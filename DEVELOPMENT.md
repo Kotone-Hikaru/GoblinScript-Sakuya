@@ -96,7 +96,7 @@ of the screen to pin anything to.
 |---|---|---|
 | transcode | 480p / 30 fps / crf 23 | -- |
 | boundaries | TransNetV2 per-frame transition probability -> shot cuts | `transnet.onnx` |
-| encode | 384x384 2-frame tubelets -> PCA latents -> int8, then the head on every 1024 rows: mask net -> attention pool -> dilated TCN -> the five heads (pos, env, ext, plat, rev) | `vjepa_pca.onnx`, `mask.onnx`, `head.onnx`, `env_step.onnx` |
+| encode | 384x384 2-frame tubelets -> PCA latents -> int8, then the head on every 1024 rows: mask net -> attention pool -> dilated TCN -> the five heads (pos, env, ext, plat, rev) | `vjepa_pca.onnx`, then the model's `packs/<name>/mask.onnx`, `head.onnx`, `env_step.onnx` |
 | styling | reversal times, level, amplitude, band snapping -> actions | -- |
 
 **There is no model stage.** The head used to be one, reading the finished
@@ -706,14 +706,39 @@ rewrite, and the page redraws, so the user's own player stays a valid second
 screen. The page also surfaces the model's per-row confidence head (`conf` in
 `head.onnx`, trained so its window mean tracks the phase correlation the model
 expects against a human script): a live readout at the playhead plus a cool
-slate band along the strip. It rides `/conf/N` and is served ONCE per clip, not
-folded into `/state` -- confidence is a property of the frozen trunk, so a
-re-style never changes it (a bundle exported before the head existed serves
-`conf: null` and the page hides the readout).
+slate band along the strip. It rides `/conf/N`, not `/state` -- confidence is a
+property of the trunk, so a knob never changes it and only a model switch does;
+each re-style hands back the track of the model that wrote the script, and the
+page reads it again once the styling settles (a bundle exported before the head
+existed serves `conf: null` and the page hides the readout).
 
-The written funscript carries nothing but the actions and an author stamp:
-`metadata` is the author alone, and it serializes ahead of the long `actions`
-array so a text editor shows it at the top of the file.
+**The model is a knob too.** A draft keeps the tracks it has made by (trunk,
+seed): the set in hand and a shelf of the others. A trunk is a pack's head and
+envelope graphs plus the manifest fields the head stage reads
+(`bundle::trunk_key`), so packs that differ only in decode constants share one
+and a switch between them is a restyle. A switch onto a trunk the draft does
+not hold runs the head pass over the retained latents (`retrack`), under the
+cuts and the crop the draft was encoded with -- the viewport belongs to the
+video, so with auto-crop on a switched model can differ from that model's own
+fresh draft. The page's model menu and compare menu post with the knobs;
+`review_style` styles the compared model's line into `compare.funscript` in
+the cache dir first and then the script under its own model, which it leaves
+in hand. A review shelves every trunk's tracks before the page opens
+(`pretrack`), so every switch on the page is a restyle; the model is chosen
+there or with `--model`, and `--models` (which conflicts with `--review`)
+writes one script per model. `retrack_is_the_head_pass_whichever_way_it_arrives`
+(ignored: it runs the bundle's head graphs) holds the switch to the head pass
+bit for bit. A pinned script belongs to the page alone: it copies the script's
+model, params and actions, draws those actions, and posts no compare while it
+is shown. Swap posts the compared model as the script and the script's model
+as the compare, or seeds the pinned params and model and pins what they
+replace. `review` hands back each script's final choice beside its params.
+
+The written funscript's `metadata` carries the author stamp, the tags, the
+model and `settings` (the `flags_line` that reproduces the style, the seed
+included when it is not the bundle's), plus the filler and artifact spans when
+there are any. It serializes ahead of the long `actions` array so a text
+editor shows it at the top of the file.
 Which file `/video/N` streams is probe-and-fallback
 (`ffmpeg::browser_playable`): the ORIGINAL when its container/codecs pass the
 every-browser whitelist (full quality -- most flat MP4 sources), otherwise the
@@ -747,6 +772,49 @@ Bit-identical output, 716 ms -> 220 ms for a two-hour fit -- see the
 If the server cannot start, the terminal review screen (`tui.rs`) takes over --
 same knobs, same restyle contract.
 
+### The API server (`serve.rs`)
+
+`--serve` is the review server with the drafting stages placed under it and
+the page taken away: an editor keeps its own timeline and wants the tracks
+drafted once, then a styled list back in milliseconds per edit. One worker
+thread runs `draft` and `retrack` one session at a time -- one GPU job at a
+time -- and the request thread answers `style` itself, because `style_draft`
+is the millisecond kind. The two never share a lock for long: a poll during a
+re-decode answers from the status, and a style call during one answers
+`409 working` rather than waiting.
+
+A session is one video under its cache fingerprint, so a second client
+asking for the same file joins the first and the cache is what makes a
+restart cheap. The stage events reach the session through `StageSink`,
+the one hook `Live` offers besides the console: `draft` is unchanged, and
+the console run passes no sink.
+
+The pages are the console's own. `vr_need` is the one decision of whether
+a video wants the aiming page, and `vr_prep` (the console) and `aim` (a
+session) both call it; the client's `vr: true` stands where the picker's
+hand mark and `--vr` stand. `vr::prep`, `cropedit::edit` and
+`review::review` each hand their URL to a `page` callback, which the
+console prints and a session records under `page` (the sink's fourth
+method) or `workbench`. The workbench runs `review::review` on a thread of
+its own with a one-clip list; its `apply` closure is `apply_style`, which
+restyles into the session's file, moves the session's params and bumps
+`style_rev`. A seed or model the page moves onto tracks the draft does not
+hold is still the worker's: `apply_style` queues the head pass and waits, and
+the worker shelves the tracks without moving the model in hand, so one job
+runs at a time and a style call never sees a half-switched session.
+
+The author's pins are the one thing the API adds to styling.
+`style::pin_actions` runs last, after the device cap, on the source clock:
+a pin replaces the model's vertices within `PIN_TOL_MS` of it and bends the
+level around it toward the author's, interpolated between pins and faded
+over `PIN_HORIZON_MS` past the outermost. Timing never moves. The pass is
+written twice, here and in `common.pin_actions`, and `grid_check` binds
+the constants and the fixture. The API is declared unstable in README.md:
+a route or a field is renamed when a better shape exists, with no alias.
+
+`probes/serve_smoke.py` in the parent tree drives every route on a
+synthetic test-pattern video, and is the check to run after a change here.
+
 ## Cache
 
 `cache/<fingerprint>/` next to the executable holds the transcode, the cuts and
@@ -777,9 +845,24 @@ checkout -- everything below the CLI is plain Rust with no model in it.
 
 What a checkout does not carry is the **bundle**: the ONNX graphs and the
 manifest of deploy constants that make up the goblin itself. It is a build
-product of the training tree -- exported from a champion checkpoint, weighing
-~250 MB -- so it is neither committed nor part of the source distribution. A
-released `goblinscript.exe` has one baked in.
+product of the training tree, weighing ~250 MB, so it is neither committed
+nor part of the source distribution. A released `goblinscript.exe` has one
+baked in.
+
+A bundle is ONE perception and SEVERAL models. The perception -- the encoder
+graph `vjepa_pca.onnx`, `transnet.onnx`, and the top-level keys of
+`manifest.json` (the basis, the grid, the row clock, the transcode) -- is
+what every model was trained on and what every draft encodes with once. Each
+model is a **pack**, `packs/<name>/{head,mask,env_step}.onnx` plus its entry
+in the manifest's `packs` map (its checkpoint, its heads and every decode
+constant of its own), named for the release that first shipped it, and
+`default` names the one a draft with no `--model` runs. `bundle.rs` resolves
+a pack against the perception into the one flat `Manifest` every stage
+reads, `Bundle::select` yields the same bundle on another pack with the
+perception's bytes shared, and `build.rs` enumerates `bundle/packs/*/` into
+the table the embedded build carries. That is why a second model over a
+video is a head stage alone: the latents on disk are the perception's, and
+every pack reads them.
 
 ```bash
 cargo build --release                        # no model: needs --bundle <DIR>
@@ -881,6 +964,24 @@ none, and stops with "could not link". `cargo xtask dist` sets it for the
 builds it runs, so it is a bare `cargo build` that wants it in the
 environment. Windows needs no such thing: its
 `onnxruntime.lib` is the import library `ort-sys` asks for by name.
+
+**The encoder runs ONE attention kernel on every card, and the choice is
+ours.** ONNX Runtime picks the kernel for a `MultiHeadAttention` node per GPU,
+and from compute capability 9.0 upward it prefers cuDNN's fused SDPA, demoting
+flash attention to reach it. sm_120 is "9.0 and above", so an RTX 50-series
+card takes that branch, and cuDNN 9.10 has no engine to build the graph with
+there: `Failed to build cuDNN graph for Flash Attention`, at `node_mha0`, on
+the first window of the draft. The shape is not what it refuses -- the same
+path forced onto an Ada card runs the encoder at the same 60 ms -- it is
+Blackwell it has nothing for. `bundle::pin_attention_kernel` sets
+`ORT_ENABLE_CUDNN_FLASH_ATTENTION=0` before the first session and before the
+first thread, which turns the preference off, and the runtime's own flash
+attention runs instead: compiled for sm_60 through sm_120a in Microsoft's
+package, and already the kernel an Ada card runs, so it is one kernel across
+the whole range instead of one per GPU generation. A variable already in the
+environment is left alone. `ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1` makes
+the runtime name the kernel it chose for each node, which is how a card's
+branch is read.
 
 Microsoft's runtime needs CUDA **12.9** beside it, not 12.6:
 the older libraries load and then fail on a missing symbol, saying
@@ -999,11 +1100,14 @@ it. Run one with `--no-transcode --no-autocrop --no-exposure` on a clip that
 is already at the deploy spec, or the comparison measures the stages rather
 than the port.
 
-## A new champion
+## A new model
 
-A new champion arrives as a new bundle: drop it in and rebuild. The manifest
-carries the arch, so a checkpoint that only retunes the existing heads needs no
-Rust change. A checkpoint that adds a NEW head -- or new DECODE logic -- needs
+A new model arrives as a new pack: `export_bundle.py --into <bundle>` in the
+training tree traces its graphs against the bundle's own perception, verifies
+each against PyTorch, and adds it beside the packs the bundle carries; a
+release that moves the default names the new pack there. Drop the bundle in
+and rebuild. The manifest carries the arch per pack, so a checkpoint that
+only retunes the existing heads needs no Rust change. A checkpoint that adds a NEW head -- or new DECODE logic -- needs
 the styler taught what to do with it: `style.rs` implements exactly the
 composed styling the current champion deploys and nothing speculative —
 band-rail snapping, the stillness hold, and the trapezoid-dwell

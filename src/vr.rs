@@ -530,8 +530,10 @@ impl Session {
 /// Aim every clip, then hand them back with their configs saved.
 ///
 /// Blocks until the user is done (the page's Done button, or Enter/Q/Esc in the
-/// console). Ctrl-C propagates as a cancel, same as everywhere else.
-pub fn prep(clips: Vec<Clip>, open: bool) -> Result<Vec<Clip>> {
+/// console). Ctrl-C propagates as a cancel, same as everywhere else. `page`
+/// hears the URL once the page is up -- the console prints it, an API
+/// session reports it -- and `open` also opens it in the browser here.
+pub fn prep(clips: Vec<Clip>, open: bool, page: &dyn Fn(&str)) -> Result<Vec<Clip>> {
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|e| anyhow::anyhow!("could not start the prep server: {e}"))?;
     let port = server
@@ -548,13 +550,7 @@ pub fn prep(clips: Vec<Clip>, open: bool) -> Result<Vec<Clip>> {
         order: Vec::new(),
     }));
 
-    let th = crate::theme::theme();
-    println!(
-        "\n  {} {}  {}",
-        console::style("[ VR ]").fg(crate::theme::con(th.accent)).bold(),
-        console::style(&url).fg(crate::theme::con(th.accent)).bold(),
-        console::style(crate::t!("console.vr.hint")).fg(crate::theme::con(th.muted))
-    );
+    page(&url);
     if open {
         open_browser(&url);
     }

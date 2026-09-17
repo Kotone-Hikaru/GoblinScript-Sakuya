@@ -12,9 +12,10 @@ you can fine-tune anything else in your favorite editor.
 >
 > It is the app that *runs* a trained model -- decode, perception, and the
 > styling that turns what the goblins see into strokes. It is **not** the
-> training pipeline, and it does **not** contain the model itself. That is a
-> separate ~250 MB bundle, baked into released binaries; a build from source
-> needs one passed with `--bundle`. The training tree is not public yet.
+> training pipeline, and it does **not** contain the models themselves. They
+> are a separate ~250 MB bundle -- one perception and every model a release
+> carries -- baked into released binaries; a build from source needs one
+> passed with `--bundle`. The training tree is not public yet.
 
 ## Using it
 
@@ -26,7 +27,23 @@ Or from a command line:
 goblinscript video.mp4                  the script appears next to the video
 goblinscript D:\clips                   every video in that folder
 goblinscript video.mp4 --out D:\scripts put the scripts somewhere else
+goblinscript video.mp4 --model v0.4.0  draft with another of the models it carries
+goblinscript video.mp4 --models v0.5.1,v0.3.0
+                                        both, from one look at the video:
+                                        video.funscript and video.v0.3.0.funscript
 ```
+
+A release carries several models, each named for the release that first
+shipped it, and every one of them watches the video the same way -- so a
+second model costs seconds, not a second encode. `--model` picks one, and
+`--models` writes them side by side without a review. The review page reads
+the video with every model while drafting, so it switches the model of a
+script at once. Under the video, **script** names the model writing the
+script and **vs** lays another line under it: another model's, written with
+the same knobs, or the **pinned** script, held as it was with its model and
+knobs. **⇄** (or **x**) swaps the script and the line under it, so a choice is
+made by flipping between them while the video plays. Every script records the
+model and the settings that wrote it.
 
 Before the goblins start, a page opens in your browser with the part of the
 picture they are about to watch drawn on each shot. Drag that rect onto the
@@ -39,6 +56,60 @@ browser to aim it once; flat video needs no flags at all. English and Chinese
 ship with it, and any `languages/*.json` you translate shows up on the **G**
 key. Existing scripts are never overwritten without `--force`, and the video
 file itself is never touched.
+
+### Serving an editor
+
+`goblinscript --serve` runs the goblins as a sidecar for another program: a
+funscript editor that draws the draft under its own timeline and re-styles it
+every time the author moves a point. It binds to localhost, prints one JSON
+line with the `port` and the access `token`, then answers requests until its
+standard input closes or a client posts `/quit`. Every drafting option on that
+command line (`--cache`, `--no-autocrop`, `--dwells` ...) is what each session
+drafts under.
+
+**The API is unstable.** Routes, fields and units change whenever a better
+shape exists, without an alias or a version bump; the client that ships beside
+a build is the one that fits it. Every request carries the token in an
+`x-goblin-token` header. `API.md` is the reference: every route, every
+field, the pages, and a client in twenty lines.
+
+| Route | What it does |
+|---|---|
+| `GET /health` | the build, the model, the session count |
+| `GET /manifest` | the deploy constants, the default params, the preset ladders |
+| `POST /sessions` `{video, vr?, crop_edit?, browser?}` | open (or join) the session for a video and draft it |
+| `GET /sessions/ID` | the stage in flight, a page waiting, the stages done, or the clip's clock once ready |
+| `GET /sessions/ID/tracks?from_ms&to_ms` | the per-row tracks on the video clock |
+| `POST /sessions/ID/style` `{params..., pins?, from_ms?, to_ms?}` | the styled actions, milliseconds |
+| `POST /sessions/ID/workbench` `{browser?}` | the review page for this session, as `{url}` |
+| `DELETE /sessions/ID` | forget the session (its cache stays) |
+| `POST /quit` | exit |
+
+The decisions a person makes keep the browser pages the console opens for
+them. Before the encode, the VR aiming page and the crop page: a session
+that reaches one reads `working` with the page's `key` and `url` under
+`page`, and the draft continues when Done is pressed there. `vr` is absent
+to detect, `true` to open the aiming page whatever the detector thinks (and
+to aim again a video that has an aim), `false` to draft the raw frames, or
+a sidecar object to apply as it is. `crop_edit` is absent to open the crop
+page when the crop was just probed, `true` to open it always, `false` never.
+`browser: false` leaves opening a page to the client; the server opens it
+otherwise.
+
+After the draft, the **workbench**: the review page, with the video, the
+simulator and every styling knob, on its own port for as long as it is
+open. Open it as often as you like. The knobs settled there are the
+session's style from then on -- every style call starts from them, the
+status carries them under `params` and `flags`, and `style_rev` counts the
+changes so a client knows to ask again.
+
+A style call takes the same fields the review page posts, every one optional
+and falling back to the session's style, plus `pins`: `[[ms, pos], ...]`
+vertices the author placed. A pin replaces the model's vertices within 60 ms
+of it and bends the level around it toward the author's; the model's other
+reversal times stay where they were. A seed that moved is head-stage work:
+the call answers `409 redecoding` and the session reads `working` until the
+tracks are back.
 
 ## What you need
 
@@ -108,9 +179,9 @@ names to put there, out of NVIDIA's redistributable archives at
 
 The release zips are built by GitHub Actions from a version tag. The inputs a
 checkout lacks sit on the permanent `bundle` release of this repository:
-`bundle.zip`, the one model both platforms run, and `music.zip`.
-`bundle.sha256` pins the model a version embeds, and the workflow refuses any
-other.
+`bundle.zip`, the perception and every model both platforms run, and
+`music.zip`. `bundle.sha256` pins the bundle a version embeds, and the
+workflow refuses any other.
 
 `DEVELOPMENT.md` is the map: what each stage does, why it is shaped that way,
 and what is measured to keep it honest.

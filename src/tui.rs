@@ -1380,6 +1380,7 @@ mod summary_tests {
 #[cfg(test)]
 mod screen_tests {
     use super::*;
+
     use ratatui::{backend::TestBackend, Terminal};
 
     // The picker paints the parade with ratatui's spans while the processing
