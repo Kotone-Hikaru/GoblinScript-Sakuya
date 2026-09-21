@@ -21,6 +21,10 @@ pub struct Settings {
     /// The style accepted at the end of the last review -- the picker seeds the
     /// next session with it, so a preferred recipe carries across launches.
     pub last_params: Option<style::Params>,
+    /// The model the first script of the last review was accepted with -- the
+    /// picker drafts the next batch with it. `None`, or a name the bundle no
+    /// longer carries, means the bundle's default.
+    pub model: Option<String>,
     /// The colour scheme, cycled with T in the picker. `None` = never chosen,
     /// which means the house phosphor green.
     pub theme: Option<crate::theme::Palette>,
@@ -63,6 +67,7 @@ impl Default for Settings {
         Settings {
             last_dir: None,
             last_params: None,
+            model: None,
             theme: None,
             lang: None,
             muted: false,

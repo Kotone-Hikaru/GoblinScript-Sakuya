@@ -1544,16 +1544,18 @@ fn script_dst(cli: &Cli, video: &Path) -> PathBuf {
     out_dir.join(name)
 }
 
-/// The model the run drafts with: `--model`, else the bundle's default, and
-/// every `--models` name checked against the bundle before a video is
-/// touched, so a wrong name fails here and not after an encode.
-fn pick_model(b: Bundle, cli: &Cli) -> Result<Bundle> {
+/// The model the run drafts with: `--model`, else the `remembered` choice
+/// when this bundle still carries it, else the bundle's default, and every
+/// `--models` name checked against the bundle before a video is touched, so a
+/// wrong name fails here and not after an encode.
+fn pick_model(b: Bundle, cli: &Cli, remembered: Option<&str>) -> Result<Bundle> {
     for m in &cli.models {
         b.select(m)?;
     }
-    match &cli.model {
-        Some(m) => b.select(m),
-        None => Ok(b),
+    match (&cli.model, remembered) {
+        (Some(m), _) => b.select(m),
+        (None, Some(m)) if b.pack_names().iter().any(|n| n == m) => b.select(m),
+        _ => Ok(b),
     }
 }
 
@@ -3096,6 +3098,10 @@ fn real_main() -> Result<()> {
     // and a command that starts playing music is a command with a bug. That run
     // is silent unless `--music` asks, and the picker's remembered ON does not
     // leak into it.
+    // The picker drafts with the model last chosen on its review page; a
+    // named-video run takes the bundle's default unless `--model` says
+    // otherwise, like every other remembered preference.
+    let remembered_model = if picker_mode { settings.model.clone() } else { None };
     let want_music = (cli.music || (picker_mode && settings.music))
         && !sound::muted()
         && std::io::stdout().is_terminal();
@@ -3121,7 +3127,7 @@ fn real_main() -> Result<()> {
     // the device lines join the loader first -- so a slow load reads as the
     // report enumerating devices, which is what a POST looks like anyway. The
     // intro then plays with everything already in hand.
-    let b = if show_intro {
+    let mut b = if show_intro {
         let bundle_arg = cli.bundle.clone();
         let loader = std::thread::spawn(move || load_bundle(bundle_arg.as_deref()));
         let post = (!cli.quiet).then(|| {
@@ -3132,7 +3138,7 @@ fn real_main() -> Result<()> {
         let b = loader
             .join()
             .map_err(|_| anyhow::anyhow!("the bundle-loading goblin panicked"))??;
-        let b = pick_model(b, &cli)?;
+        let b = pick_model(b, &cli, remembered_model.as_deref())?;
         check_cpu_runnable(&b.manifest)?;
         b.probe_gpu()?;
         let b = b.with_seed(cli.env_seed);
@@ -3143,7 +3149,7 @@ fn real_main() -> Result<()> {
         tui::intro()?;
         b
     } else {
-        let b = pick_model(load_bundle(cli.bundle.as_deref())?, &cli)?;
+        let b = pick_model(load_bundle(cli.bundle.as_deref())?, &cli, remembered_model.as_deref())?;
         check_cpu_runnable(&b.manifest)?;
         b.probe_gpu()?;
         let b = b.with_seed(cli.env_seed);
@@ -3466,8 +3472,14 @@ fn real_main() -> Result<()> {
             if let Some(p0) = clip_params.first() {
                 params = *p0;
             }
-            // remember the accepted style, so the next launch starts from it
+            // and the first script's model drafts the next batch
+            if let Some(c0) = choices.first() {
+                b = b.select(&c0.model)?;
+            }
+            // remember the accepted style and model, so the next launch starts
+            // from them
             settings.last_params = Some(params);
+            settings.model = Some(b.manifest.pack.clone());
             settings.save();
             if !cli.keep_cache {
                 for o in &outs {
