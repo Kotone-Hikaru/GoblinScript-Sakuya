@@ -15,7 +15,12 @@ you can fine-tune anything else in your favorite editor.
 > training pipeline, and it does **not** contain the models themselves. They
 > are a separate ~250 MB bundle -- one perception and every model a release
 > carries -- baked into released binaries; a build from source needs one
-> passed with `--bundle`. The training tree is not public yet.
+> passed with `--bundle`.
+>
+> The training pipeline is
+> [GoblinTrainingGrounds](https://github.com/ofs69/GoblinTrainingGrounds).
+> It trains a model on your own video/funscript pairs, compares it with the
+> released one, and exports it as a pack this app loads.
 
 ## Using it
 
