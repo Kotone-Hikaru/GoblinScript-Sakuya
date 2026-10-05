@@ -591,9 +591,31 @@ fn run_transcode(
         .args(["-progress", "pipe:1", "-nostats"])
         .arg(part)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("could not start ffmpeg")?;
+    // ffmpeg's own reason for a failure is on stderr, and it has to reach the
+    // error rather than the console: the console is the picker's again by the
+    // time anyone reads it, and the log is written from the error. Drained on
+    // its own thread because the loop below is blocked on stdout -- a source
+    // that complains on every frame fills the pipe and stalls ffmpeg. Read as
+    // bytes, not `lines()`: a source path in the console's code page is not
+    // UTF-8, and a reader that stopped at it would stall ffmpeg the same way.
+    let stderr = child.stderr.take().map(|err| {
+        std::thread::spawn(move || {
+            let mut tail = std::collections::VecDeque::new();
+            let mut r = BufReader::new(err);
+            let mut buf = Vec::new();
+            while matches!(r.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
+                if tail.len() == STDERR_TAIL {
+                    tail.pop_front();
+                }
+                tail.push_back(String::from_utf8_lossy(&buf).into_owned());
+                buf.clear();
+            }
+            tail
+        })
+    });
 
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -615,11 +637,55 @@ fn run_transcode(
         }
     }
     let st = child.wait()?;
+    let tail = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
     if !st.success() {
         let _ = std::fs::remove_file(part);
-        bail!("ffmpeg failed to transcode the source (exit {st})");
+        return Err(ffmpeg_failure(
+            format!("ffmpeg failed to transcode the source ({st})"),
+            tail,
+        ));
     }
     Ok(())
+}
+
+/// How many of ffmpeg's last stderr lines a failed transcode keeps. Its fatal
+/// lines come last: the root cause, then what it stopped, then "Conversion
+/// failed!" -- three or four lines, behind however many it complained about
+/// before it gave up.
+const STDERR_TAIL: usize = 4;
+
+/// A failed ffmpeg run as an error chain: `what` outermost, then ffmpeg's last
+/// lines LAST FIRST, so the earliest -- usually the root cause -- is the
+/// deepest cause. That is the order `errlog` reads a chain in: what failed,
+/// then why, then why that.
+fn ffmpeg_failure(what: String, tail: impl IntoIterator<Item = String>) -> anyhow::Error {
+    let mut lines = tail
+        .into_iter()
+        .map(|l| strip_addr(l.trim()))
+        .filter(|l| !l.is_empty());
+    let Some(root) = lines.next() else {
+        return anyhow::anyhow!(what);
+    };
+    lines
+        .fold(anyhow::anyhow!(root), |e, l| e.context(l))
+        .context(what)
+}
+
+/// `[aac @ 0000026c0478f9c0] Unsupported ...` -> `[aac] Unsupported ...`. The
+/// address is a pointer in a process that has already exited, and it makes
+/// two reports of the same failure read as different ones.
+fn strip_addr(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix('[') {
+        if let Some((tag, after)) = rest.split_once(']') {
+            if let Some((name, addr)) = tag.split_once(" @ ") {
+                let addr = addr.trim_start_matches("0x");
+                if !addr.is_empty() && addr.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return format!("[{name}]{after}");
+                }
+            }
+        }
+    }
+    line.to_string()
 }
 
 /// Raw rgb24 frames off an ffmpeg pipe, on the deploy frame grid.
@@ -842,7 +908,7 @@ impl SegmentedDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{deep_pix_fmt, first_dims, norm_filter, playable, surface_fmt, HW_BACKENDS, Decoder, HwAccel, SegmentedDecoder};
+    use super::{deep_pix_fmt, ffmpeg_failure, first_dims, norm_filter, playable, strip_addr, surface_fmt, HW_BACKENDS, Decoder, HwAccel, SegmentedDecoder};
     use crate::bundle::Transcode;
     use std::path::{Path, PathBuf};
 
@@ -866,6 +932,54 @@ mod tests {
     fn the_normalize_chain_gates_the_rate_then_turns_the_format() {
         let f = norm_filter(&spec(), None, None);
         assert_eq!(f, "fps=30,format=yuv420p|yuv420p10le,scale=-2:480:flags=bicubic");
+    }
+
+    /// A failed transcode reads like every other failure in the log: what
+    /// failed, then why, then why that -- so ffmpeg's FIRST line, the one that
+    /// usually names the cause, is the deepest.
+    #[test]
+    fn a_failed_transcode_carries_ffmpegs_reason_root_cause_deepest() {
+        let tail = [
+            "[aac @ 0000026c0478f9c0] Unsupported channel layout \"9 channels\"
+",
+            "  
+",
+            "[aost#0:1/aac @ 0x5581e2a0] Error while opening encoder
+",
+            "Conversion failed!
+",
+        ]
+        .map(String::from);
+        let e = ffmpeg_failure("ffmpeg failed to transcode the source (exit code: 1)".into(), tail);
+        let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+        assert_eq!(
+            chain,
+            [
+                "ffmpeg failed to transcode the source (exit code: 1)",
+                "Conversion failed!",
+                "[aost#0:1/aac] Error while opening encoder",
+                "[aac] Unsupported channel layout \"9 channels\"",
+            ]
+        );
+    }
+
+    /// An ffmpeg that said nothing still fails with the plain message.
+    #[test]
+    fn a_silent_ffmpeg_fails_with_the_message_alone() {
+        let e = ffmpeg_failure("ffmpeg failed".into(), ["
+".to_string()]);
+        assert_eq!(e.chain().count(), 1);
+        assert_eq!(e.to_string(), "ffmpeg failed");
+    }
+
+    /// Only a pointer goes: a tag that merely contains " @ " keeps its text.
+    #[test]
+    fn strip_addr_drops_the_pointer_and_nothing_else() {
+        assert_eq!(strip_addr("[null @ 0000026c0478f9c0] dts"), "[null] dts");
+        assert_eq!(strip_addr("[h264 @ 0x7f3a] bad"), "[h264] bad");
+        assert_eq!(strip_addr("[in @ the end] x"), "[in @ the end] x");
+        assert_eq!(strip_addr("Conversion failed!"), "Conversion failed!");
+        assert_eq!(strip_addr("[out#0/mp4] Nothing was written"), "[out#0/mp4] Nothing was written");
     }
 
     /// Naming both planar depths is what keeps the software turn free: a
@@ -1293,6 +1407,29 @@ mod tests {
                  it has to land on the file the other two agree on"
             );
         }
+    }
+
+    /// A source ffmpeg cannot read fails with ffmpeg's own words in the error,
+    /// not just its exit code -- the part the log used to be missing.
+    #[test]
+    #[ignore = "transcodes with the real ffmpeg; run explicitly: cargo test -- --ignored reason"]
+    fn reason_a_failed_transcode_says_what_ffmpeg_said() {
+        let dir = clock_dir();
+        let src = dir.join("reason_garbage.mp4");
+        std::fs::write(&src, vec![0x5au8; 64 * 1024]).unwrap();
+        let norm = dir.join("reason_norm.mp4");
+        let spec = crate::bundle::Transcode {
+            height: 240,
+            fps: 30.0,
+            crf: 23,
+            preset: "veryfast".to_string(),
+        };
+        let e = super::transcode(&src, &norm, &spec, 1000.0, None, HwAccel::Off, |_| {})
+            .unwrap_err();
+        let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+        assert!(chain.len() > 1, "no reason from ffmpeg: {chain:?}");
+        assert!(!format!("{e:#}").contains("exit exit"), "{e:#}");
+        assert!(!norm.exists() && !norm.with_extension("part.mp4").exists());
     }
 
     /// THE deploy clock check: normalizing a source must not move its content
