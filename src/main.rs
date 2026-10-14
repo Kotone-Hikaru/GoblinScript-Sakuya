@@ -29,6 +29,7 @@ mod settings;
 mod sound;
 mod style;
 mod theme;
+mod throttle;
 mod tui;
 mod viz;
 mod vr;
@@ -168,7 +169,10 @@ struct Cli {
     #[arg(long, value_name = "SEC")]
     depth_window: Option<f64>,
 
-    /// Stroke amplitude scale, 0.5..2.0; 1.0 = the model's own amplitude.
+    /// Stroke amplitude scale, 0.5..4.0 (the review page's unlock boxes raise
+    /// this to 10 or 100); 1.0 = the model's own amplitude. Multiplies every
+    /// position's distance from mid-range, so 1.5 writes strokes half again as
+    /// far from the middle.
     #[arg(long, default_value_t = 1.0)]
     intensity: f64,
 
@@ -176,6 +180,117 @@ struct Cli {
     /// never hit its physical ends.
     #[arg(long, value_name = "LO-HI", default_value = "0-100", value_parser = parse_range)]
     range: (f64, f64),
+
+    /// Cap the whole-device GPU load while a draft runs, so the machine stays
+    /// usable (a browser video keeps playing). A background loop samples the
+    /// GPU every --throttle-interval seconds and stretches the gap between
+    /// encoder windows until the load settles at --throttle-gpu-target.
+    /// Presets: gentle (target 85, gentle corrections), balanced (target 90,
+    /// the shipped default), aggressive (target 95, holds speed), custom
+    /// (start from balanced and set any --throttle-* knob below). Off by
+    /// default: a plain run is byte-identical to a build without this flag.
+    #[arg(long, value_name = "PRESET")]
+    throttle: Option<String>,
+
+    /// Do not throttle. The default, stated so a script can be explicit.
+    #[arg(long)]
+    no_throttle: bool,
+
+    /// Fraction of the GPU load to hold, as a percentage (--throttle target).
+    /// Over the target the gaps between windows lengthen; under it they
+    /// shorten. 90 leaves a browser video ~10% of headroom.
+    #[arg(long, value_name = "PCT")]
+    throttle_gpu_target: Option<f32>,
+
+    /// Seconds between GPU samples. NVML reads cost ~2 us, so this is a
+    /// responsiveness choice, not a cost one. The driver's own utilization is
+    /// a ~1 s sliding average, and the encoder's load is a pulse train whose
+    /// period is ~3 s, so a single sample is mostly the phase of that train;
+    /// this is why the loop DECIDES on --throttle-avg-window, not on one
+    /// sample. Sampling fast is still right -- the average wants points.
+    #[arg(long, value_name = "SEC")]
+    throttle_interval: Option<f32>,
+
+    /// Seconds of samples averaged before ONE duty correction. Must exceed the
+    /// encoder's pulse period (~3 s here) or the loop regulates its own phase:
+    /// see the module docs. 9 s is three periods and the shipped default.
+    #[arg(long, value_name = "SEC")]
+    throttle_avg_window: Option<f32>,
+
+    /// Loop gain: duty moves this many points per point of error. Higher
+    /// settles faster and hunts more.
+    #[arg(long, value_name = "K")]
+    throttle_kp: Option<f32>,
+
+    /// Error inside +-this many points is ignored, so the machine's own
+    /// jitter never moves the loop.
+    #[arg(long, value_name = "PCT")]
+    throttle_deadzone: Option<f32>,
+
+    /// Duty floor, as a percentage: the throttle never starves the encode
+    /// below this, so a draft always finishes.
+    #[arg(long, value_name = "PCT")]
+    throttle_duty_min: Option<f32>,
+
+    /// Duty the loop arms at, instead of 100. Starting at 100 spends the first
+    /// average window at full pelt no matter what, and that window is the one
+    /// the user is most likely to be watching; the loop walks up from here if
+    /// the machine is idle.
+    #[arg(long, value_name = "PCT")]
+    throttle_duty_start: Option<f32>,
+
+    /// Cap on a single upward duty move per tick, in points. Raising duty is
+    /// the cautious direction (it re-tightens the throttle), so it moves
+    /// slowly; see --throttle-fall-limit for the other side.
+    #[arg(long, value_name = "PCT")]
+    throttle_rise_limit: Option<f32>,
+
+    /// Cap on a single downward duty move per tick, in points. Without it a
+    /// large error relative to a low --throttle-gpu-target floors the loop in
+    /// one move and it then has to climb back at --throttle-rise-limit per
+    /// tick.
+    #[arg(long, value_name = "PCT")]
+    throttle_fall_limit: Option<f32>,
+
+    /// Seconds a duty change must hold before the loop may move the other
+    /// way. Kills slow hunting that smoothing alone would ride.
+    #[arg(long, value_name = "SEC")]
+    throttle_dwell: Option<f32>,
+
+    /// RETIRED, no effect. A single over-target sample can no longer move the
+    /// loop: at this sampling rate the encoder's own pulse (~606 ms of load
+    /// every ~3 s) and a real external burst are the same shape, so the branch
+    /// that acted on one sample acted on the loop's own phase and floor-locked
+    /// it. Accepted so an older command line still runs.
+    #[arg(long, value_name = "PCT")]
+    throttle_spike_margin: Option<f32>,
+
+    /// RETIRED with --throttle-spike-margin. No effect.
+    #[arg(long, value_name = "PCT")]
+    throttle_spike_cut_max: Option<f32>,
+
+    /// RETIRED with --throttle-spike-margin. No effect.
+    #[arg(long, value_name = "SEC")]
+    throttle_spike_hold: Option<f32>,
+
+    /// OPTIONAL second clamp: hold the SCRIPT itself to this duty ceiling,
+    /// independent of the machine target. The plain loop controls the whole
+    /// device and lets the script use whatever is free; this bounds the
+    /// script even when the device is idle. Off unless set.
+    #[arg(long, value_name = "PCT")]
+    throttle_script_max: Option<f32>,
+
+    /// SUPERSEDED by --throttle-avg-window and has no effect: the loop now
+    /// averages over a span of TIME (which is what the plant's pulse period
+    /// is), not over a count of samples. Accepted so an older command line
+    /// still runs.
+    #[arg(long, value_name = "N")]
+    throttle_smooth: Option<usize>,
+
+    /// Seconds at the start with no correction, so encoder warmup is not
+    /// throttled.
+    #[arg(long, value_name = "SEC")]
+    throttle_grace: Option<f32>,
 
     /// Cap position speed (pos-units/s). The default is the speed a funscript
     /// player can actually deliver: a faster transition is depth the device
@@ -2719,6 +2834,82 @@ fn bench(b: &Bundle) -> Result<()> {
     Ok(())
 }
 
+/// Build a throttle config from whatever `--throttle-*` flags this run carries
+/// and arm it, or do nothing if the command line asks for no throttle.
+///
+/// Split out of `main` because the picker needs the same validation on a
+/// DIFFERENT source: its preset comes from `settings.json`, and the two paths
+/// must agree on what a good config is or a value the picker accepts would
+/// panic in `rest_after` where a CLI value would have been rejected up front.
+fn arm_throttle_from_cli(cli: &Cli) -> anyhow::Result<()> {
+    let ov = throttle::Overrides {
+        gpu_target: cli.throttle_gpu_target,
+        interval: cli.throttle_interval,
+        avg_window: cli.throttle_avg_window,
+        kp: cli.throttle_kp,
+        deadzone: cli.throttle_deadzone,
+        duty_min: cli.throttle_duty_min,
+        duty_start: cli.throttle_duty_start,
+        rise_limit: cli.throttle_rise_limit,
+        fall_limit: cli.throttle_fall_limit,
+        dwell: cli.throttle_dwell,
+        spike_margin: cli.throttle_spike_margin,
+        spike_cut_max: cli.throttle_spike_cut_max,
+        spike_hold: cli.throttle_spike_hold,
+        script_max: cli.throttle_script_max,
+        smooth: cli.throttle_smooth,
+        grace: cli.throttle_grace,
+    };
+    // `--throttle-script-max` on its own is a request to throttle, with the
+    // balanced preset and only that clamp changed.
+    if cli.no_throttle && (cli.throttle.is_some() || cli.throttle_script_max.is_some()) {
+        anyhow::bail!("--no-throttle conflicts with --throttle / --throttle-script-max");
+    }
+    let want = !cli.no_throttle && (cli.throttle.is_some() || cli.throttle_script_max.is_some());
+    if !want {
+        return Ok(());
+    }
+    let name = cli.throttle.as_deref().unwrap_or("balanced");
+    arm_throttle(name, &ov)
+}
+
+/// Validate `ov`-overridden `name` and install it. The one place a config
+/// becomes a running throttle, so `--throttle` and the picker's P key cannot
+/// drift apart on what is legal.
+fn arm_throttle(name: &str, ov: &throttle::Overrides) -> anyhow::Result<()> {
+    let cfg = throttle::parse(name, ov)?;
+    if !(1.0..=100.0).contains(&cfg.gpu_target) {
+        anyhow::bail!("throttle gpu_target {} is out of range (1..100)", cfg.gpu_target);
+    }
+    if cfg.duty_min < 1.0 || cfg.duty_min > 100.0 {
+        anyhow::bail!("throttle duty_min {} is out of range (1..100)", cfg.duty_min);
+    }
+    if cfg.duty_start < 1.0 || cfg.duty_start > 100.0 {
+        anyhow::bail!("throttle duty_start {} is out of range (1..100)", cfg.duty_start);
+    }
+    // A zero or negative cap would be a `delta` that cannot move, and a
+    // `script_max` of 0 a duty clamped straight to the atomic's floor; both are
+    // legal f32 but not legal controls.
+    if cfg.script_max <= 0.0 || cfg.script_max > 100.0 {
+        anyhow::bail!("throttle script_max {} is out of range (1..100]", cfg.script_max);
+    }
+    if cfg.rise_limit <= 0.0 || cfg.fall_limit <= 0.0 {
+        anyhow::bail!(
+            "throttle step caps must be positive (rise {}, fall {})",
+            cfg.rise_limit,
+            cfg.fall_limit
+        );
+    }
+    if cfg.avg_window <= 0.0 {
+        anyhow::bail!("throttle avg_window {} must be positive seconds", cfg.avg_window);
+    }
+    if cfg.interval <= 0.0 {
+        anyhow::bail!("throttle interval {} must be positive seconds", cfg.interval);
+    }
+    throttle::install(true, cfg);
+    Ok(())
+}
+
 fn main() -> std::process::ExitCode {
     use std::io::Write as _;
     // A double-clicked exe (no args) gets the picker -- and a pause before the
@@ -2934,6 +3125,14 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
+    // The optional GPU throttle. Armed here -- after every early-return path
+    // that does no drafting (`--music-levels`, `--dump-bundle`, `--vr-only`)
+    // and before any encode can start -- from the CLI flags when there are any,
+    // and otherwise left to the picker, which reads its setting from
+    // `settings.json` below. A run that asks for neither is byte-identical to a
+    // build without any of this.
+    arm_throttle_from_cli(&cli)?;
+
     ffmpeg::have_tools()?;
 
     // A folder stands for the videos in it from here on, so nothing below --
@@ -2972,8 +3171,13 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
-    if !(0.5..=2.0).contains(&cli.intensity) {
-        anyhow::bail!("--intensity {} is out of range (0.5..2.0)", cli.intensity);
+    if !(crate::style::INTENSITY_MIN..=crate::style::INTENSITY_UNLOCKED_100).contains(&cli.intensity) {
+        anyhow::bail!(
+            "--intensity {} is out of range ({}..{})",
+            cli.intensity,
+            crate::style::INTENSITY_MIN,
+            crate::style::INTENSITY_UNLOCKED_100
+        );
     }
     if cli.max_speed < 0.0 {
         anyhow::bail!("--max-speed must be >= 0");
@@ -3106,6 +3310,39 @@ fn real_main() -> Result<()> {
         && !sound::muted()
         && std::io::stdout().is_terminal();
 
+    // What the throttle will actually be, resolved ONCE for the report below.
+    // Precedence: `--no-throttle` > a `--throttle*` flag > the picker's
+    // remembered choice. A run that was CALLED (a named video, a script) does
+    // not read the file -- same rule as `music`, and for the same reason: a
+    // command should not silently change behaviour because somebody pressed a
+    // key in the picker last week.
+    let throttle_name: Option<String> = if cli.no_throttle {
+        None
+    } else if cli.throttle.is_some() || cli.throttle_script_max.is_some() {
+        Some(cli.throttle.clone().unwrap_or_else(|| "balanced".into()))
+    } else if picker_mode {
+        settings.throttle.clone()
+    } else {
+        None
+    };
+    // The picker's own choice is not on any command line, so it is armed here.
+    // (A CLI run was already armed above, before `settings` had been read --
+    // `install` is one-shot, and `reconfigure` is what reaches an installed
+    // loop, so either path lands on the same place.)
+    //
+    // A stale or hand-edited name this build does not know is not worth a hard
+    // failure on a double-click: say so and draft unthrottled, which is the
+    // state the user was in anyway.
+    if picker_mode {
+        match throttle_name.as_deref() {
+            None => {}
+            Some(name) => match throttle::parse(name, &throttle::Overrides::default()) {
+                Ok(cfg) => throttle::reconfigure(Some(cfg)),
+                Err(e) => eprintln!("[throttle] {e}; drafting unthrottled"),
+            },
+        }
+    }
+
     let cache_root = cli.cache.clone().unwrap_or_else(|| {
         std::env::current_exe()
             .ok()
@@ -3133,6 +3370,7 @@ fn real_main() -> Result<()> {
         let post = (!cli.quiet).then(|| {
             let p = bios::Post::begin(true);
             bios::system(&p, &cache_root);
+            bios::throttle(&p, throttle_name.as_deref());
             p
         });
         let b = loader
@@ -3158,6 +3396,7 @@ fn real_main() -> Result<()> {
             // machine, and the report is a header rather than a ceremony
             let p = bios::Post::begin(false);
             bios::system(&p, &cache_root);
+            bios::throttle(&p, throttle_name.as_deref());
             bios::devices(&p, &b.manifest);
             bios::ready(&p);
         }
@@ -3183,7 +3422,11 @@ fn real_main() -> Result<()> {
         sound::set_music(true);
     }
 
-    let mut start_dir = settings.start_dir().or_else(|| std::env::current_dir().ok());
+    // The picker opens where `dir_mode` says: the remembered directory by
+    // default, or the exe's own folder when the user pinned it there. The
+    // exe's folder is the fallback, not the working directory -- a
+    // double-clicked exe is handed an unrelated cwd by Explorer.
+    let mut start_dir = settings.picker_start_dir();
     // In the picker (double-clicked, no flags) the last session's accepted style
     // is the starting point -- there is no command line to carry it otherwise.
     if picker_mode {
@@ -3207,6 +3450,10 @@ fn real_main() -> Result<()> {
                 !cli.no_autocrop && settings.autocrop,
                 // and so is the crop page it feeds
                 !cli.no_crop_edit && settings.crop_edit,
+                // the throttle, as the picker last left it (CLI flags win and
+                // were armed above, but the picker still shows and re-saves
+                // what it would use)
+                throttle_name.clone(),
                 start_dir.clone(),
                 std::mem::take(&mut report),
                 cli.dl_dir.clone(),
@@ -3229,6 +3476,26 @@ fn real_main() -> Result<()> {
                     settings.last_dir = p.dir.as_ref().map(|d| d.display().to_string());
                     settings.autocrop = p.autocrop;
                     settings.crop_edit = p.crop_edit;
+                    // The throttle, as the picker left it. Same terms as the
+                    // switches above: a preference, remembered for next launch
+                    // AND applied now, because the picker's user has no command
+                    // line to apply it with. `reconfigure` reaches the loop the
+                    // CLI already installed, or installs one the picker just
+                    // asked for, or turns it off.
+                    if p.throttle != settings.throttle {
+                        match p.throttle.as_deref() {
+                            None => throttle::disable(),
+                            Some(name) => match throttle::parse(name, &throttle::Overrides::default())
+                            {
+                                Ok(cfg) => throttle::reconfigure(Some(cfg)),
+                                // a name this build does not know (hand-edited
+                                // file): draft unthrottled rather than refuse a
+                                // batch over an optional feature
+                                Err(e) => eprintln!("[throttle] {e}; drafting unthrottled"),
+                            },
+                        }
+                    }
+                    settings.throttle = p.throttle.clone();
                     settings.remember_presentation();
                     settings.save();
                     // the picker's users have no flags to re-run with -- the

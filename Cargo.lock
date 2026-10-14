@@ -763,6 +763,7 @@ dependencies = [
  "clap",
  "console",
  "indicatif",
+ "libloading",
  "midly",
  "ort",
  "ratatui",

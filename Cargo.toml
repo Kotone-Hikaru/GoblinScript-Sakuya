@@ -49,6 +49,12 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 console = "0.15"
 ratatui = "0.29"
+# The optional GPU throttle (src/throttle.rs) reads whole-device utilization
+# through nvml.dll, which ships with every NVIDIA driver. It is loaded by hand
+# with libloading rather than through nvml-wrapper: three calls do not justify
+# pinning a sys crate, and "no NVML" is then a runtime state we handle
+# (fail-open, throttle disarmed) instead of a build-time one.
+libloading = "0.8"
 # No ndarray here on purpose: tensors go in and out of ort as (shape, &[T]),
 # which keeps us off ort's own ndarray version and out of dependency conflicts.
 # The default feature set with rustls in place of the platform TLS: the

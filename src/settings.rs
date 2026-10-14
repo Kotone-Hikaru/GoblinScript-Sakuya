@@ -60,6 +60,33 @@ pub struct Settings {
     /// make here. Switched off, a batch runs start to finish with nobody at
     /// the keyboard.
     pub crop_edit: bool,
+    /// GPU throttle preset, cycled with P in the picker. `None` = never chosen,
+    /// which means OFF -- a plain draft is unchanged, and someone who never
+    /// touches this key is never throttled behind their back.
+    ///
+    /// The picker's users have no flags to re-run with, so this is the ONLY way
+    /// to reach the throttle from a double-clicked exe; a named-video run reads
+    /// `--throttle` instead, like every other remembered preference. A string
+    /// (not an enum) so an unknown name from a hand-edited file, or a preset a
+    /// future build drops, degrades to "off" rather than failing the parse for
+    /// the whole file -- these settings are a convenience and never a
+    /// dependency (see the module docs).
+    pub throttle: Option<String>,
+    /// Where the picker's file list starts. `None` (never chosen) means
+    /// `last` -- the remembered directory, then the exe's OWN folder, then the
+    /// launch directory. The two other names are:
+    ///
+    /// - `"last"` -- remember the last directory a batch was started from, and
+    ///   reopen there. The shipped behaviour, and what `None` resolves to.
+    /// - `"exe"`  -- always open in the folder the executable sits in, IGNORING
+    ///   the remembered directory. For someone who double-clicks the exe from
+    ///   Explorer: the process's working directory is then whatever Explorer
+    ///   happened to hand it, which is why the picker used to open somewhere
+    ///   unrelated. `exe` pins it to where the goblins actually live.
+    ///
+    /// A string, like `throttle`, so a hand-edited value this build does not
+    /// know degrades to the default rather than failing the whole file.
+    pub dir_mode: Option<String>,
 }
 
 impl Default for Settings {
@@ -75,6 +102,8 @@ impl Default for Settings {
             volume: None,
             autocrop: true,
             crop_edit: true,
+            throttle: None,
+            dir_mode: None,
         }
     }
 }
@@ -119,5 +148,89 @@ impl Settings {
             .as_ref()
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
+    }
+
+    /// Where the picker's file list opens, resolving `dir_mode`.
+    ///
+    /// `"exe"` pins it to the executable's own folder and ignores the
+    /// remembered directory entirely. Anything else (including the default
+    /// `None`, and an unknown name from a hand-edited file) is the remembered
+    /// directory first.
+    ///
+    /// The exe's folder is the fallback rather than the process's working
+    /// directory: a double-clicked exe is handed some unrelated cwd by
+    /// Explorer, and "somewhere the user did not choose" is exactly the bug
+    /// this ordering avoids. The working directory is kept as the last resort,
+    /// for a launch where even the exe's own path cannot be read.
+    pub fn picker_start_dir(&self) -> Option<PathBuf> {
+        let exe_dir = || {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(PathBuf::from))
+        };
+        if self.dir_mode.as_deref() == Some("exe") {
+            return exe_dir().or_else(|| std::env::current_dir().ok());
+        }
+        self.start_dir()
+            .or_else(exe_dir)
+            .or_else(|| std::env::current_dir().ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole file is `#[serde(default)]`, and that is load-bearing: a user
+    /// upgrading from a build that never heard of the throttle must keep every
+    /// other field, not lose the file to a missing key.
+    #[test]
+    fn a_file_from_before_the_throttle_field_still_loads() {
+        let old = r#"{
+            "last_dir": "F://OSR6",
+            "theme": "phosphor",
+            "lang": "zh-CN",
+            "muted": false,
+            "music": true,
+            "autocrop": true,
+            "crop_edit": false
+        }"#;
+        let s: Settings = serde_json::from_str(old).expect("an older file must still parse");
+        assert_eq!(s.last_dir.as_deref(), Some("F://OSR6"));
+        assert_eq!(s.throttle, None, "no field means off, not a parse failure");
+        assert!(s.autocrop && !s.crop_edit);
+    }
+
+    /// A hand-edited name this build does not ship must come back as a string
+    /// and not fail the parse -- `describe` and the CLI both know what to do
+    /// with a name they cannot resolve, and neither is worth losing the file
+    /// over. (The empty file and the `null` are the other two shapes a user
+    /// can leave behind.)
+    #[test]
+    fn an_unknown_or_nulled_throttle_is_data_not_a_failure() {
+        for text in [
+            r#"{"throttle": "some-future-preset"}"#,
+            r#"{"throttle": null}"#,
+            r#"{}"#,
+        ] {
+            let s: Settings = serde_json::from_str(text).expect("must parse");
+            assert!(
+                s.throttle.is_none() || s.throttle.as_deref() == Some("some-future-preset"),
+                "unexpected value from {text}"
+            );
+        }
+    }
+
+    /// A round trip must preserve the throttle: it is the ONLY place the
+    /// picker's P key is written down, so a field dropped on save would make
+    /// the key look like it never stuck.
+    #[test]
+    fn a_saved_throttle_comes_back() {
+        let mut s = Settings::default();
+        assert_eq!(s.throttle, None, "off is the shipped state");
+        s.throttle = Some("aggressive".into());
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.throttle.as_deref(), Some("aggressive"));
     }
 }

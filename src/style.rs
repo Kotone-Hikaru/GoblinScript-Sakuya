@@ -57,6 +57,25 @@ const REV_SUPPORT_S: f64 = 0.0667;
 /// `jepa_infer.PHASE_RUN_K`: the run length of the run-share phase reading.
 const PHASE_RUN_K: usize = 3;
 
+/// The stroke-amplitude scale's limits. `intensity` multiplies every position's
+/// distance from mid-range (`shape_actions`), so 1.0 is the model's own
+/// amplitude and 2.0 writes strokes twice as far from the middle.
+///
+/// `MAX` is the everyday ceiling. The review page carries two unlock boxes that
+/// raise the slider to `UNLOCKED_MAX` (10x) and then `UNLOCKED_100` (100x) --
+/// for a draft whose strokes sit so close to mid-range that even 10x cannot
+/// reach, and where a hard, saturated line is wanted on purpose. The reach is
+/// behind a click because it is not the answer to reach for by accident: past
+/// the slider's own span every endpoint pins to 0 or 100 and the result is a
+/// square wave, not a stroke. All three live here so the CLI check, the
+/// picker's `+` key, the review POST handler and the page's own slider agree on
+/// one set of numbers; the page gets them over the wire rather than
+/// hard-coding a second copy.
+pub const INTENSITY_MIN: f64 = 0.5;
+pub const INTENSITY_MAX: f64 = 4.0;
+pub const INTENSITY_UNLOCKED_MAX: f64 = 10.0;
+pub const INTENSITY_UNLOCKED_100: f64 = 100.0;
+
 fn sign(x: f64) -> f64 {
     if x > 0.0 {
         1.0

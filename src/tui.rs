@@ -39,6 +39,10 @@ pub struct Pick {
     /// but not perfect, and a missed VR source costs a full-length draft of
     /// nonsense -- so the listing is where that can be corrected, per video.
     pub vr: BTreeSet<PathBuf>,
+    /// The GPU throttle preset chosen with P, or `None` for off. Carried out on
+    /// start so the caller can arm it and remember it; the picker itself never
+    /// runs the encoder and so has nothing to arm.
+    pub throttle: Option<String>,
 }
 
 /// What the batch that just ran left behind, for the picker to hand back.
@@ -169,6 +173,10 @@ struct App {
     /// The crop page before each video of the next batch (K), on the same
     /// terms. Off is what a batch left running unattended wants.
     crop_edit: bool,
+    /// The GPU throttle preset for the next batch (P), or `None` for off. On
+    /// the same terms as the two switches above: seeded from the remembered
+    /// setting, and the choice sticks when a batch starts with it.
+    throttle: Option<String>,
     /// Feedback from the batch that just ran (drafted/skipped/failed) -- shown
     /// so an instant, all-skipped start is not silent.
     status: Option<String>,
@@ -232,6 +240,7 @@ impl App {
         force: bool,
         autocrop: bool,
         crop_edit: bool,
+        throttle: Option<String>,
         start: Option<PathBuf>,
         report: Report,
         dl_dir: Option<PathBuf>,
@@ -248,6 +257,7 @@ impl App {
             force,
             autocrop,
             crop_edit,
+            throttle,
             status: report.status,
             errors: !report.failures.is_empty(),
             err_off: 0,
@@ -275,6 +285,15 @@ impl App {
         a.spawn_probe_pool();
         a.refresh();
         a
+    }
+
+    /// Test-only shorthand: the picker with everything at its default and no
+    /// throttle. The tests below predate the throttle parameter and there is
+    /// nothing about a picker under test that cares which preset is armed, so
+    /// this keeps those call sites about what they are actually testing.
+    #[cfg(test)]
+    fn plain(force: bool, autocrop: bool, crop_edit: bool, start: Option<PathBuf>, report: Report) -> Self {
+        Self::new(force, autocrop, crop_edit, None, start, report, None, Vec::new())
     }
 
     /// Re-read the folder from disk, then rebuild the view. The ONLY entry
@@ -1462,7 +1481,7 @@ mod screen_tests {
             for (w, h) in sizes {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
                 let mut app =
-                    App::new(false, false, false, None, Report::default(), None, Vec::new());
+                    App::plain(false, false, false, None, Report::default());
                 term.draw(|f| draw(f, &mut app)).unwrap();
                 // and again mid-filter, which adds the blinking cursor span
                 app.filtering = true;
@@ -1494,7 +1513,7 @@ mod screen_tests {
             }],
             log: Some(PathBuf::from("C:/goblins/goblinscript.log")),
         };
-        let mut app = App::new(false, false, false, None, report, None, Vec::new());
+        let mut app = App::plain(false, false, false, None, report);
         assert!(app.errors, "a batch that failed has to say so without being asked");
 
         for (w, h) in [(1u16, 1u16), (20, 6), (80, 24), (200, 60)] {
@@ -1557,7 +1576,7 @@ mod screen_tests {
             std::fs::write(here.join(n), b"").unwrap();
         }
 
-        let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+        let mut app = App::plain(false, false, false, None, Report::default());
         app.cur = Some(here.clone());
         app.refresh();
 
@@ -1598,7 +1617,7 @@ mod screen_tests {
         std::fs::write(a.join("one.mp4"), b"").unwrap();
         std::fs::write(b.join("two.mp4"), b"").unwrap();
 
-        let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+        let mut app = App::plain(false, false, false, None, Report::default());
         app.selected.insert(a.join("one.mp4"));
         app.selected.insert(b.join("two.mp4"));
 
@@ -1636,14 +1655,12 @@ mod screen_tests {
                 causes: vec!["ffprobe could not read the video".into()],
             })
             .collect();
-        let mut app = App::new(
+        let mut app = App::plain(
             false,
             false,
             false,
             None,
             Report { status: None, failures, log: None },
-            None,
-            Vec::new(),
         );
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1676,14 +1693,12 @@ mod screen_tests {
                 causes: vec!["ffprobe could not read the video".into()],
             })
             .collect();
-        let mut app = App::new(
+        let mut app = App::plain(
             false,
             false,
             false,
             None,
             Report { status: None, failures, log: None },
-            None,
-            Vec::new(),
         );
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1752,7 +1767,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
             ],
             log: Some(PathBuf::from("C:/Program Files/goblinscript/goblinscript.log")),
         };
-        let mut app = App::new(false, false, false, None, report, None, Vec::new());
+        let mut app = App::plain(false, false, false, None, report);
         let mut term = Terminal::new(TestBackend::new(80, 26)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
@@ -1780,7 +1795,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
             crate::theme::set(p);
             for (w, h) in [(1u16, 1u16), (12, 9), (40, 12), (80, 24), (200, 60)] {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-                let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+                let mut app = App::plain(false, false, false, None, Report::default());
                 app.cur = Some(dir.clone());
                 app.entries = vec![
                     Entry::Up,
@@ -1879,7 +1894,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
         let (short, wide) = (dir.join("short.mp4"), dir.join("影片_很长的名字_测试.mp4"));
         for (w, h) in [(80u16, 24u16), (100, 30), (200, 60)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-            let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+            let mut app = App::plain(false, false, false, None, Report::default());
             app.cur = Some(dir.clone());
             app.entries =
                 vec![Entry::Up, Entry::File(short.clone()), Entry::File(wide.clone())];
@@ -1938,7 +1953,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
         let dir = PathBuf::from("Q:/vids");
         let (w, h) = (100u16, 30u16);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+        let mut app = App::plain(false, false, false, None, Report::default());
         app.cur = Some(dir.clone());
         app.folders.clear(); // `App::new` listed the launch directory; this is a folder of its own
         app.videos = (0..5000)
@@ -2005,7 +2020,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
             }
         }
 
-        let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+        let mut app = App::plain(false, false, false, None, Report::default());
         app.cur = Some(dir.clone());
         let t = Instant::now();
         app.refresh();
@@ -2036,7 +2051,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
     #[test]
     fn filtering_narrows_the_listing_without_a_folder_to_read() {
         let dir = PathBuf::from("Q:/nowhere-at-all");
-        let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+        let mut app = App::plain(false, false, false, None, Report::default());
         app.cur = Some(dir.clone());
         app.folders.clear(); // `App::new` listed the launch directory; this is a folder of its own
         for name in ["alpha.mp4", "beta.mp4", "gamma.mp4", "ALPHABET.mp4"] {
@@ -2082,7 +2097,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
         std::fs::write(deep.join("deeper.mp4"), b"").unwrap();
 
         let mut app =
-            App::new(false, false, false, Some(root.clone()), Report::default(), None, Vec::new());
+            App::plain(false, false, false, Some(root.clone()), Report::default());
         assert!(matches!(app.entries[1], Entry::Dir(ref d) if *d == bare), "bare sorts first");
         app.list.select(Some(2)); // the drop
         app.toggle_at_cursor();
@@ -2132,7 +2147,7 @@ C:/videos/a/very/deeply/nested/folder/with/an/extremely-long-file-name-indeed.mp
             crate::theme::set(p);
             for (w, h) in [(80u16, 24u16), (100, 30), (200, 60)] {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-                let mut app = App::new(false, false, false, None, Report::default(), None, Vec::new());
+                let mut app = App::plain(false, false, false, None, Report::default());
                 term.draw(|f| draw(f, &mut app)).unwrap();
                 let buf = term.backend().buffer();
                 let rows: Vec<String> = (0..h)
@@ -2313,6 +2328,21 @@ fn onoff(t: &Theme, label: &str, key: &str, on: bool) -> Vec<Span<'static>> {
             Span::styled(t!("common.on"), Style::new().fg(rat(t.accent)).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(t!("common.off"), Style::new().fg(rat(t.muted)))
+        },
+    ]
+}
+
+/// Like `onoff`, but for a knob with more than two states -- the throttle,
+/// whose P key cycles off -> gentle -> balanced -> aggressive -> off. The value
+/// is drawn as the preset's own word, so the guide says which one is armed
+/// rather than merely that something is.
+fn onoff_named(t: &Theme, label: &str, key: &str, value: Option<&str>, off_word: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!(" {key} "), Style::new().fg(Color::Black).bg(rat(t.chrome_bg))),
+        Span::raw(format!(" {label}: ")),
+        match value {
+            Some(v) => Span::styled(v.to_string(), Style::new().fg(rat(t.accent)).add_modifier(Modifier::BOLD)),
+            None => Span::styled(off_word.to_string(), Style::new().fg(rat(t.muted))),
         },
     ]
 }
@@ -2692,6 +2722,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     opts.push(onoff(&t, t!("picker.toggle.overwrite"), "F", app.force));
     opts.push(onoff(&t, t!("picker.toggle.autocrop"), "C", app.autocrop));
     opts.push(onoff(&t, t!("picker.toggle.cropedit"), "K", app.crop_edit));
+    // The throttle, as its preset's own name -- a bare on/off would leave the
+    // user unable to tell gentle from aggressive at a glance, which is the one
+    // thing this footer is for.
+    opts.push(onoff_named(
+        &t,
+        t!("picker.toggle.throttle"),
+        "P",
+        app.throttle.as_deref(),
+        &t!("common.off"),
+    ));
     let opt_rows = pack_lines(opts, "   ", area.width, FOOT_MAX_ROWS);
 
     // The link key is advertised only when yt-dlp is installed: an offer the app
@@ -2723,6 +2763,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("B", t!("picker.act.markvr")),
             ("C", t!("picker.act.autocrop")),
             ("K", t!("picker.act.cropedit")),
+            ("P", t!("picker.act.throttle")),
         ];
         if crate::dl::available() {
             v.push(("L", t!("picker.act.pastelink")));
@@ -3153,6 +3194,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Option<Pick>> {
                 force: app.force,
                 autocrop: app.autocrop,
                 crop_edit: app.crop_edit,
+                throttle: app.throttle.clone(),
                 dir: app.cur.clone(),
                 // only the marks that are in this batch: a mark left on a
                 // video the user did not start is not an instruction
@@ -3176,6 +3218,16 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Option<Pick>> {
         }
         KeyCode::Char('k') | KeyCode::Char('K') => {
             app.crop_edit = !app.crop_edit;
+            crate::sound::play_click();
+        }
+        // The GPU throttle, on the same terms as the crop and force switches:
+        // one key, live, and remembered when a batch starts. Cycles
+        // off -> gentle -> balanced -> aggressive -> off, so the whole range is
+        // reachable without a settings file or a command line -- which the
+        // picker's user does not have.
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.throttle = crate::throttle::next_preset(app.throttle.as_deref())
+                .map(|s| s.to_string());
             crate::sound::play_click();
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -3260,13 +3312,14 @@ pub fn pick(
     force: bool,
     autocrop: bool,
     crop_edit: bool,
+    throttle: Option<String>,
     start: Option<PathBuf>,
     report: Report,
     dl_dir: Option<PathBuf>,
     dl_args: Vec<String>,
 ) -> Result<Option<Pick>> {
     let mut term = ratatui::init();
-    let mut app = App::new(force, autocrop, crop_edit, start, report, dl_dir, dl_args);
+    let mut app = App::new(force, autocrop, crop_edit, throttle, start, report, dl_dir, dl_args);
     let r = run(&mut term, &mut app);
     // The pools outlive the screen otherwise, and the batch about to run wants
     // the disk (and, for a probe, the process table) to itself.
@@ -3371,9 +3424,13 @@ fn review_run(
                 params[sel].depth_window = None;
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
-                params[sel].intensity = (params[sel].intensity + 0.1).min(2.0)
+                params[sel].intensity =
+                    (params[sel].intensity + 0.1).min(style::INTENSITY_MAX)
             }
-            KeyCode::Char('-') => params[sel].intensity = (params[sel].intensity - 0.1).max(0.5),
+            KeyCode::Char('-') => {
+                params[sel].intensity =
+                    (params[sel].intensity - 0.1).max(style::INTENSITY_MIN)
+            }
             _ => {}
         }
         if params[sel] != before {

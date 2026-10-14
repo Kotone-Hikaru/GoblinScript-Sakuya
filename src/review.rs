@@ -534,6 +534,14 @@ pub(crate) fn presets_json(presets: Presets) -> serde_json::Value {
             "steady": filler_preset(style::FillerPreset::Steady),
             "bursts": filler_preset(style::FillerPreset::Bursts),
         },
+        // The intensity slider's ceilings, so the page's unlock boxes and the
+        // server's own accept-check are the same four numbers rather than two
+        // copies that can drift. `base` is the everyday one a fresh page shows.
+        "intensity": {
+            "min": style::INTENSITY_MIN,
+            "base": style::INTENSITY_MAX,
+            "tiers": [style::INTENSITY_UNLOCKED_MAX, style::INTENSITY_UNLOCKED_100],
+        },
     })
 }
 
@@ -739,8 +747,18 @@ pub(crate) fn params_from_json(body: &str, base: &style::Params) -> Result<style
         }
     };
     let intensity = m.intensity.unwrap_or(base.intensity);
-    if !(0.5..=2.0).contains(&intensity) {
-        anyhow::bail!("intensity {intensity} is out of range (0.5..2.0)");
+    // The page's slider is the user's own guard rail: it stops at
+    // `INTENSITY_MAX` until an unlock box is ticked, then reaches
+    // `INTENSITY_UNLOCKED_MAX` or `INTENSITY_UNLOCKED_100`. The server accepts
+    // up to the far ceiling for every request (it cannot see the boxes, and the
+    // requests are the user's own), so the narrower everyday bound stays a UI
+    // decision.
+    if !(style::INTENSITY_MIN..=style::INTENSITY_UNLOCKED_100).contains(&intensity) {
+        anyhow::bail!(
+            "intensity {intensity} is out of range ({}..{})",
+            style::INTENSITY_MIN,
+            style::INTENSITY_UNLOCKED_100
+        );
     }
     let (lo, hi) = m.range.map(|r| (r[0], r[1])).unwrap_or(base.range);
     if !(0.0..=100.0).contains(&lo) || !(0.0..=100.0).contains(&hi) || lo >= hi {

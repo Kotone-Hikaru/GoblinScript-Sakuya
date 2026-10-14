@@ -242,7 +242,32 @@ pub fn encode(
                 // loses only the seconds since the last window
                 crate::cancel::check()?;
                 let win: Vec<&[u8]> = buf[..group + k].iter().map(|f| f.as_slice()).collect();
+                // Time the forward so the optional GPU throttle can nap for a
+                // duty-proportional fraction of it afterwards. This is the ONE
+                // place the encoder touches the GPU, so it is the one place the
+                // throttle can act; see src/throttle.rs. With no throttle
+                // installed `rest_after` returns zero and nothing changes.
+                let t0 = std::time::Instant::now();
                 encode_window(sess, man, &win, scale, row_bytes, &mut x, &mut slab)?;
+                let work = t0.elapsed();
+                let rest = crate::throttle::rest_after(work);
+                if !rest.is_zero() {
+                    std::thread::sleep(rest);
+                }
+                // `GS_THROTTLE_WINDOW=1`: one line per window, the encode time
+                // and the nap that followed it. The controller's duty is
+                // `work / (work + rest)`, and the only way to know whether the
+                // GPU is actually idle for that share -- rather than queued
+                // behind an async submit -- is to see the two times the loop
+                // itself saw.
+                if std::env::var_os("GS_THROTTLE_WINDOW").is_some_and(|v| v != "0") {
+                    eprintln!(
+                        "[window] work={:.1}ms rest={:.1}ms duty={:.0}%",
+                        work.as_secs_f64() * 1e3,
+                        rest.as_secs_f64() * 1e3,
+                        crate::throttle::duty()
+                    );
+                }
                 if rows_written == 0 {
                     assert_signal(&slab)?;
                 }

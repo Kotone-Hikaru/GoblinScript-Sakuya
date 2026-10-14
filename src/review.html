@@ -219,11 +219,30 @@
   .knobs.showfine .fine:not(.hidden) { display: flex;
                  background: color-mix(in srgb, var(--hi) 7%, var(--bg));
                  border-left: 2px solid var(--hi); padding: 6px 8px; }
+  /* The unlock row sits with the everyday knobs, not behind the fine-tuning
+     reveal: it is a first-class control of the intensity slider beside it, and
+     hiding it was why a click never landed -- an unrendered label is not a
+     clickable one. A horizontal row (name left, box right) so it reads as a
+     switch rather than another stacked field. */
+  .knobs .unlockrow { flex-direction: row; align-items: center;
+                 justify-content: space-between; gap: 8px; }
+  .knobs .unlockrow .field { flex: 0 0 auto; gap: 10px; }
+  .knobs .unlockopt { display: inline-flex; align-items: center; gap: 4px; }
+  .knobs .unlockopt label { display: inline; font-size: 12px; color: inherit;
+                 cursor: pointer; }
+  .knobs input[type=checkbox] { width: 15px; height: 15px; margin: 0; accent-color: var(--hi-bright); cursor: pointer; }
+  /* Armed: the row lights up so "the ceiling moved" is visible without reading
+     the slider's own right end -- the whole point of the box is a state a
+     glance should carry. */
+  .knobs .unlockrow:has(input:checked) { color: var(--hi-bright); }
   /* one control per line, each as wide as the rail: nothing here is worth a
      second column at this width, and equal widths make the bank scannable */
   #rail select, #rail input[type=range], #rail input[type=number] { width: 100%; min-width: 0; }
-  /* in a field row the controls share what the leading ? leaves */
-  #rail .field > select, #rail .field > input { flex: 1 1 0; }
+  /* in a field row the controls share what the leading ? leaves. A checkbox
+     is NOT one of them: it has no width of its own to share, so `flex: 1 1 0`
+     stretched it into a full-width sliver -- which is why the unlock box was
+     not recognised as a box, and a click on empty rail space did nothing. */
+  #rail .field > select, #rail .field > input:not([type=checkbox]) { flex: 1 1 0; }
   /* the key legend: what the arrows do, parked where it cannot cost the video
      any height */
   .keylist { display: flex; flex-direction: column; gap: 5px;
@@ -469,8 +488,14 @@
           <div class="group-knobs">
             <label for="intensity" data-t="page.knob.intensity">intensity <span id="ival">1.0</span>
               <span class="field"><button type="button" class="help" data-h="intensity">?</button>
-              <input id="intensity" type="range" min="0.5" max="2" step="0.1" value="1"></span>
+              <input id="intensity" type="range" min="0.5" max="4" step="0.1" value="1"></span>
             </label>
+            <div class="unlockrow" data-t="page.knob.unlock">unlock <span class="sub" data-t="page.knob.unlock.sub">raise the slider's ceiling</span>
+              <span class="field">
+                <span class="unlockopt"><input type="checkbox" id="intensityUnlock10"><label for="intensityUnlock10">10x</label></span>
+                <span class="unlockopt"><input type="checkbox" id="intensityUnlock100"><label for="intensityUnlock100">100x</label></span>
+              </span>
+            </div>
             <label class="fine" for="envSeed" data-t="page.knob.envseed">variation
               <span class="field"><button type="button" class="help" data-h="envSeed">?</button>
               <input id="envSeed" type="number" min="0" max="9007199254740991" step="1" value=""></span>
@@ -659,6 +684,20 @@ const timeline = $('timeline'), tlctx = timeline.getContext('2d');
 
 let state = null;     // /state payload
 let cur = 0;          // selected clip
+// The intensity slider's ceiling, as the user set it: the everyday one, or one
+// of the tiers the server names (currently 10x and 100x). Held HERE rather than
+// inferred from the value on every repaint, because a re-style round-trip
+// replaces `state` and re-seeds every control -- inferring "is it unlocked?"
+// from a value that is still under the old ceiling is exactly how the box used
+// to untick itself a beat after it was clicked.
+// Page state, not server state: the intent is about this sitting, and a reload
+// starting back at the base ceiling is the honest default.
+// The numbers themselves come from the server (`presets.intensity`), so the
+// boxes and the accept-check share one definition; these are only the fallbacks
+// for the beat before the first payload lands.
+let BASE_MAX = 4;
+let unlock = BASE_MAX;
+const UNLOCK_TIERS = [10, 100];
 let actions = [];     // current clip's actions, sorted by .at
 let cmpActions = [];  // the line under the script: another model's or the pinned one, on the clip's clock
 // per clip: the pinned script (its model, knobs and line), and whether it is
@@ -723,8 +762,23 @@ function applyTheme(t) {
 // ---- data ----------------------------------------------------------------
 async function fetchState() {
   state = await (await fetch('/state')).json();
+  syncIntensityLimits();
   applyTheme(state.theme);
   renderTabs();
+}
+// The server names the slider's ceilings; take them once, before any control
+// is seeded, so the boxes and the clamp agree from the first frame. An older
+// server without the field leaves the fallbacks in place.
+function syncIntensityLimits() {
+  const lim = state.presets && state.presets.intensity;
+  if (!lim) return;
+  if (typeof lim.base === 'number') BASE_MAX = lim.base;
+  if (Array.isArray(lim.tiers)) { UNLOCK_TIERS.length = 0; UNLOCK_TIERS.push(...lim.tiers); }
+  if (typeof lim.min === 'number') $('intensity').min = lim.min;
+  // An unlock below the base is not an unlock: clamp the live tier up to it so a
+  // payload cannot leave the slider holding a value past its own max.
+  if (unlock < BASE_MAX) unlock = BASE_MAX;
+  syncUnlockUI();
 }
 async function fetchScript() {
   const s = await (await fetch('/script/' + cur)).json();
@@ -933,6 +987,14 @@ function seedControls(p) {
   $('dwellsNum').value = Number(pk).toFixed(2);
   $('stillNum').value = Math.round(se);
   $('intensity').value = p.intensity;
+  // The ceiling comes from `unlock`, NOT from the value: a round-trip re-seeds
+  // this control while the value it carries is still the old one, and inferring
+  // the state from that value is what unticked the box a beat after a click.
+  // A value past the everyday ceiling (a remembered 4+ from an earlier unlock)
+  // raises the tier so the slider can still show it rather than snapping it.
+  { const v = Number(p.intensity);
+    if (v > unlock) unlock = [...UNLOCK_TIERS].reverse().find(t => v <= t) ?? UNLOCK_TIERS[UNLOCK_TIERS.length - 1];
+    syncUnlockUI(); }
   // null = the bundle's own seed; the box is empty and stays empty until a
   // person puts a number in it
   $('envSeed').value = p.env_seed ?? '';
@@ -1318,6 +1380,37 @@ $('depth').addEventListener('change', () => {
 });
 $('intensity').addEventListener('input',
   () => $('ival').textContent = parseFloat($('intensity').value).toFixed(1));
+// The two unlock boxes raise the slider's ceiling: neither (4, the everyday
+// one), 10x, or 100x. They are mutually exclusive -- a tier, not two flags --
+// so ticking one clears the other, and ticking the ticked one drops back to the
+// everyday ceiling.
+//
+// The state lives in `unlock`, and this is the ONLY thing the boxes write.
+// `syncUnlockUI` then paints both the boxes and the slider's `max` from it, and
+// a re-style round-trip repaints through the same function -- which is what
+// keeps a click from being undone by the refresh that follows it.
+//
+// The value is left where it is when the ceiling moves UP (a drag to 5 and back
+// changes nothing on its own), and pulled down when the ceiling comes back under
+// it -- a slider holding a number past its own max gets snapped by the browser
+// on the next draw, silently and after the POST that carried the old one.
+function syncUnlockUI() {
+  const slider = $('intensity');
+  $('intensityUnlock10').checked = unlock === 10;
+  $('intensityUnlock100').checked = unlock === 100;
+  slider.max = unlock;
+  if (parseFloat(slider.value) > unlock) {
+    slider.value = unlock;
+    $('ival').textContent = Number(unlock).toFixed(1);
+  }
+}
+function armUnlock(tier) {
+  unlock = (unlock === tier) ? BASE_MAX : tier;
+  syncUnlockUI();
+  postParams();
+}
+$('intensityUnlock10').addEventListener('change', () => armUnlock(10));
+$('intensityUnlock100').addEventListener('change', () => armUnlock(100));
 $('fillModelW').addEventListener('input',
   () => $('fillMWVal').textContent = parseFloat($('fillModelW').value).toFixed(2));
 

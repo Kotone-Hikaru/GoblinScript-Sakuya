@@ -415,6 +415,19 @@ pub fn ready(p: &Post) {
     p.end();
 }
 
+/// The throttle, as one POST line -- shown whether it is on or off, because
+/// "no line" and "off" would then look the same and the whole point of the
+/// line is to answer "is something holding my GPU back?". `name` is the
+/// resolved preset (see `main`'s `throttle_name`); `None` is off.
+pub fn throttle(p: &Post, name: Option<&str>) {
+    let value = crate::throttle::describe(name);
+    // Off is the shipped state, so it reads as a plain line; ON is the state a
+    // user went out of their way to reach, and the one they are most likely to
+    // have forgotten a month later -- so it is the one that gets a marker.
+    let status = if name.is_some() { Status::Ok } else { Status::Warn };
+    p.line("GPU throttle", &value, status);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
