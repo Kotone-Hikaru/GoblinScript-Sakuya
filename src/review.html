@@ -2340,9 +2340,11 @@ function shotLoad() {
   shotUndo = []; shotRedo = [];
   if (!c) { shots = []; shotsDraft = []; renderShots(); return; }
   shotsDraft = (c.cuts_ms || []).slice();
-  // `cuts_cur` null = the draft's own; an EMPTY array is a real answer (no cuts)
-  const cur = (c.cuts_cur == null) ? shotsDraft : c.cuts_cur;
-  shots = cur.map(t => ({ t_ms: t }));
+  // `cuts_cur` null = the draft's own; an EMPTY array is a real answer (no cuts).
+  // NB: never name this `cur` -- that shadows the module-level selected-clip
+  // index for the whole body and the line above dies in the temporal dead zone.
+  const live = (c.cuts_cur == null) ? shotsDraft : c.cuts_cur;
+  shots = live.map(t => ({ t_ms: t }));
   renderShots();
 }
 function commitShots() {

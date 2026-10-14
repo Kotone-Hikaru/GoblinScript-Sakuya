@@ -1316,4 +1316,168 @@ mod tests {
         assert_eq!(parse_range("items=0-5", 100), None);
         assert_eq!(parse_range("bytes=0-5", 0), None);
     }
+
+    /// The page's state lives in flush-left `let`s and its helpers read them.
+    /// A helper that names one of its own locals after that state does not
+    /// shadow "from there down" as it reads -- it shadows for the WHOLE body, so
+    /// any read ABOVE the local declaration runs in the temporal dead zone and
+    /// throws. That is exactly how the shot bench shipped dead: `shotLoad` opened
+    /// with `state.clips[cur]` and closed with `const cur = ...`, so the very
+    /// first line threw on every load and the only trace was a console error.
+    ///
+    /// So the rule this pins down: inside one function body, a local that
+    /// shadows page state must not have that state read above it. Comments and
+    /// blocks that shadow without reading the outer name first are fine, and a
+    /// same-named local in a DIFFERENT function is fine too -- only the read
+    /// that a shadowing declaration re-scopes is a hazard.
+    ///
+    /// Bodies are found the way the page writes them: a flush-left `function`,
+    /// `async function`, or `... => {` opens one and the next flush-left `}`
+    /// closes it. Parameters are not modelled; only `let`/`const`/`var`, which
+    /// is what a name-the-local-after-state mistake produces.
+    #[test]
+    fn no_helper_shadows_the_pages_own_state() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let html = std::fs::read_to_string(dir.join("review.html")).expect("the review page is missing");
+        let all: Vec<&str> = html.lines().collect();
+        let open = all
+            .iter()
+            .position(|l| l.trim_start().starts_with("<script>"))
+            .expect("review.html has no <script>");
+        let close = all[open..]
+            .iter()
+            .position(|l| l.trim_start().starts_with("</script>"))
+            .map(|i| open + i)
+            .unwrap_or(all.len());
+
+        fn word(line: &str, name: &str) -> bool {
+            let wordish = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+            let mut from = 0;
+            while from < line.len() {
+                let Some(at) = line[from..].find(name).map(|p| from + p) else { return false };
+                let before = at == 0 || !line[..at].chars().next_back().is_some_and(wordish);
+                let after = at + name.len();
+                let done = after == line.len() || !line[after..].chars().next().is_some_and(wordish);
+                if before && done {
+                    return true;
+                }
+                from = at + 1;
+                while from < line.len() && !line.is_char_boundary(from) {
+                    from += 1;
+                }
+            }
+            false
+        }
+        fn declared(line: &str) -> Option<(&str, String)> {
+            let t = line.trim_start();
+            if t.len() == line.len() {
+                return None; // flush-left: that is the state itself
+            }
+            let mut it = t.split_whitespace();
+            let kw = it.next()?;
+            if !matches!(kw, "let" | "const" | "var") {
+                return None;
+            }
+            let name: String = it
+                .next()?
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            name.chars().next()?.is_alphabetic().then_some((kw, name))
+        }
+
+        /// Every name a flush-left declaration binds: `let a = [], b = [];`
+        /// binds two. Only `=` at bracket depth zero counts, so the arrow in
+        /// `let $ = (id) => ...` and anything inside an initializer are skipped.
+        fn bound(line: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut depth = 0i32;
+            for (i, b) in line.bytes().enumerate() {
+                match b {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b'=' if depth == 0 => {
+                        let head = line[..i].trim_end();
+                        let name: String = head
+                            .chars()
+                            .rev()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                            .collect::<Vec<char>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        let lead = head
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
+                        // ...and the name has to sit in the binding list, so an
+                        // arrow's parameter (`const $ = id => ...`) is not state
+                        let tail = head[..head.len() - name.len()].trim_end();
+                        let listed = tail.ends_with("let")
+                            || tail.ends_with("const")
+                            || tail.ends_with("var")
+                            || tail.ends_with(',');
+                        if lead && listed && !tail.ends_with('.') {
+                            out.push(name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        // page state: every flush-left declaration in the script
+        let mut state: Vec<String> = Vec::new();
+        for line in &all[open..close] {
+            if line.starts_with(char::is_whitespace) {
+                continue;
+            }
+            if !matches!(line.split_whitespace().next(), Some("let" | "const" | "var")) {
+                continue;
+            }
+            for name in bound(line) {
+                if !state.contains(&name) {
+                    state.push(name);
+                }
+            }
+        }
+
+        let mut bad: Vec<String> = Vec::new();
+        let mut i = open;
+        while i < close {
+            let head = all[i];
+            let opens = !head.starts_with(char::is_whitespace)
+                && (head.starts_with("function ")
+                    || head.starts_with("async function ")
+                    || head.contains("=> {"));
+            if !opens {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < close && !all[j].starts_with('}') {
+                j += 1;
+            }
+            let last = j.min(close - 1);
+            for (k, line) in all[i..=last].iter().enumerate() {
+                let ln = i + k;
+                let Some((kw, name)) = declared(line) else { continue };
+                if !state.contains(&name) {
+                    continue;
+                }
+                if all[i..ln].iter().any(|above| word(above, &name)) {
+                    bad.push(format!("review.html:{} `{kw} {name}` shadows state read above it", ln + 1));
+                }
+            }
+            i = last + 1;
+        }
+
+        assert!(
+            bad.is_empty(),
+            "a local shadows the page's own state, so the read above it throws in the temporal \
+             dead zone -- rename the local:\n  {}",
+            bad.join("\n  ")
+        );
+    }
 }
