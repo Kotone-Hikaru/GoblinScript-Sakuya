@@ -460,6 +460,26 @@
         <div id="shotList" class="seglist"></div>
         <div id="shotNote" class="segnote"></div>
       </div>
+      <div class="sec" id="confSec">
+        <span class="sec-h" data-t="page.conf.suggest">conf suggestion</span>
+        <span class="hint" data-t="page.conf.suggest.hint">a proposal, never an application: every model's confidence is sampled (one instant restyle each) and each shot keeps the model that scored highest. the switch is off until you ask for it, and your own pieces come back the moment the sampling ends.</span>
+        <div class="drow">
+          <button type="button" id="confSuggestToggle" class="tool"><b>◎</b> <span
+                  data-t="page.conf.suggest.toggle">suggest from conf</span></button>
+        </div>
+        <div id="confSuggestBox" class="hidden">
+          <div class="drow">
+            <button type="button" id="confSuggestBtn"><span
+                    data-t="page.conf.suggest.run">generate suggestion</span></button>
+            <button type="button" id="confApply"><span
+                    data-t="page.conf.suggest.apply">apply</span></button>
+            <button type="button" id="confDrop"><span
+                    data-t="page.conf.suggest.drop">discard</span></button>
+          </div>
+          <div id="confSuggestList" class="seglist"></div>
+          <div id="confSuggestNote" class="segnote"></div>
+        </div>
+      </div>
     </aside>
     <main>
       <div id="stage">
@@ -766,7 +786,9 @@ function applyLang() {
   labelAdv();
   labelDrawer();
   labelShots();
+  labelSuggest();
   renderShots();   // the per-row delete titles are built in the new language
+  renderSuggest();
   document.title = T('page.title');
 }
 const vid = $('vid'), strip = $('strip'), sctx = strip.getContext('2d');
@@ -2420,6 +2442,141 @@ function renderShots() {
   $('shotRedoN').textContent = String(shotRedo.length);
   labelShots();
 }
+
+// ---- the conf suggestion --------------------------------------------------
+// A PROPOSAL, never an application. `conf` is the head's per-row self-score
+// [0,1] and it is a property of the TRUNK, so comparing models means asking
+// each one what it thinks -- which is one instant re-style each, since every
+// trunk is already on the shelf. The user's own pieces are put back the moment
+// the sampling ends, and the switch is off until it is asked for: nothing here
+// ever changes what the reviewer drew.
+let suggestOn = false;
+let suggestSpans = null;   // the proposal: [{lo_ms, hi_ms, model, score}] or null
+let suggestBusy = false;
+let suggestMsg = null;     // an overriding note key (e.g. "only one model")
+
+function labelSuggest() {
+  $('confSuggestToggle').classList.toggle('on', suggestOn);
+  $('confSuggestBox').classList.toggle('hidden', !suggestOn);
+}
+function renderSuggest() {
+  const list = $('confSuggestList');
+  const note = $('confSuggestNote');
+  if (!list || !note) return;
+  list.innerHTML = '';
+  $('confApply').disabled = !suggestSpans || !suggestSpans.length;
+  if (suggestBusy) { note.textContent = T('page.conf.suggest.busy'); return; }
+  if (suggestMsg) { note.textContent = T(suggestMsg); return; }
+  if (!suggestSpans) { note.textContent = T('page.conf.suggest.none'); return; }
+  if (!suggestSpans.length) { note.textContent = T('page.conf.suggest.agree'); return; }
+  for (const p of suggestSpans) {
+    const row = document.createElement('div');
+    row.className = 'segrow';
+    const sw = document.createElement('span');
+    sw.className = 'sw';
+    sw.style.background = modelColor(p.model);
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = fmtClock(p.lo_ms) + '–' + fmtClock(p.hi_ms);
+    const m = document.createElement('span');
+    m.className = 'n';
+    m.textContent = p.model + (p.score != null ? ' · ' + Math.round(p.score * 100) + '%' : '');
+    row.append(sw, t, m);
+    row.onclick = () => seekMs(p.lo_ms + 1);
+    list.append(row);
+  }
+  note.textContent = T('page.conf.suggest.note', { n: suggestSpans.length });
+}
+/** Score every interval by each model's MEAN confidence and keep the winner.
+ *  The intervals are the shot cuts the user sees (they are the boundaries the
+ *  video actually has), or fixed 30 s windows when there is no detector. */
+function scoreSpans(confs, c) {
+  const dur = spanDur(c);
+  let edges = shots.map(s => s.t_ms).filter(t => t > 0 && t < dur).sort((a, b) => a - b);
+  if (edges.length < 2) {
+    edges = [];
+    for (let t = 30000; t < dur - 30000; t += 30000) edges.push(t);
+  }
+  const bounds = [0, ...edges, dur];
+  const hz = confFps || 30, row0 = confRow0 || 0;
+  const models = Object.keys(confs);
+  const picked = [];
+  for (let i = 0; i + 1 < bounds.length; i++) {
+    const lo = bounds[i], hi = bounds[i + 1];
+    if (hi - lo < 1000) continue;
+    let best = null, bestV = -Infinity;
+    for (const m of models) {
+      const arr = confs[m];
+      if (!arr) continue;
+      const a = Math.max(0, Math.round((lo - row0) / 1000 * hz));
+      const b = Math.min(arr.length, Math.round((hi - row0) / 1000 * hz));
+      let sum = 0, n = 0;
+      for (let r = a; r < b; r++) { const v = arr[r]; if (v != null) { sum += v; n++; } }
+      const mean = n ? sum / n : -Infinity;
+      if (mean > bestV) { bestV = mean; best = m; }
+    }
+    if (best) picked.push({ lo_ms: lo, hi_ms: hi, model: best, score: bestV });
+  }
+  // neighbours that landed on the same model become one piece
+  const merged = [];
+  for (const p of picked) {
+    const last = merged[merged.length - 1];
+    if (last && last.model === p.model && Math.abs(last.hi_ms - p.lo_ms) < 1) last.hi_ms = p.hi_ms;
+    else merged.push({ ...p });
+  }
+  // only the pieces that differ from the script's own model are the ask
+  return merged.filter(p => p.model !== c.model);
+}
+async function runSuggestion() {
+  const c = state.clips[cur];
+  if (!c || suggestBusy) return;
+  const models = (c.models || []).map(m => m.name);
+  if (models.length < 2) {
+    suggestMsg = 'page.conf.suggest.one';
+    suggestSpans = null;
+    renderSuggest();
+    return;
+  }
+  const saveModel = c.model;
+  const saveSpans = spansPayload();
+  suggestMsg = null;
+  suggestBusy = true;
+  renderSuggest();
+  $('confSuggestBtn').disabled = true;
+  let confs = {};
+  try {
+    for (const m of models) {
+      // sampled with NO spans, so the track that comes back is THAT model's own
+      await postParams({ model: m, spans: [] });
+      const j = await (await fetch('/conf/' + cur)).json();
+      confs[m] = (j && Array.isArray(j.conf)) ? j.conf : null;
+    }
+  } finally {
+    // whatever happened, the reviewer's own model and pieces come back
+    await postParams({ model: saveModel, spans: saveSpans });
+    suggestBusy = false;
+    $('confSuggestBtn').disabled = false;
+  }
+  suggestSpans = scoreSpans(confs, state.clips[cur] || c);
+  renderSuggest();
+}
+/** The one button that DOES change the pieces -- and it is the user's click. */
+function applySuggestion() {
+  if (!suggestSpans || !suggestSpans.length) return;
+  const c = state.clips[cur];
+  if (!c) return;
+  pushSegUndo();
+  segs = partitionOf({ ...c, spans: suggestSpans.map(p => ({ lo_ms: p.lo_ms, hi_ms: p.hi_ms, model: p.model })) });
+  selSeg = -1;
+  suggestSpans = null;
+  suggestMsg = null;
+  commitSegs();
+  renderSuggest();
+}
+$('confSuggestToggle').onclick = () => { suggestOn = !suggestOn; labelSuggest(); };
+$('confSuggestBtn').onclick = runSuggestion;
+$('confApply').onclick = applySuggestion;
+$('confDrop').onclick = () => { suggestSpans = null; suggestMsg = null; renderSuggest(); };
 
 // ---- drawing the bar ------------------------------------------------------
 function drawSpanBand(X, w, h, dur) {
