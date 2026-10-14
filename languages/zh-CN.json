@@ -213,6 +213,7 @@
   "page.shots.reset.tip": "丢弃本次会话对切点的修改，回到读取视频时的切点",
   "page.shots.undo.tip": "撤销一次切点编辑",
   "page.shots.redo.tip": "重做一次切点编辑",
+  "page.shots.del.tip": "移除这个切点",
   "page.slow": "慢",
   "page.fast": "快",
   "page.styling": "哥布林正在重写这个脚本……",

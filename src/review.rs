@@ -65,6 +65,11 @@ pub struct Clip {
     /// Where the compared model's line is written: served as `/compare/N`,
     /// never the script itself.
     pub compare: PathBuf,
+    /// The cuts this draft was DECODED against, video milliseconds on the
+    /// draft's clock. The page draws them as the shot layer, and they are what
+    /// "reset" goes back to: the draft's own set never changes, only the
+    /// session's edit to it does.
+    pub cuts_ms: Vec<f64>,
 }
 
 /// Which model writes a script, and which other model's line the page lays
@@ -80,6 +85,11 @@ pub struct Choice {
     /// the cuts a draft was encoded against belong to the draft, a span
     /// belongs to the reviewer and is never written back.
     pub spans: Vec<Span>,
+    /// The shot cuts to decode with, when this session has edited them.
+    /// `None` -- every ordinary review -- means the draft's own set. A change
+    /// here reaches the head as its `cut` input channel, so the page treats it
+    /// as work: the head pass re-runs, several seconds per trunk.
+    pub cuts_ms: Option<Vec<f64>>,
 }
 
 /// One stretch of a script written by its own model, in video milliseconds on
@@ -595,6 +605,11 @@ fn state_json(
             "model": choices[i].model,
             "compare": choices[i].compare,
             "spans": choices[i].spans,
+            // the cuts this draft was decoded against (the shot layer draws
+            // them, and "reset" goes back to them), and this session's
+            // replacement when it has one -- null means "the draft's own"
+            "cuts_ms": c.cuts_ms,
+            "cuts_cur": choices[i].cuts_ms,
             "models": c.models,
             "actions": actions[i],
             // This clip's script is still catching up with its knobs. The page
@@ -654,6 +669,10 @@ fn parse_choice(body: &str, clip: &Clip, base: &Choice) -> Result<Choice> {
         compare: Option<Option<String>>,
         #[serde(default)]
         spans: Option<Vec<Span>>,
+        // absent keeps, `null` goes back to the draft's own cuts, an array
+        // replaces them
+        #[serde(default, deserialize_with = "nullable")]
+        cuts_ms: Option<Option<Vec<f64>>>,
     }
     let m: Msg = serde_json::from_str(body).context("bad params payload")?;
     let model = m.model.unwrap_or_else(|| base.model.clone());
@@ -670,7 +689,11 @@ fn parse_choice(body: &str, clip: &Clip, base: &Choice) -> Result<Choice> {
         Some(s) => normalize_spans(s, clip),
         None => base.spans.clone(),
     };
-    Ok(Choice { model, compare, spans })
+    let cuts_ms = match m.cuts_ms {
+        Some(c) => c.map(|v| normalize_cuts(v, clip.duration_ms)),
+        None => base.cuts_ms.clone(),
+    };
+    Ok(Choice { model, compare, spans, cuts_ms })
 }
 
 /// Clean a span list off a page message: clamp into the clip, drop empties,
@@ -694,6 +717,22 @@ fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
     out.sort_by(|a, b| {
         a.lo_ms.partial_cmp(&b.lo_ms).unwrap_or(std::cmp::Ordering::Equal)
     });
+    out
+}
+
+/// Clean a cut list off a page message: finite, inside the clip, sorted, and
+/// deduplicated. `shot_edges` clamps and dedupes too, but `cut_rows` does not,
+/// and a NaN or a negative here would be a row the head is asked about that
+/// does not exist -- so the scrubbing happens once, at the door. The order is
+/// the page's to keep or not: this sorts before it collapses neighbours, so a
+/// descending list is cleaned the same as an ascending one.
+fn normalize_cuts(cuts: Vec<f64>, dur_ms: f64) -> Vec<f64> {
+    let mut out: Vec<f64> = cuts
+        .into_iter()
+        .filter(|c| c.is_finite() && *c > 0.0 && *c < dur_ms)
+        .collect();
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| (*a - *b).abs() < 1.0);
     out
 }
 
@@ -1095,7 +1134,7 @@ mod tests {
             p.intensity = v;
             p
         };
-        let c = Choice { model: "m".into(), compare: None, spans: Vec::new() };
+        let c = Choice { model: "m".into(), compare: None, spans: Vec::new(), cuts_ms: None };
         work.request(0, at(0.1), c.clone()); // the styler picks this up and blocks in it
         while entered.load(Ordering::SeqCst) < 1 {
             std::thread::yield_now();
@@ -1143,13 +1182,14 @@ mod tests {
             model: "a".into(),
             models: vec![m("a", "t1"), m("b", "t1"), m("c", "t2")],
             compare: "k".into(),
+            cuts_ms: Vec::new(),
         };
-        let base = Choice { model: "a".into(), compare: Some("c".into()), spans: Vec::new() };
+        let base = Choice { model: "a".into(), compare: Some("c".into()), spans: Vec::new(), cuts_ms: None };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
         assert_eq!(parse(r#"{"clip":0}"#).unwrap(), base);
-        assert_eq!(parse(r#"{"model":"b"}"#).unwrap(), Choice { model: "b".into(), compare: Some("c".into()), spans: Vec::new() });
+        assert_eq!(parse(r#"{"model":"b"}"#).unwrap(), Choice { model: "b".into(), compare: Some("c".into()), spans: Vec::new(), cuts_ms: None });
         assert_eq!(parse(r#"{"compare":null}"#).unwrap().compare, None);
-        assert_eq!(parse(r#"{"model":"c"}"#).unwrap(), Choice { model: "c".into(), compare: None, spans: Vec::new() });
+        assert_eq!(parse(r#"{"model":"c"}"#).unwrap(), Choice { model: "c".into(), compare: None, spans: Vec::new(), cuts_ms: None });
         assert!(parse(r#"{"model":"z"}"#).is_err());
         assert!(parse(r#"{"compare":"z"}"#).is_err());
     }
@@ -1174,11 +1214,13 @@ mod tests {
             model: "a".into(),
             models: vec![m("a"), m("b")],
             compare: "k".into(),
+            cuts_ms: Vec::new(),
         };
         let base = Choice {
             model: "a".into(),
             compare: None,
             spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into() }],
+            cuts_ms: None,
         };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
         // absent keeps the clip's own
@@ -1205,6 +1247,51 @@ mod tests {
         );
         // an empty list is a real answer: back to one model over the whole clip
         assert!(parse(r#"{"spans":[]}"#).unwrap().spans.is_empty());
+    }
+
+    /// Cuts ride the same message as spans: absent keeps the session's edit,
+    /// `null` explicitly goes back to the draft's own set, and an array
+    /// replaces it -- scrubbed (finite, inside the clip, sorted, collapsed)
+    /// before the head is ever asked about a row that does not exist.
+    #[test]
+    fn a_choice_carries_cuts_and_cleans_them() {
+        let m = |n: &str| crate::bundle::ModelInfo { name: n.into(), trunk: "t".into() };
+        let clip = super::Clip {
+            name: "c".into(),
+            script: "s".into(),
+            video: "v".into(),
+            fallback: None,
+            is_original: true,
+            duration_ms: 2000.0,
+            row_hz: 30.0,
+            row0_ms: 0.0,
+            t0_ms: 0.0,
+            crop: None,
+            model: "a".into(),
+            models: vec![m("a")],
+            compare: "k".into(),
+            // the draft's own set: what "reset" goes back to
+            cuts_ms: vec![500.0, 1500.0],
+        };
+        let base = Choice {
+            model: "a".into(),
+            compare: None,
+            spans: Vec::new(),
+            // this session has already moved a boundary
+            cuts_ms: Some(vec![400.0, 1600.0]),
+        };
+        let parse = |body: &str| super::parse_choice(body, &clip, &base);
+        // absent keeps the session's edit
+        assert_eq!(parse(r#"{"model":"a"}"#).unwrap().cuts_ms, base.cuts_ms);
+        // null goes back to the draft's own: the draft's set never changed
+        assert_eq!(parse(r#"{"cuts_ms":null}"#).unwrap().cuts_ms, None);
+        // an array replaces, cleaned: out-of-clip and negative dropped, a
+        // descending list sorted, near-duplicates collapsed
+        let got = parse(r#"{"cuts_ms":[1200, 300, 300.4, 5000, -10, 1200.2]}"#)
+            .unwrap()
+            .cuts_ms
+            .unwrap();
+        assert_eq!(got, vec![300.0, 1200.0]);
     }
 
     #[test]

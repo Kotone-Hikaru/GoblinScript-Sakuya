@@ -362,6 +362,8 @@
   .segrow .t { font: 11px var(--chrome); color: var(--ink-soft); flex: 0 0 auto; white-space: nowrap; }
   .segrow select { flex: 1 1 0; min-width: 0; font-size: 11px; }
   .segrow .n { flex: 0 0 auto; color: var(--hi-dim); font: 700 10px var(--chrome); }
+  /* a shot row is a time and a delete: the time grows, the ✕ sits at the end */
+  .segrow .x { flex: 0 0 auto; margin-left: auto; padding: 0 6px; line-height: 1.4; }
   .segnote { font-size: 11px; color: var(--ink-soft); opacity: .85; }
   #drawer .sec-h { display: block; }
 
@@ -450,8 +452,8 @@
         <span class="sec-h" data-t="page.shots">shot cuts</span>
         <span class="hint" data-t="page.shots.hint">the cuts the video was read with. adding or removing one re-runs the head pass (about half a minute) &mdash; it changes what the models were shown, so the script follows.</span>
         <div class="drow">
-          <button type="button" id="shotUndo" data-t-title="page.shots.undo.tip">↶</button>
-          <button type="button" id="shotRedo" data-t-title="page.shots.redo.tip">↷</button>
+          <button type="button" id="shotUndo" data-t-title="page.shots.undo.tip">↶ <span id="shotUndoN">0</span></button>
+          <button type="button" id="shotRedo" data-t-title="page.shots.redo.tip">↷ <span id="shotRedoN">0</span></button>
           <button type="button" id="shotReset" data-t-title="page.shots.reset.tip"><span
                   data-t="page.shots.reset">reset to detected</span></button>
         </div>
@@ -763,6 +765,8 @@ function applyLang() {
   labelRail();
   labelAdv();
   labelDrawer();
+  labelShots();
+  renderShots();   // the per-row delete titles are built in the new language
   document.title = T('page.title');
 }
 const vid = $('vid'), strip = $('strip'), sctx = strip.getContext('2d');
@@ -1193,6 +1197,7 @@ async function selectClip(i) {
   renderTabs();
   syncControls();  // this clip's own knobs, model + recipe
   spanLoad();      // ...and its own spans, from scratch
+  shotLoad();      // ...and its own shot cuts
   updateStylingUI();
   await Promise.all([fetchScript(), fetchConf(), fetchCompare()]);
 }
@@ -1610,6 +1615,19 @@ document.addEventListener('keydown', e => {
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
   // let space/enter still click a focused button (arrows here step the video)
   if (tag === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
+  // undo / redo: one pair of keys for both benches. Spans and shot cuts keep
+  // separate stacks; `undoNow`/`redoNow` pick the one the user last touched.
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+    if (e.shiftKey) redoNow(); else undoNow();
+    e.preventDefault();
+    return;
+  }
+  // Ctrl+Y is the other redo the muscle memory reaches for
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+    redoNow();
+    e.preventDefault();
+    return;
+  }
   // Keyed off the physical arrows + space ONLY -- never character keys like
   // [ or ], which sit under different fingers (or behind AltGr) on QWERTZ /
   // AZERTY / etc.
@@ -1621,6 +1639,11 @@ document.addEventListener('keydown', e => {
     case ' ':          if (vid.paused) vid.play(); else vid.pause(); break;
     case ',':          stepRate(-1); break;   // slower
     case '.':          stepRate(1); break;    // faster
+    // the spanning bench's tools, by their first letters (see the tool tips)
+    case 'v': case 'V': setTool('select'); break;
+    case 'r': case 'R': setTool('razor'); break;
+    case 'b': case 'B': setTool('shot'); break;
+    case 's': case 'S': magnet = !magnet; labelMagnet(); break;
     // the crop overlay covers the picture it describes, so it wants a switch
     // right under the hand that is already stepping frames
     case 'c': case 'C':
@@ -2017,7 +2040,12 @@ let hoverSeg = -1;        // the piece under the pointer, for the hover tint
 // The shot layer (the video's own cuts) shares this bar with the razor. Read
 // and edited further down; declared here because the span band draws it and
 // the magnet snaps to it.
-let shots = [];
+let shots = [];          // [{t_ms}] the CURRENT set: detected, plus this session's
+let shotsDraft = [];     // the detected set as decoded -- what "reset" returns to
+let shotUndo = [], shotRedo = [];
+// Which stack Ctrl+Z answers to: the span edits or the shot edits. Set by
+// whichever the user last touched, so the shortcut undoes the thing they did.
+let lastEdit = 'span';
 
 // A colour per model, so a piece is identified at a glance. Fixed hues rather
 // than palette variables: these must stay distinct from EACH OTHER, and every
@@ -2082,6 +2110,7 @@ function pushSegUndo() {
   spanUndo.push(JSON.stringify(segs));
   if (spanUndo.length > 64) spanUndo.shift();
   spanRedo.length = 0;
+  lastEdit = 'span';
 }
 function segUndoNow() {
   if (!spanUndo.length) return;
@@ -2180,6 +2209,21 @@ $('segCut').onclick = () => cutAt(vid.currentTime * 1000);
 $('segMerge').onclick = () => mergeWith(selSeg);
 $('segUndo').onclick = segUndoNow;
 $('segRedo').onclick = segRedoNow;
+$('shotUndo').onclick = shotUndoNow;
+$('shotRedo').onclick = shotRedoNow;
+$('shotReset').onclick = shotReset;
+// Ctrl+Z / Ctrl+Shift+Z answer to whichever bench the user last touched, and
+// fall back to the other when that stack is empty -- one shortcut, two layers.
+function undoNow() {
+  if (lastEdit === 'shot' && shotUndo.length) return shotUndoNow();
+  if (spanUndo.length) return segUndoNow();
+  if (shotUndo.length) return shotUndoNow();
+}
+function redoNow() {
+  if (lastEdit === 'shot' && shotRedo.length) return shotRedoNow();
+  if (spanRedo.length) return segRedoNow();
+  if (shotRedo.length) return shotRedoNow();
+}
 
 // ---- the drawer -----------------------------------------------------------
 function labelDrawer() {
@@ -2245,8 +2289,10 @@ function updateSegNote() {
 
 // ---- the shot layer -------------------------------------------------------
 // The video's own cuts, and the session's edits to them. `shots` is the
-// CURRENT set (detected cuts, plus or minus what was placed here); the
-// detected set is kept so "reset" has something to go back to.
+// CURRENT set (detected cuts, plus or minus what was placed here); `shotsDraft`
+// is the set the draft was decoded against, kept so "reset" has something to
+// go back to. A change here is NOT a knob: the cuts are the head's `cut` input
+// channel, so the server re-runs the head pass (seconds per trunk).
 function nearestCut(t) {
   let best = null;
   for (const s of shots) {
@@ -2254,13 +2300,126 @@ function nearestCut(t) {
   }
   return best;
 }
+/** Do two cut lists name the same boundaries? Within a millisecond, so a
+ *  round trip through the server's rounding does not read as an edit. */
+function sameCuts(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 0.5) return false;
+  return true;
+}
+/** The ask: `null` when the cuts are the draft's own (the server then decodes
+ *  with the original set), the array otherwise. */
+function shotsPayload() {
+  const now = shots.map(s => s.t_ms);
+  return sameCuts(now, shotsDraft) ? null : now;
+}
+function shotLoad() {
+  const c = state.clips[cur];
+  shotUndo = []; shotRedo = [];
+  if (!c) { shots = []; shotsDraft = []; renderShots(); return; }
+  shotsDraft = (c.cuts_ms || []).slice();
+  // `cuts_cur` null = the draft's own; an EMPTY array is a real answer (no cuts)
+  const cur = (c.cuts_cur == null) ? shotsDraft : c.cuts_cur;
+  shots = cur.map(t => ({ t_ms: t }));
+  renderShots();
+}
+function commitShots() {
+  renderShots();
+  labelShots();
+  postParams({ cuts_ms: shotsPayload() });
+}
+function pushShotUndo() {
+  shotUndo.push(shots.map(s => s.t_ms));
+  if (shotUndo.length > 64) shotUndo.shift();
+  shotRedo.length = 0;
+  lastEdit = 'shot';
+}
+function shotUndoNow() {
+  if (!shotUndo.length) return;
+  shotRedo.push(shots.map(s => s.t_ms));
+  shots = shotUndo.pop().map(t => ({ t_ms: t }));
+  commitShots();
+}
+function shotRedoNow() {
+  if (!shotRedo.length) return;
+  shotUndo.push(shots.map(s => s.t_ms));
+  shots = shotRedo.pop().map(t => ({ t_ms: t }));
+  commitShots();
+}
+/** Throw this session's cut edits away and go back to what the video was read
+ *  with. Undoable like any other edit, and a no-op when nothing was moved. */
+function shotReset() {
+  if (sameCuts(shots.map(s => s.t_ms), shotsDraft)) return;
+  pushShotUndo();
+  shots = shotsDraft.map(t => ({ t_ms: t }));
+  commitShots();
+}
+function addShot(ms) {
+  const dur = curDurationMs();
+  if (!(dur > 0)) return;
+  let t = Math.min(dur - 1, Math.max(1, ms));
+  // snap a new cut onto the nearest span edge, so a boundary the razor drew is
+  // exactly the boundary the goblins are shown
+  if (magnet) {
+    let best = null;
+    for (const s of segs) {
+      for (const e of [s.lo, s.hi]) {
+        if (e <= 0 || e >= dur) continue;
+        if (best == null || Math.abs(e - t) < Math.abs(best - t)) best = e;
+      }
+    }
+    if (best != null && Math.abs(best - t) < 350) t = best;
+  }
+  if (shots.some(s => Math.abs(s.t_ms - t) < 1)) return;   // already one there
+  pushShotUndo();
+  shots.push({ t_ms: t });
+  shots.sort((a, b) => a.t_ms - b.t_ms);
+  commitShots();
+}
+function removeShot(hit) {
+  pushShotUndo();
+  shots = shots.filter(s => s !== hit);
+  commitShots();
+}
+/** A press on the bar in shot mode: on a cut takes it out, between two places
+ *  one. */
+function shotPress(clientX, ms) {
+  const r = timeline.getBoundingClientRect();
+  const dur = curDurationMs();
+  if (!(dur > 0)) return;
+  const hit = shots.find(s => Math.abs(s.t_ms / dur * r.width - (clientX - r.left)) <= 6);
+  if (hit) { removeShot(hit); return; }
+  addShot(ms);
+}
 function labelShots() {
   const el = $('shotNote');
   if (!el) return;
   el.textContent = T('page.shots.note', { n: shots.length });
 }
-// the shot editor (press / drag / delete on the bar) is the next commit
-function shotPress() {}
+function renderShots() {
+  const list = $('shotList');
+  if (!list) return;
+  list.innerHTML = '';
+  shots.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'segrow';
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = fmtClock(s.t_ms);
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'x';
+    del.textContent = '✕';
+    del.title = T('page.shots.del.tip');
+    del.onclick = ev => { ev.stopPropagation(); removeShot(s); };
+    row.append(n, del);
+    row.onclick = () => seekMs(s.t_ms);
+    list.append(row);
+  });
+  $('shotUndoN').textContent = String(shotUndo.length);
+  $('shotRedoN').textContent = String(shotRedo.length);
+  labelShots();
+}
 
 // ---- drawing the bar ------------------------------------------------------
 function drawSpanBand(X, w, h, dur) {

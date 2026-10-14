@@ -213,6 +213,7 @@
   "page.shots.reset.tip": "throw away this session's cut edits and use the ones the video was read with",
   "page.shots.undo.tip": "undo a shot cut",
   "page.shots.redo.tip": "redo a shot cut",
+  "page.shots.del.tip": "remove this cut",
   "page.slow": "slow",
   "page.fast": "fast",
   "page.styling": "the goblins are re-scrawling this script…",

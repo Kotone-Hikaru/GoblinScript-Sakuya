@@ -1249,6 +1249,11 @@ struct DraftOut {
     /// Tracks this draft made and set aside, by (trunk, seed): what a switch
     /// back to a model or a seed already visited takes instead of a head pass.
     shelf: HashMap<(String, u64), style::Tracks>,
+    /// The cuts the shelf and the tracks in hand were decoded at. `trunk_key`
+    /// covers the graphs and the seed but NOT the cuts, so this is what tells
+    /// an edited cut list that nothing cached may be trusted and the head has
+    /// to run again. Equal to `cuts_ms` until a review moves a shot boundary.
+    shelf_cuts: Vec<f64>,
     shot_edges: Vec<usize>,
     times: Vec<f64>,
     cache_dir: PathBuf,
@@ -1302,6 +1307,10 @@ fn review_clip(o: &DraftOut, b: &Bundle) -> Result<review::Clip> {
         model: o.pack.clone(),
         models: b.models()?,
         compare: o.cache_dir.join("compare.funscript"),
+        // the cuts this draft was DECODED against: the page's shot layer, and
+        // what its "reset" goes back to. The session's own edit rides the
+        // Choice, never the draft.
+        cuts_ms: o.cuts_ms.clone(),
     })
 }
 
@@ -1578,19 +1587,68 @@ fn review_style(
     choice: &review::Choice,
     compare: &Path,
 ) -> Result<review::Restyled> {
-    if let Some(m) = &choice.compare {
-        let cb = b.select(m)?;
-        retrack(d, &cb, seed_for(&cb, p))?;
-        write_styled(compare, &style_draft(d, &cb.manifest, p, &[]), &cb.manifest, p)?;
-    }
-    let bb = b.select(&choice.model)?;
-    retrack(d, &bb, seed_for(&bb, p))?;
-    // The rows the script is written from: the chosen model's tracks over the
-    // whole clip, each span's own model spliced in on its rows, with the
-    // per-row amplitude bound that follows (each pack keeps its own `amp_cap_x`).
-    let (mixed, cap_x, cap_f0, conf) = mixed_tracks(d, b, p, choice, &bb)?;
-    let (actions, _, _) = restyle_mixed(d, &bb.manifest, p, &mixed, &cap_x, &cap_f0)?;
-    Ok(review::Restyled { actions, conf })
+    with_cuts(d, b, p, choice.cuts_ms.as_deref(), |d| {
+        if let Some(m) = &choice.compare {
+            let cb = b.select(m)?;
+            retrack(d, &cb, seed_for(&cb, p))?;
+            write_styled(compare, &style_draft(d, &cb.manifest, p, &[]), &cb.manifest, p)?;
+        }
+        let bb = b.select(&choice.model)?;
+        retrack(d, &bb, seed_for(&bb, p))?;
+        // The rows the script is written from: the chosen model's tracks over the
+        // whole clip, each span's own model spliced in on its rows, with the
+        // per-row amplitude bound that follows (each pack keeps its own `amp_cap_x`).
+        let (mixed, cap_x, cap_f0, conf) = mixed_tracks(d, b, p, choice, &bb)?;
+        let (actions, _, _) = restyle_mixed(d, &bb.manifest, p, &mixed, &cap_x, &cap_f0)?;
+        Ok(review::Restyled { actions, conf })
+    })
+}
+
+/// Decode the draft at a session's edited cut list for the length of `body`,
+/// then hand the draft its own cuts back.
+///
+/// An edit here is not a knob: the shot cuts reach the head as its `cut` input
+/// channel AND are what `shot_edges` is built from, so the tracks in hand and
+/// every shelved trunk were decoded for the OLD boundaries. `trunk_key` covers
+/// the graphs and the seed but not the cuts, so nothing cached is reused: the
+/// shelf is dropped, the in-hand key poisoned, and `pretrack` refills it -- one
+/// head pass per trunk, seconds each. `shelf_cuts` is what says the shelf is
+/// already the right shape so a run of edits with one cut set rebuilds ONCE.
+///
+/// `cuts_ms` and `shot_edges` are the draft's own and are restored on every
+/// path, so the page's "reset" always has the original to ask for and the rest
+/// of the program never sees a half-edited draft.
+fn with_cuts<R>(
+    d: &mut DraftOut,
+    b: &Bundle,
+    p: &style::Params,
+    cuts: Option<&[f64]>,
+    body: impl FnOnce(&mut DraftOut) -> Result<R>,
+) -> Result<R> {
+    // `None` = the draft's own cuts; `Some` = this session's edit
+    let want: Vec<f64> = match cuts {
+        Some(c) => c.to_vec(),
+        None => d.cuts_ms.clone(),
+    };
+    let old_cuts = std::mem::replace(&mut d.cuts_ms, want.clone());
+    let old_edges = std::mem::replace(&mut d.shot_edges, Vec::new());
+    let n = old_edges.last().copied().unwrap_or(0);
+    // the body always runs with cuts and edges in step, whichever branch below
+    d.shot_edges = boundaries::shot_edges(&d.cuts_ms, n, |i| b.manifest.row_ms(i));
+    let res = (|| -> Result<R> {
+        if want != d.shelf_cuts {
+            // nothing was decoded at these cuts: the shelf and the hand are stale
+            d.shelf.clear();
+            d.trunk.clear();
+            d.tracks_seed = u64::MAX;
+            pretrack(d, b, p)?;
+            d.shelf_cuts = want.clone();
+        }
+        body(d)
+    })();
+    d.cuts_ms = old_cuts;
+    d.shot_edges = old_edges;
+    res
 }
 
 /// The tracks a review's chosen model and spans make, plus the per-row
@@ -2677,13 +2735,14 @@ fn draft(
             .to_string_lossy()
             .to_string(),
         src: video.to_path_buf(),
-        cuts_ms: cuts,
+        cuts_ms: cuts.clone(),
         norm: (!cli.no_transcode).then(|| norm.clone()),
         dst,
         tracks,
         trunk: b.trunk(),
         tracks_seed: man.env_seed,
         shelf: HashMap::new(),
+        shelf_cuts: cuts,
         shot_edges,
         times,
         cache_dir: cache.dir.clone(),
@@ -3800,7 +3859,7 @@ fn real_main() -> Result<()> {
             let mut clip_params: Vec<style::Params> = vec![params; clips.len()];
             let mut choices: Vec<review::Choice> = clips
                 .iter()
-                .map(|c| review::Choice { model: c.model.clone(), compare: None, spans: Vec::new() })
+                .map(|c| review::Choice { model: c.model.clone(), compare: None, spans: Vec::new(), cuts_ms: None })
                 .collect();
             // the manifest's "normal" values, so the page can show every preset's
             // number in brackets and seed the expert inputs
@@ -4463,13 +4522,14 @@ mod retrack_tests {
         let mut d = DraftOut {
             name: "fixture".into(),
             src: dir.join("fixture.mp4"),
-            cuts_ms: cuts,
+            cuts_ms: cuts.clone(),
             norm: None,
             dst: dir.join("fixture.funscript"),
             tracks: empty(),
             trunk: String::new(),
             tracks_seed: man.env_seed,
             shelf: HashMap::new(),
+            shelf_cuts: cuts,
             shot_edges,
             times: (0..rows).map(|i| man.row_ms(i)).collect(),
             cache_dir: dir.clone(),
@@ -4502,7 +4562,7 @@ mod retrack_tests {
 
         // the review's style: the compared line first, the script's own model
         // left in hand and its script the plain restyle's
-        let choice = review::Choice { model: a.name.clone(), compare: Some(other.name.clone()), spans: Vec::new() };
+        let choice = review::Choice { model: a.name.clone(), compare: Some(other.name.clone()), spans: Vec::new(), cuts_ms: None };
         let p = style::Params::default();
         let compare = dir.join("compare.funscript");
         let r = review_style(&mut d, &b, &p, &choice, &compare).unwrap();
