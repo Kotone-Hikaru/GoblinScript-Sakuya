@@ -4575,4 +4575,115 @@ mod retrack_tests {
         assert_eq!(r.conf.len(), d.tracks.conf.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A cut the page moved is a re-decode, and the draft must come back whole.
+    ///
+    /// Three claims, all through the real head graphs: an edited cut list
+    /// changes the written script; a span naming another trunk's model changes
+    /// it too, without moving the model in hand; and after either, `cuts_ms` /
+    /// `shot_edges` are the draft's own again while `shelf_cuts` remembers what
+    /// the shelf was rebuilt at -- so "reset" still has the original to ask for
+    /// and nothing downstream sees a half-edited draft.
+    #[test]
+    #[ignore = "runs the head graphs of ./bundle on the CPU: cargo test --release -- --ignored moved_cut"]
+    fn a_moved_cut_redecodes_and_leaves_the_draft_whole() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let b = Bundle::from_dir(&root.join("bundle")).unwrap();
+        let models = b.models().unwrap();
+        let a = models.iter().find(|m| m.name == b.default_pack()).unwrap().clone();
+        let other = models.iter().find(|m| m.trunk != a.trunk).expect("another trunk").clone();
+        let (ba, bo) = (b.select(&a.name).unwrap(), b.select(&other.name).unwrap());
+        assert_ne!(ba.trunk(), bo.trunk(), "the two models share a trunk");
+        let man = &ba.manifest;
+
+        let dir = root.join("target/cuts_fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = 1500usize;
+        let row_bytes = man.dim * man.grid * man.grid;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let lat: Vec<u8> = (0..rows * row_bytes)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((((state >> 33) % 41) as i64) - 20) as i8 as u8
+            })
+            .collect();
+        std::fs::write(dir.join("latents.i8"), &lat).unwrap();
+
+        let cuts0 = vec![man.row_ms(800)];
+        let edges0 = boundaries::shot_edges(&cuts0, rows, |i| man.row_ms(i));
+        let mut d = DraftOut {
+            name: "fixture".into(),
+            src: dir.join("fixture.mp4"),
+            cuts_ms: cuts0.clone(),
+            norm: None,
+            dst: dir.join("fixture.funscript"),
+            tracks: empty(),
+            trunk: String::new(),
+            tracks_seed: man.env_seed,
+            shelf: HashMap::new(),
+            shelf_cuts: cuts0.clone(),
+            shot_edges: edges0.clone(),
+            times: (0..rows).map(|i| man.row_ms(i)).collect(),
+            cache_dir: dir.clone(),
+            dur_ms: man.row_ms(rows),
+            t0_ms: 0.0,
+            is_vr: false,
+            crop: None,
+            pack: a.name.clone(),
+        };
+        let p = style::Params::default();
+        let compare = dir.join("compare.funscript");
+        let base_choice = review::Choice {
+            model: a.name.clone(), compare: None, spans: Vec::new(), cuts_ms: None,
+        };
+        review_style(&mut d, &b, &p, &base_choice, &compare).unwrap();
+        let base = std::fs::read(&d.dst).unwrap();
+        let tracks_base = bits(&d.tracks);
+
+        // 1. a moved cut: the head is shown a different boundary, so the tracks
+        //    in hand -- and the script the page reads back -- are not the same
+        let cuts1 = vec![man.row_ms(300), man.row_ms(1100)];
+        let moved = review::Choice {
+            model: a.name.clone(), compare: None, spans: Vec::new(),
+            cuts_ms: Some(cuts1.clone()),
+        };
+        review_style(&mut d, &b, &p, &moved, &compare).unwrap();
+        let moved_script = std::fs::read(&d.dst).unwrap();
+        let tracks_moved = bits(&d.tracks);
+        assert_eq!(tracks_base.len(), tracks_moved.len(), "a moved cut changed the row count");
+        assert_ne!(tracks_base, tracks_moved, "a moved cut did not re-decode the tracks");
+        assert_ne!(base, moved_script, "a moved cut did not change the written script");
+        // the draft is whole again, and the shelf remembers the edit
+        assert_eq!(d.cuts_ms, cuts0, "the draft lost its own cuts");
+        assert_eq!(d.shot_edges, edges0, "the draft lost its own shot edges");
+        assert_eq!(d.shelf_cuts, cuts1, "the shelf did not record the rebuilt cuts");
+        assert_eq!(d.pack, a.name, "the moved cut moved the model in hand");
+
+        // 2. a span on the other trunk: the rows it covers are another model's,
+        //    so the script changes -- and the model in hand does not, and the
+        //    shelf is still the edited cut set (spans never touch cuts)
+        let spanned = review::Choice {
+            model: a.name.clone(), compare: None,
+            spans: vec![review::Span { lo_ms: 100.0, hi_ms: man.row_ms(1100), model: other.name.clone() }],
+            cuts_ms: Some(cuts1.clone()),
+        };
+        review_style(&mut d, &b, &p, &spanned, &compare).unwrap();
+        let spanned_script = std::fs::read(&d.dst).unwrap();
+        assert_ne!(moved_script, spanned_script, "a span did not change the written script");
+        assert_eq!(bits(&d.tracks), tracks_moved, "a span disturbed the tracks in hand");
+        assert_eq!(d.pack, a.name, "a span moved the model in hand");
+        assert_eq!(d.cuts_ms, cuts0);
+        assert_eq!(d.shot_edges, edges0);
+        assert_eq!(d.shelf_cuts, cuts1);
+
+        // 3. back to the draft's own cuts: the head runs at the original
+        //    boundaries again, and the bytes are the base run's own
+        review_style(&mut d, &b, &p, &base_choice, &compare).unwrap();
+        assert_eq!(bits(&d.tracks), tracks_base, "reset did not re-decode at the draft's cuts");
+        assert_eq!(std::fs::read(&d.dst).unwrap(), base, "reset did not restore the script");
+        assert_eq!(d.shelf_cuts, cuts0, "reset did not rebuild the shelf at the draft's cuts");
+        assert_eq!(d.cuts_ms, cuts0);
+        assert_eq!(d.shot_edges, edges0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
