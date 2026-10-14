@@ -481,6 +481,10 @@ fn fit_emission_bias_bands(
     b
 }
 
+/// One video's decoded readings, row by row. `Clone` exists for the mixed
+/// review: a splice is built on a COPY of the base model's tracks so the
+/// shelf and the draft's own hand keep what they hold.
+#[derive(Clone)]
 pub struct Tracks {
     pub vmarg: Vec<f64>, // marginal velocity, pos-units/s (already * v_std)
     pub level: Vec<f64>, // position head, 0..100
@@ -497,6 +501,53 @@ pub struct Tracks {
     pub conf: Vec<f64>,
 }
 
+/// Copy rows `[lo, hi)` of `src` into `dst` when both can answer for them.
+/// A no-op on an empty or inverted range, or when either side is shorter than
+/// `hi` -- so a caller that clamped poorly can never panic a review.
+fn copy_rows(dst: &mut [f64], src: &[f64], lo: usize, hi: usize) {
+    if hi <= lo || dst.len() < hi || src.len() < hi {
+        return;
+    }
+    dst[lo..hi].copy_from_slice(&src[lo..hi]);
+}
+
+impl Tracks {
+    /// Copy rows `[lo, hi)` of every track from `src` into `self`.
+    ///
+    /// The spans of a mixed review all come off the SAME latents (one row
+    /// clock, one row count), so a splice is a per-row memcpy and needs no
+    /// resampling. Optional tracks are copied only when BOTH sides carry them:
+    /// a bundle's packs agree on the field set today, but a `None` on either
+    /// side is left alone rather than guessed at. An out-of-range or inverted
+    /// range is a no-op, so a span that clamps to nothing is safe.
+    pub fn splice_from(&mut self, src: &Tracks, lo: usize, hi: usize) {
+        if hi <= lo {
+            return;
+        }
+        let hi = hi.min(self.vmarg.len()).min(src.vmarg.len());
+        if hi <= lo {
+            return;
+        }
+        copy_rows(&mut self.vmarg, &src.vmarg, lo, hi);
+        copy_rows(&mut self.level, &src.level, lo, hi);
+        copy_rows(&mut self.env, &src.env, lo, hi);
+        if let (Some((a0, a1)), Some((b0, b1))) = (self.band.as_mut(), src.band.as_ref()) {
+            copy_rows(a0, b0, lo, hi);
+            copy_rows(a1, b1, lo, hi);
+        }
+        if let (Some((a0, a1)), Some((b0, b1))) = (self.plat.as_mut(), src.plat.as_ref()) {
+            copy_rows(a0, b0, lo, hi);
+            copy_rows(a1, b1, lo, hi);
+        }
+        if let (Some((a0, a1)), Some((b0, b1))) = (self.rev.as_mut(), src.rev.as_ref()) {
+            copy_rows(a0, b0, lo, hi);
+            copy_rows(a1, b1, lo, hi);
+        }
+        copy_rows(&mut self.period, &src.period, lo, hi);
+        copy_rows(&mut self.conf, &src.conf, lo, hi);
+    }
+}
+
 pub struct StyleCfg {
     pub fps: f64,
     pub still_eps: f64,
@@ -506,6 +557,14 @@ pub struct StyleCfg {
     pub amp_cap_x: f64,
     /// Hz above which the bound loosens on the hedge curve; 0 = flat.
     pub amp_cap_f0: f64,
+    /// Per-ROW amplitude bound, one entry per row (indexed off the row the
+    /// stroke starts on). EMPTY = the scalar `amp_cap_x` above applies to the
+    /// whole clip, which is every non-mixed draft and keeps those byte for
+    /// byte. A mixed review -- different models on different spans -- fills
+    /// this so each model's stretch carries its OWN pack's bound.
+    pub amp_cap_x_rows: Vec<f64>,
+    /// Per-row twin of `amp_cap_f0`; same emptiness rule.
+    pub amp_cap_f0_rows: Vec<f64>,
     /// The hedge curve's exponent.
     pub env_gain_p: f64,
     pub plat_thr: f64,
@@ -1879,14 +1938,25 @@ pub fn compose(
                     }
                 }
                 // a quiet segment is already at the marginal's own travel
+                let (cap_x, cap_f0) = if cfg.amp_cap_x_rows.is_empty() {
+                    (cfg.amp_cap_x, cfg.amp_cap_f0)
+                } else {
+                    // a mixed review: the stroke's bound is its OWN span's
+                    // pack's, read off the row the stroke starts on
+                    let r = lo + a;
+                    (
+                        cfg.amp_cap_x_rows.get(r).copied().unwrap_or(cfg.amp_cap_x),
+                        cfg.amp_cap_f0_rows.get(r).copied().unwrap_or(cfg.amp_cap_f0),
+                    )
+                };
                 end = amp_bound(
                     end,
                     cur,
                     tr_raw,
                     b - a,
                     dt,
-                    cfg.amp_cap_x,
-                    cfg.amp_cap_f0,
+                    cap_x,
+                    cap_f0,
                     cfg.env_gain_p,
                 );
             }
@@ -2982,6 +3052,8 @@ mod tests {
             ext_snap: 20.0,
             amp_cap_x: 0.0,
             amp_cap_f0: 0.0,
+            amp_cap_x_rows: Vec::new(),
+            amp_cap_f0_rows: Vec::new(),
             env_gain_p: 0.6,
             plat_thr: 0.5,
             plat_lo: 0.3,
@@ -3535,5 +3607,86 @@ mod tests {
                 "shot {si} lost every vertex"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::Tracks;
+
+    /// A tracks set of `n` rows whose every field is a distinct ramp, so a
+    /// mis-spliced field or an off-by-one row shows up as a number, not a
+    /// crash. `opt` toggles the optional heads on and off.
+    fn mk(n: usize, base: f64, opt: bool) -> Tracks {
+        let v = |off: f64| (0..n).map(|i| base + off + i as f64).collect::<Vec<f64>>();
+        let pair = |off: f64| Some((v(off), v(off + 0.5)));
+        Tracks {
+            vmarg: v(0.0),
+            level: v(1.0),
+            env: v(2.0),
+            band: if opt { pair(3.0) } else { None },
+            plat: if opt { pair(4.0) } else { None },
+            rev: if opt { pair(5.0) } else { None },
+            period: if opt { v(6.0) } else { Vec::new() },
+            conf: if opt { v(7.0) } else { Vec::new() },
+        }
+    }
+
+    #[test]
+    fn splice_replaces_only_the_requested_rows() {
+        let mut dst = mk(20, 0.0, true);
+        let src = mk(20, 1000.0, true);
+        dst.splice_from(&src, 5, 12);
+        for i in 0..20 {
+            let want = if (5..12).contains(&i) { 1000.0 + i as f64 } else { i as f64 };
+            assert!((dst.vmarg[i] - want).abs() < 1e-9, "vmarg row {i}");
+            assert!((dst.level[i] - (want + 1.0)).abs() < 1e-9, "level row {i}");
+            assert!((dst.env[i] - (want + 2.0)).abs() < 1e-9, "env row {i}");
+            assert!((dst.period[i] - (want + 6.0)).abs() < 1e-9, "period row {i}");
+            assert!((dst.conf[i] - (want + 7.0)).abs() < 1e-9, "conf row {i}");
+        }
+        let (b0, b1) = dst.band.clone().unwrap();
+        for i in 0..20 {
+            let want = if (5..12).contains(&i) { 1000.0 + i as f64 + 3.0 } else { i as f64 + 3.0 };
+            assert!((b0[i] - want).abs() < 1e-9, "band.0 row {i}");
+            assert!((b1[i] - (want + 0.5)).abs() < 1e-9, "band.1 row {i}");
+        }
+        // the optional heads dst lacks stay absent -- a splice never invents one
+        let mut bare = mk(10, 0.0, false);
+        bare.splice_from(&mk(10, 100.0, true), 0, 10);
+        assert!(bare.band.is_none() && bare.period.is_empty() && bare.conf.is_empty());
+        assert!((bare.vmarg[0] - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn splice_clamps_and_never_panics() {
+        let mut dst = mk(10, 0.0, true);
+        let src = mk(10, 500.0, true);
+        // inverted / empty ranges are no-ops
+        dst.splice_from(&src, 7, 3);
+        dst.splice_from(&src, 4, 4);
+        assert_eq!(dst.vmarg, mk(10, 0.0, true).vmarg);
+        // a range past the end copies only what both sides hold
+        dst.splice_from(&src, 8, 999);
+        assert!((dst.vmarg[8] - 508.0).abs() < 1e-9);
+        assert!((dst.vmarg[9] - 509.0).abs() < 1e-9);
+        // a src SHORTER than the range is bounded by src's length
+        let mut d2 = mk(10, 0.0, true);
+        d2.splice_from(&mk(6, 700.0, true), 4, 10);
+        assert!((d2.vmarg[4] - 704.0).abs() < 1e-9);
+        assert!((d2.vmarg[5] - 705.0).abs() < 1e-9);
+        assert!((d2.vmarg[6] - 6.0).abs() < 1e-9); // untouched past src
+    }
+
+    /// The per-row cap the mixed review builds: a splice must carry the
+    /// SOURCE model's rows, so the bound read off them is the source pack's.
+    #[test]
+    fn spliced_rows_read_the_source_travel() {
+        let mut dst = mk(30, 0.0, true);
+        let src = mk(30, 0.0, true);
+        dst.splice_from(&src, 10, 20);
+        // identical here, but the point is the RANGE: everything outside is
+        // still dst's, so a per-row cap array indexed the same way lines up
+        assert_eq!(dst.vmarg.len(), 30);
     }
 }

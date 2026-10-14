@@ -74,6 +74,22 @@ pub struct Clip {
 pub struct Choice {
     pub model: String,
     pub compare: Option<String>,
+    /// Stretches written by a model OTHER than `model`. Empty -- every
+    /// ordinary review -- means `model`'s tracks fill the whole clip; each
+    /// span splices its own model's rows in over that base. Session state:
+    /// the cuts a draft was encoded against belong to the draft, a span
+    /// belongs to the reviewer and is never written back.
+    pub spans: Vec<Span>,
+}
+
+/// One stretch of a script written by its own model, in video milliseconds on
+/// the clip's clock (`lo_ms` inclusive, `hi_ms` exclusive). The page edits
+/// these; the styler splices the named model's tracks in over those rows.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Span {
+    pub lo_ms: f64,
+    pub hi_ms: f64,
+    pub model: String,
 }
 
 /// The manifest's "normal" values for the two preset axes. The page shows each
@@ -578,6 +594,7 @@ fn state_json(
             // it (null: none), and every model the menus offer
             "model": choices[i].model,
             "compare": choices[i].compare,
+            "spans": choices[i].spans,
             "models": c.models,
             "actions": actions[i],
             // This clip's script is still catching up with its knobs. The page
@@ -635,6 +652,8 @@ fn parse_choice(body: &str, clip: &Clip, base: &Choice) -> Result<Choice> {
         model: Option<String>,
         #[serde(default, deserialize_with = "nullable")]
         compare: Option<Option<String>>,
+        #[serde(default)]
+        spans: Option<Vec<Span>>,
     }
     let m: Msg = serde_json::from_str(body).context("bad params payload")?;
     let model = m.model.unwrap_or_else(|| base.model.clone());
@@ -645,7 +664,37 @@ fn parse_choice(body: &str, clip: &Clip, base: &Choice) -> Result<Choice> {
             "no model {name:?} for this script"
         );
     }
-    Ok(Choice { model, compare })
+    // spans absent keeps the clip's own; present replaces them whole (the
+    // page sends the full list on every edit, so no per-span merging)
+    let spans = match m.spans {
+        Some(s) => normalize_spans(s, clip),
+        None => base.spans.clone(),
+    };
+    Ok(Choice { model, compare, spans })
+}
+
+/// Clean a span list off a page message: clamp into the clip, drop empties,
+/// drop a model the clip does not offer, and sort by start. The page's
+/// contract is sorted and non-overlapping; the server never trusts a client
+/// to hold it -- a later span simply wins its rows when they are spliced.
+fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
+    let dur = clip.duration_ms;
+    let mut out: Vec<Span> = Vec::new();
+    for mut s in spans {
+        if !clip.models.iter().any(|m| m.name == s.model) {
+            continue;
+        }
+        s.lo_ms = s.lo_ms.clamp(0.0, dur);
+        s.hi_ms = s.hi_ms.clamp(0.0, dur);
+        if s.hi_ms <= s.lo_ms {
+            continue;
+        }
+        out.push(s);
+    }
+    out.sort_by(|a, b| {
+        a.lo_ms.partial_cmp(&b.lo_ms).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
 }
 
 /// The page's params message -> a clip index + a validated `Params`, same
@@ -1046,7 +1095,7 @@ mod tests {
             p.intensity = v;
             p
         };
-        let c = Choice { model: "m".into(), compare: None };
+        let c = Choice { model: "m".into(), compare: None, spans: Vec::new() };
         work.request(0, at(0.1), c.clone()); // the styler picks this up and blocks in it
         while entered.load(Ordering::SeqCst) < 1 {
             std::thread::yield_now();
@@ -1095,14 +1144,67 @@ mod tests {
             models: vec![m("a", "t1"), m("b", "t1"), m("c", "t2")],
             compare: "k".into(),
         };
-        let base = Choice { model: "a".into(), compare: Some("c".into()) };
+        let base = Choice { model: "a".into(), compare: Some("c".into()), spans: Vec::new() };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
         assert_eq!(parse(r#"{"clip":0}"#).unwrap(), base);
-        assert_eq!(parse(r#"{"model":"b"}"#).unwrap(), Choice { model: "b".into(), compare: Some("c".into()) });
+        assert_eq!(parse(r#"{"model":"b"}"#).unwrap(), Choice { model: "b".into(), compare: Some("c".into()), spans: Vec::new() });
         assert_eq!(parse(r#"{"compare":null}"#).unwrap().compare, None);
-        assert_eq!(parse(r#"{"model":"c"}"#).unwrap(), Choice { model: "c".into(), compare: None });
+        assert_eq!(parse(r#"{"model":"c"}"#).unwrap(), Choice { model: "c".into(), compare: None, spans: Vec::new() });
         assert!(parse(r#"{"model":"z"}"#).is_err());
         assert!(parse(r#"{"compare":"z"}"#).is_err());
+    }
+
+    /// Spans ride the same message: absent keeps the clip's own, present
+    /// replaces them whole, and the server clamps, drops unknown models and
+    /// sorts before the styler ever sees them.
+    #[test]
+    fn a_choice_carries_spans_and_cleans_them() {
+        let m = |n: &str| crate::bundle::ModelInfo { name: n.into(), trunk: "t".into() };
+        let clip = super::Clip {
+            name: "c".into(),
+            script: "s".into(),
+            video: "v".into(),
+            fallback: None,
+            is_original: true,
+            duration_ms: 1000.0,
+            row_hz: 30.0,
+            row0_ms: 0.0,
+            t0_ms: 0.0,
+            crop: None,
+            model: "a".into(),
+            models: vec![m("a"), m("b")],
+            compare: "k".into(),
+        };
+        let base = Choice {
+            model: "a".into(),
+            compare: None,
+            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into() }],
+        };
+        let parse = |body: &str| super::parse_choice(body, &clip, &base);
+        // absent keeps the clip's own
+        assert_eq!(parse(r#"{"model":"a"}"#).unwrap().spans, base.spans);
+        // present replaces whole, and is cleaned: unknown model dropped,
+        // inverted dropped, out-of-clip clamped, then sorted by start
+        let got = parse(
+            r#"{"spans":[
+                {"lo_ms":900,"hi_ms":5000,"model":"b"},
+                {"lo_ms":300,"hi_ms":400,"model":"zzz"},
+                {"lo_ms":800,"hi_ms":900,"model":"b"},
+                {"lo_ms":600,"hi_ms":700,"model":"a"}
+            ]}"#,
+        )
+        .unwrap()
+        .spans;
+        assert_eq!(
+            got,
+            vec![
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into() },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into() },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into() },
+            ]
+        );
+        // an empty list is a real answer: back to one model over the whole clip
+        assert!(parse(r#"{"spans":[]}"#).unwrap().spans.is_empty());
     }
 
     #[test]

@@ -329,6 +329,42 @@
              background: linear-gradient(90deg, rgba(var(--cool),.12), rgba(var(--cool),.85)); }
   #closed { margin: auto; text-align: center; padding: 80px 20px; color: var(--ink-soft); font-size: 16px; }
 
+  /* ---- drawer: the spanning bench ----
+     The mirror of the rail, on the other side, holding everything the
+     model-span and shot-cut features add: the tool row, the segment list,
+     the shot list. The knob bank, the recipe and the clip list stay exactly
+     where they were -- the new surface gets its own column instead of piling
+     onto a page that has no room for it. Folds away to a left-edge grip with
+     the same gesture as the rail, so the two flanks behave alike. */
+  #drawer { flex: 0 0 clamp(272px, 23vw, 348px); min-height: 0; overflow-y: auto;
+            background: var(--panel); border-right: 2px solid var(--edge);
+            padding: 12px 14px 0; display: flex; flex-direction: column; gap: 13px; }
+  body.drawer-off #drawer { display: none; }
+  #drawerGrip { display: none; flex: 0 0 24px; align-items: flex-start; justify-content: center;
+                padding-top: 12px; background: var(--panel); border-right: 2px solid var(--edge);
+                color: var(--hi-dim); font: 700 14px var(--chrome); cursor: pointer;
+                border-top: 0; border-bottom: 0; border-left: 0; }
+  body.drawer-off #drawerGrip { display: flex; }
+  #drawerGrip:hover { color: var(--hi-bright); }
+  .drow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .drow button { flex: 0 0 auto; }
+  /* the live tool is the one the canvas is listening to -- it has to read as a
+     mode, not as a button that was pressed once */
+  .tool.on { outline: 1px solid var(--hi-bright); color: var(--hi-bright); }
+  .tool b { font-weight: 700; }
+  /* the segment list: one row per piece, the razor's answer in text form --
+     the accessible route to the same edit, and how a narrow piece is reached */
+  .seglist { display: flex; flex-direction: column; gap: 3px; }
+  .segrow { display: flex; align-items: center; gap: 6px; padding: 2px 4px;
+            border: 1px solid var(--edge); font-size: 11px; cursor: pointer; }
+  .segrow.cur { border-color: var(--hi-bright); }
+  .segrow .sw { width: 9px; height: 9px; flex: 0 0 auto; border: 1px solid var(--edge); }
+  .segrow .t { font: 11px var(--chrome); color: var(--ink-soft); flex: 0 0 auto; white-space: nowrap; }
+  .segrow select { flex: 1 1 0; min-width: 0; font-size: 11px; }
+  .segrow .n { flex: 0 0 auto; color: var(--hi-dim); font: 700 10px var(--chrome); }
+  .segnote { font-size: 11px; color: var(--ink-soft); opacity: .85; }
+  #drawer .sec-h { display: block; }
+
   /* Narrow windows have no flanks to spend, so the rail lies back down under
      the stage as a dock: the same sections, wrapped into rows, capped at a
      share of the height and scrolling within it. */
@@ -337,6 +373,11 @@
     #rail { flex: 0 0 auto; max-height: 42vh;
             border-left: 0; border-top: 2px solid var(--edge);
             padding: 10px clamp(10px, 3vw, 20px) 0; }
+    #drawer { flex: 0 0 auto; max-height: 34vh;
+              border-right: 0; border-bottom: 2px solid var(--edge);
+              padding: 10px clamp(10px, 3vw, 20px) 0; }
+    #drawerGrip { flex: 0 0 auto; padding: 4px 0; border-right: 0;
+                  border-bottom: 2px solid var(--edge); }
     .knobs { flex-direction: row; flex-wrap: wrap; gap: 8px 18px; }
     .knobs .group { flex: 1 1 180px; }
     #tabs { flex-direction: row; flex-wrap: wrap; }
@@ -367,6 +408,10 @@
     <h1>GoblinScript <span class="sub" data-t="page.review">review</span></h1>
     <span class="tag" data-t="page.tagline">made by real goblins</span>
     <span class="hint" data-t="page.hint">every change rewrites the script instantly</span>
+    <button id="drawerToggle" type="button" aria-expanded="true"
+            data-t-title="page.spans.title"
+            title="fold the spanning bench away">◨ <span
+            data-t="page.spans">spans</span></button>
     <button id="railToggle" type="button" aria-expanded="true"
             data-t-title="page.workbench.title"
             title="fold the workbench away and give the frame the whole window">◧ <span
@@ -374,6 +419,46 @@
   </header>
 
   <div id="shell">
+    <button id="drawerGrip" type="button" data-t-title="page.spans.grip"
+            title="pull the spanning bench out">✂</button>
+    <aside id="drawer">
+      <div class="sec">
+        <span class="sec-h" data-t="page.spans">model spans</span>
+        <span class="hint" data-t="page.spans.hint">the razor cuts the timeline; each piece is written by the model you pick for it. nothing here touches the draft &mdash; it is this session's edit, like a knob.</span>
+        <div class="drow">
+          <button type="button" id="toolSelect" class="tool on"
+                  data-t-title="page.spans.select.tip"><b>V</b> <span data-t="page.spans.select">select</span></button>
+          <button type="button" id="toolRazor" class="tool"
+                  data-t-title="page.spans.razor.tip"><b>R</b> <span data-t="page.spans.razor">razor</span></button>
+          <button type="button" id="toolShot" class="tool"
+                  data-t-title="page.spans.shot.tip"><b>B</b> <span data-t="page.spans.shot">cuts</span></button>
+          <button type="button" id="magBtn" class="tool"
+                  data-t-title="page.spans.magnet.tip"><b>S</b> <span data-t="page.spans.magnet">snap</span></button>
+        </div>
+        <div class="drow">
+          <button type="button" id="segCut" data-t-title="page.spans.cutat.tip">✂ <span
+                  data-t="page.spans.cutat">cut at the playhead</span></button>
+          <button type="button" id="segMerge" data-t-title="page.spans.merge.tip">⇥⇤ <span
+                  data-t="page.spans.merge">merge right</span></button>
+          <button type="button" id="segUndo" data-t-title="page.spans.undo.tip">↶ <span id="undoN">0</span></button>
+          <button type="button" id="segRedo" data-t-title="page.spans.redo.tip">↷ <span id="redoN">0</span></button>
+        </div>
+        <div id="segList" class="seglist"></div>
+        <div id="segNote" class="segnote"></div>
+      </div>
+      <div class="sec" id="shotSec">
+        <span class="sec-h" data-t="page.shots">shot cuts</span>
+        <span class="hint" data-t="page.shots.hint">the cuts the video was read with. adding or removing one re-runs the head pass (about half a minute) &mdash; it changes what the models were shown, so the script follows.</span>
+        <div class="drow">
+          <button type="button" id="shotUndo" data-t-title="page.shots.undo.tip">↶</button>
+          <button type="button" id="shotRedo" data-t-title="page.shots.redo.tip">↷</button>
+          <button type="button" id="shotReset" data-t-title="page.shots.reset.tip"><span
+                  data-t="page.shots.reset">reset to detected</span></button>
+        </div>
+        <div id="shotList" class="seglist"></div>
+        <div id="shotNote" class="segnote"></div>
+      </div>
+    </aside>
     <main>
       <div id="stage">
         <video id="vid" controls preload="metadata"></video>
@@ -677,6 +762,7 @@ function applyLang() {
   // through the same path that changes them
   labelRail();
   labelAdv();
+  labelDrawer();
   document.title = T('page.title');
 }
 const vid = $('vid'), strip = $('strip'), sctx = strip.getContext('2d');
@@ -1106,6 +1192,7 @@ async function selectClip(i) {
   updateCropUI();
   renderTabs();
   syncControls();  // this clip's own knobs, model + recipe
+  spanLoad();      // ...and its own spans, from scratch
   updateStylingUI();
   await Promise.all([fetchScript(), fetchConf(), fetchCompare()]);
 }
@@ -1140,6 +1227,11 @@ function syncModels() {
   if (pinned[cur]) opt(cmp, '#pinned', T('page.compare.pinned'));
   cmp.value = pinOn[cur] ? '#pinned' : ((c && c.compare) || '');
   updateStylingUI();
+  // the segment list is per clip and follows the base model the same way the
+  // menu does, so it redraws with it (the partition itself is NOT rebuilt here
+  // -- the page's own pieces, cuts and all, are what the user is editing)
+  renderSegs();
+  updateSegNote();
 }
 async function fetchCompare() {
   cmpActions = [];
@@ -1601,6 +1693,9 @@ function drawTimeline(ms) {
   const dur = curDurationMs();
   const X = t => t / dur * w;
   tlctx.clearRect(0, 0, w, h);
+  // the span bar FIRST, so the elapsed tint and every band below pass over it:
+  // one colour per model, cut where the razor cut it (see the drawer)
+  drawSpanBand(X, w, h, dur);
   // faint elapsed fill, so progress reads even where nothing else is drawn
   const px = X(ms);
   tlctx.fillStyle = hexA(C.hi, .10);
@@ -1609,7 +1704,7 @@ function drawTimeline(ms) {
   tlctx.strokeStyle = 'rgba(255,255,255,.06)';
   tlctx.beginPath();
   const step = dur > 600000 ? 300000 : 60000;
-  for (let t = step; t < dur; t += step) { tlctx.moveTo(X(t), 8); tlctx.lineTo(X(t), h - 14); }
+  for (let t = step; t < dur; t += step) { tlctx.moveTo(X(t), 4); tlctx.lineTo(X(t), h - 14); }
   tlctx.stroke();
   // filled spans along the top: where the background rhythm replaced the
   // decode's output, so the filler knobs can be tuned by eye
@@ -1617,7 +1712,7 @@ function drawTimeline(ms) {
     tlctx.fillStyle = hexA(C.hiBright, .5);
     for (const [a, b] of fillerSpans) {
       const x0 = X(Math.max(0, a)), x1 = X(Math.min(dur, b));
-      if (x1 > x0) tlctx.fillRect(x0, 1, Math.max(1, x1 - x0), 3);
+      if (x1 > x0) tlctx.fillRect(x0, 6, Math.max(1, x1 - x0), 3);
     }
   }
   // rarity spans under the filler band: action sequences the authored
@@ -1627,7 +1722,7 @@ function drawTimeline(ms) {
     tlctx.fillStyle = hexA(ARTIFACT_AMBER, .6);
     for (const [a, b] of artifactSpans) {
       const x0 = X(Math.max(0, a)), x1 = X(Math.min(dur, b));
-      if (x1 > x0) tlctx.fillRect(x0, 10, Math.max(1, x1 - x0), 3);
+      if (x1 > x0) tlctx.fillRect(x0, 15, Math.max(1, x1 - x0), 3);
     }
   }
   // cropped spans just under the filler band: where the goblins were shown a
@@ -1641,9 +1736,9 @@ function drawTimeline(ms) {
       const x0 = X(Math.max(0, s.t_ms)), x1 = X(Math.min(dur, end));
       if (x1 <= x0) continue;
       tlctx.fillStyle = hexA(CROP_GREEN, .55);
-      tlctx.fillRect(x0, 5, Math.max(1, x1 - x0), 3);
+      tlctx.fillRect(x0, 10, Math.max(1, x1 - x0), 3);
       tlctx.fillStyle = CROP_GREEN;
-      tlctx.fillRect(x0, 5, 1, 6);
+      tlctx.fillRect(x0, 10, 1, 6);
     }
   }
   // confidence band along the bottom -- height + alpha grow with certainty, so
@@ -1682,12 +1777,95 @@ function tlSeek(clientX) {
   const frac = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
   seekMs(frac * curDurationMs());
 }
+/** The millisecond under a client X, on the same clock the spans are in. */
+function tlMs(clientX) {
+  const r = timeline.getBoundingClientRect();
+  const frac = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+  return frac * curDurationMs();
+}
+/** Canvas-local X, for the razor's preview. */
+function tlX(clientX) { return clientX - timeline.getBoundingClientRect().left; }
+/** The span edge within grabbing distance of a client X, or -1. */
+function edgeAt(clientX) {
+  const r = timeline.getBoundingClientRect();
+  const dur = curDurationMs();
+  if (!(dur > 0)) return -1;
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (Math.abs(segs[i].hi / dur * r.width - (clientX - r.left)) <= 6) return i;
+  }
+  return -1;
+}
+// The bar answers to whichever tool is armed. Scrub stays on the bare drag, so
+// the timeline is a scrubber first whatever the tool -- the razor and the
+// shot cutter take only the press they recognize.
 timeline.addEventListener('pointerdown', e => {
-  tlDrag = true; timeline.setPointerCapture(e.pointerId); tlSeek(e.clientX); e.preventDefault();
+  timeline.setPointerCapture(e.pointerId);
+  const ms = tlMs(e.clientX);
+  if (tool === 'razor') {
+    razorDrag = { x0: tlX(e.clientX) };
+    razorX = tlX(e.clientX);
+    e.preventDefault();
+    return;
+  }
+  if (tool === 'shot') {
+    shotPress(e.clientX, ms);
+    e.preventDefault();
+    return;
+  }
+  const edge = edgeAt(e.clientX);
+  if (edge >= 0) {
+    pushSegUndo();
+    dragEdge = edge;
+    selSeg = edge;
+    renderSegs();
+    e.preventDefault();
+    return;
+  }
+  selSeg = segAt(ms);
+  renderSegs();
+  tlDrag = true;
+  tlSeek(e.clientX);
+  e.preventDefault();
 });
-timeline.addEventListener('pointermove', e => { if (tlDrag) tlSeek(e.clientX); });
-timeline.addEventListener('pointerup', () => { tlDrag = false; });
-timeline.addEventListener('pointercancel', () => { tlDrag = false; });
+timeline.addEventListener('pointermove', e => {
+  if (razorDrag) {
+    razorX = tlX(e.clientX);
+    return;
+  }
+  if (dragEdge !== null) { moveEdge(dragEdge, tlMs(e.clientX)); return; }
+  if (tlDrag) { tlSeek(e.clientX); return; }
+  if (tool === 'select') {
+    const over = edgeAt(e.clientX) >= 0 ? -1 : segAt(tlMs(e.clientX));
+    if (over !== hoverSeg) { hoverSeg = over; }
+    timeline.style.cursor = edgeAt(e.clientX) >= 0 ? 'col-resize' : 'pointer';
+  } else {
+    hoverSeg = -1;
+  }
+});
+timeline.addEventListener('pointerleave', () => {
+  hoverSeg = -1;
+  if (!tlDrag && dragEdge === null && !razorDrag) razorX = null;
+});
+timeline.addEventListener('pointerup', e => {
+  if (razorDrag) {
+    const x1 = tlX(e.clientX);
+    const a = tlMs(Math.min(razorDrag.x0, x1) + timeline.getBoundingClientRect().left);
+    const b = tlMs(Math.max(razorDrag.x0, x1) + timeline.getBoundingClientRect().left);
+    razorDrag = null;
+    razorX = null;
+    // a tap is one cut; a drag is a range, cut at both ends
+    if (b - a < 60) cutAt(tlMs(e.clientX)); else razorCut(a, b);
+    return;
+  }
+  if (dragEdge !== null) { commitSegs(); dragEdge = null; return; }
+  tlDrag = false;
+});
+timeline.addEventListener('pointercancel', () => {
+  razorDrag = null;
+  razorX = null;
+  if (dragEdge !== null) { commitSegs(); dragEdge = null; }
+  tlDrag = false;
+});
 
 // ---- script strip ----------------------------------------------------------------
 const WINDOW_MS = 30000;  // +-15 s around the playhead
@@ -1815,6 +1993,324 @@ function tick() {
   drawCrop(ms);
   requestAnimationFrame(tick);
 }
+
+// ---- spans: the razor's second layer on the timeline ---------------------
+// One bar, cut into pieces, each written by the model picked for it. This is
+// PR's razor where it helps and not where it does not: a piece is CHANGED or
+// MERGED, never deleted -- a script has to cover the whole clip, so there is
+// no hole to make.
+//
+// The page holds a full partition of the clip; what travels to the server is
+// only the pieces whose model differs from the script's own, which is exactly
+// the base-plus-span splice the styler eats. A span is session state like a
+// knob: nothing here is written to the draft, and switching the base model
+// leaves the pieces you placed alone (the untouched ones follow the new base).
+let segs = [];            // [{lo, hi, model, gap}] contiguous over the clip
+let selSeg = -1;
+let spanUndo = [], spanRedo = [];
+let tool = 'select';      // 'select' | 'razor' | 'shot'
+let magnet = false;
+let dragEdge = null;
+let razorDrag = null;
+let razorX = null;        // the blade's preview, in canvas pixels
+let hoverSeg = -1;        // the piece under the pointer, for the hover tint
+// The shot layer (the video's own cuts) shares this bar with the razor. Read
+// and edited further down; declared here because the span band draws it and
+// the magnet snaps to it.
+let shots = [];
+
+// A colour per model, so a piece is identified at a glance. Fixed hues rather
+// than palette variables: these must stay distinct from EACH OTHER, and every
+// palette the app ships is dark, so the ramp is tuned for a dark bar.
+const SPAN_HUES = ['#8bc34a', '#ffb000', '#55c0ff', '#e06ce0', '#ff6b5a',
+                   '#3ad6b0', '#d8d84a', '#9a8cff'];
+function modelColor(name) {
+  const c = state.clips[cur];
+  const ms = (c && c.models) || [];
+  const i = ms.findIndex(m => m.name === name);
+  return SPAN_HUES[(i < 0 ? 0 : i) % SPAN_HUES.length];
+}
+
+// ---- the partition --------------------------------------------------------
+function spanDur(c) {
+  const d = c && c.duration_ms;
+  return (typeof d === 'number' && d > 0) ? d : Math.max(1, curDurationMs());
+}
+/** The clip's own spans, filled out to a full partition: the gaps between them
+ *  (and either side of them) belong to the script's own model. */
+function partitionOf(c) {
+  const dur = spanDur(c);
+  const out = [];
+  let t = 0;
+  const sp = (c.spans || []).slice().sort((a, b) => a.lo_ms - b.lo_ms);
+  for (const e of sp) {
+    const lo = Math.max(t, Math.min(dur, e.lo_ms));
+    const hi = Math.max(0, Math.min(dur, e.hi_ms));
+    if (hi <= lo) continue;
+    if (lo > t) out.push({ lo: t, hi: lo, model: c.model, gap: true });
+    out.push({ lo, hi, model: e.model, gap: false });
+    t = hi;
+  }
+  if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
+  return out.length ? out : [{ lo: 0, hi: dur, model: c.model, gap: true }];
+}
+/** The ask: only the pieces the script's own model would not have written. */
+function spansPayload() {
+  const c = state.clips[cur];
+  if (!c) return [];
+  return segs.filter(s => s.model !== c.model)
+             .map(s => ({ lo_ms: s.lo, hi_ms: s.hi, model: s.model }));
+}
+function retagGaps() {
+  const c = state.clips[cur];
+  if (!c) return;
+  for (const s of segs) s.gap = (s.model === c.model);
+}
+function spanLoad() {
+  const c = state.clips[cur];
+  spanUndo = []; spanRedo = [];
+  selSeg = -1;
+  segs = c ? partitionOf(c) : [];
+  renderSegs();
+}
+function commitSegs() {
+  renderSegs();
+  updateSegNote();
+  postParams({ spans: spansPayload() });
+}
+function pushSegUndo() {
+  spanUndo.push(JSON.stringify(segs));
+  if (spanUndo.length > 64) spanUndo.shift();
+  spanRedo.length = 0;
+}
+function segUndoNow() {
+  if (!spanUndo.length) return;
+  spanRedo.push(JSON.stringify(segs));
+  if (spanRedo.length > 64) spanRedo.shift();
+  segs = JSON.parse(spanUndo.pop());
+  selSeg = Math.min(selSeg, segs.length - 1);
+  commitSegs();
+}
+function segRedoNow() {
+  if (!spanRedo.length) return;
+  spanUndo.push(JSON.stringify(segs));
+  segs = JSON.parse(spanRedo.pop());
+  selSeg = Math.min(selSeg, segs.length - 1);
+  commitSegs();
+}
+
+// ---- edits ----------------------------------------------------------------
+function segAt(ms) {
+  for (let i = 0; i < segs.length; i++) if (ms >= segs[i].lo && ms < segs[i].hi) return i;
+  return segs.length ? segs.length - 1 : -1;
+}
+/** Cut `segs` at `ms` without touching the undo stack (razor drags cut twice). */
+function cutInPlace(ms) {
+  const i = segAt(ms);
+  if (i < 0) return i;
+  const s = segs[i];
+  if (ms <= s.lo + 40 || ms >= s.hi - 40) return -1;
+  segs.splice(i, 1, { lo: s.lo, hi: ms, model: s.model, gap: s.gap },
+                    { lo: ms, hi: s.hi, model: s.model, gap: s.gap });
+  return i;
+}
+function cutAt(ms) {
+  const before = segs.length;
+  pushSegUndo();
+  cutInPlace(ms);
+  if (segs.length === before) { spanUndo.pop(); return; }   // nothing to cut
+  commitSegs();
+}
+function razorCut(a, b) {
+  if (b - a < 80) { cutAt(a); return; }
+  const before = segs.length;
+  pushSegUndo();
+  cutInPlace(a); cutInPlace(b);
+  if (segs.length === before) { spanUndo.pop(); return; }
+  commitSegs();
+}
+function setSegModel(i, model) {
+  const s = segs[i];
+  if (!s || s.model === model) return;
+  pushSegUndo();
+  s.model = model;
+  retagGaps();
+  commitSegs();
+}
+/** Merge piece `i` with the one to its right. The survivor keeps the LEFT
+ *  piece's model -- said out loud in the note, because PR asks instead. */
+function mergeWith(i) {
+  if (i < 0 || i + 1 >= segs.length) return;
+  pushSegUndo();
+  segs[i].hi = segs[i + 1].hi;
+  segs.splice(i + 1, 1);
+  selSeg = i;
+  commitSegs();
+}
+/** Move the edge between `i` and `i+1` to `ms`, keeping both sides non-empty. */
+function moveEdge(i, ms) {
+  if (i < 0 || i + 1 >= segs.length) return;
+  const lo = segs[i].lo + 60, hi = segs[i + 1].hi - 60;
+  let t = Math.min(hi, Math.max(lo, ms));
+  if (magnet) {
+    const snap = nearestCut(t);
+    if (snap != null && Math.abs(snap - t) < 350) t = Math.min(hi, Math.max(lo, snap));
+  }
+  segs[i].hi = t;
+  segs[i + 1].lo = t;
+}
+
+// ---- tools ----------------------------------------------------------------
+const TOOL_BTNS = [['toolSelect', 'select'], ['toolRazor', 'razor'], ['toolShot', 'shot']];
+function setTool(t) {
+  tool = t;
+  for (const [id, name] of TOOL_BTNS) $(id).classList.toggle('on', name === t);
+  timeline.style.cursor = t === 'razor' ? 'crosshair' : (t === 'shot' ? 'copy' : 'pointer');
+  if (t !== 'razor') { razorX = null; razorDrag = null; }
+  updateSegNote();
+  renderSegs();
+}
+function labelMagnet() {
+  $('magBtn').classList.toggle('on', magnet);
+  updateSegNote();
+}
+for (const [id, name] of TOOL_BTNS) $(id).onclick = () => setTool(name);
+$('magBtn').onclick = () => { magnet = !magnet; labelMagnet(); };
+$('segCut').onclick = () => cutAt(vid.currentTime * 1000);
+$('segMerge').onclick = () => mergeWith(selSeg);
+$('segUndo').onclick = segUndoNow;
+$('segRedo').onclick = segRedoNow;
+
+// ---- the drawer -----------------------------------------------------------
+function labelDrawer() {
+  const off = document.body.classList.contains('drawer-off');
+  $('drawerToggle').textContent = (off ? '▸' : '◨') + ' ' + T('page.spans');
+}
+function setDrawer(off) {
+  document.body.classList.toggle('drawer-off', off);
+  $('drawerToggle').setAttribute('aria-expanded', String(!off));
+  labelDrawer();
+  sizeTimeline();
+}
+$('drawerToggle').onclick = () => setDrawer(!document.body.classList.contains('drawer-off'));
+$('drawerGrip').onclick = () => setDrawer(false);
+
+// ---- the list -------------------------------------------------------------
+function renderSegs() {
+  const list = $('segList');
+  if (!list) return;
+  list.innerHTML = '';
+  const c = state.clips[cur];
+  if (!c) return;
+  const models = c.models || [];
+  segs.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'segrow' + (i === selSeg ? ' cur' : '');
+    const sw = document.createElement('span');
+    sw.className = 'sw';
+    sw.style.background = modelColor(s.model);
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = '#' + (i + 1);
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = fmtClock(s.lo) + '–' + fmtClock(s.hi);
+    const sel = document.createElement('select');
+    for (const m of models) {
+      const o = document.createElement('option');
+      o.value = m.name;
+      o.textContent = m.name;
+      sel.append(o);
+    }
+    sel.value = s.model;
+    sel.onchange = () => setSegModel(i, sel.value);
+    sel.onclick = ev => ev.stopPropagation();
+    row.append(sw, n, t, sel);
+    row.onclick = () => { selSeg = i; renderSegs(); seekMs(s.lo + 1); };
+    list.append(row);
+  });
+  $('undoN').textContent = String(spanUndo.length);
+  $('redoN').textContent = String(spanRedo.length);
+}
+function updateSegNote() {
+  const el = $('segNote');
+  if (!el) return;
+  const c = state.clips[cur];
+  if (!c) { el.textContent = ''; return; }
+  if (tool === 'razor') { el.textContent = T('page.spans.razor.hint'); return; }
+  if (tool === 'shot') { el.textContent = T('page.spans.shot.hint'); return; }
+  const other = segs.filter(s => s.model !== c.model).length;
+  el.textContent = T('page.spans.note', { n: segs.length, m: other });
+}
+
+// ---- the shot layer -------------------------------------------------------
+// The video's own cuts, and the session's edits to them. `shots` is the
+// CURRENT set (detected cuts, plus or minus what was placed here); the
+// detected set is kept so "reset" has something to go back to.
+function nearestCut(t) {
+  let best = null;
+  for (const s of shots) {
+    if (best == null || Math.abs(s.t_ms - t) < Math.abs(best - t)) best = s.t_ms;
+  }
+  return best;
+}
+function labelShots() {
+  const el = $('shotNote');
+  if (!el) return;
+  el.textContent = T('page.shots.note', { n: shots.length });
+}
+// the shot editor (press / drag / delete on the bar) is the next commit
+function shotPress() {}
+
+// ---- drawing the bar ------------------------------------------------------
+function drawSpanBand(X, w, h, dur) {
+  if (!segs.length) return;
+  const clampX = v => Math.max(0, Math.min(w, v));
+  for (const s of segs) {
+    const x0 = clampX(X(s.lo)), x1 = clampX(X(s.hi));
+    if (x1 <= x0) continue;
+    tlctx.fillStyle = hexA(modelColor(s.model), s.gap ? .28 : .62);
+    tlctx.fillRect(x0, 1, Math.max(1, x1 - x0), 4);
+  }
+  // the edges, full height so a cut is unmistakable against the bands below
+  const d = (dur > 0 ? dur : 1);
+  for (let i = 0; i < segs.length - 1; i++) {
+    const x = clampX(segs[i].hi / d * w);
+    const on = (i === selSeg || i + 1 === selSeg);
+    tlctx.strokeStyle = hexA(C.hiBright, on ? .95 : .5);
+    tlctx.lineWidth = 1;
+    tlctx.beginPath(); tlctx.moveTo(x, 0); tlctx.lineTo(x, h); tlctx.stroke();
+    // a grip at the top, so the edge reads as grabbable
+    tlctx.fillRect(x - 2, 0, 5, 3);
+  }
+  // the razor's preview: where the blade would land
+  if (tool === 'razor' && razorX != null) {
+    tlctx.save();
+    tlctx.setLineDash([3, 3]);
+    tlctx.strokeStyle = hexA(C.dangerSoft || C.hiBright, .9);
+    tlctx.beginPath(); tlctx.moveTo(razorX, 0); tlctx.lineTo(razorX, h); tlctx.stroke();
+    tlctx.restore();
+  }
+  // shot cuts: a faint amber line, deliberately a different SHAPE from a span
+  // edge -- two layers share this bar and telling them apart is the whole risk
+  if (shots.length) {
+    tlctx.fillStyle = hexA(ARTIFACT_AMBER, .8);
+    for (const s of shots) {
+      const x = clampX(s.t_ms / d * w);
+      for (let y = 6; y < (h - 14); y += 4) tlctx.fillRect(x, y, 1, 2);
+    }
+  }
+  // the segment under the pointer, tinted, so a hover says what a click takes
+  if (hoverSeg >= 0 && hoverSeg < segs.length) {
+    const s = segs[hoverSeg];
+    const x0 = clampX(X(s.lo)), x1 = clampX(X(s.hi));
+    if (x1 > x0) {
+      tlctx.fillStyle = 'rgba(255,255,255,.10)';
+      tlctx.fillRect(x0, 0, x1 - x0, h);
+    }
+  }
+}
+
 
 // ---- boot ----------------------------------------------------------------
 (async () => {

@@ -723,7 +723,7 @@ fn workbench_route(s: &Arc<Session>, body: &str, tx: &mpsc::Sender<Job>, b: &Bun
         let man = &b2.manifest;
         let presets = review::Presets { dwell_ramp: man.plat_soft[0], still_eps: man.still_eps };
         let compare = clip.compare.clone();
-        let mut choices = [review::Choice { model: clip.model.clone(), compare: None }];
+        let mut choices = [review::Choice { model: clip.model.clone(), compare: None, spans: Vec::new() }];
         let r = review::review(
             &[clip],
             &mut params,
