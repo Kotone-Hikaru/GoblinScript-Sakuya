@@ -566,11 +566,14 @@ pub struct StyleCfg {
     /// Per-row twin of `amp_cap_f0`; same emptiness rule.
     pub amp_cap_f0_rows: Vec<f64>,
     /// Manual-fill pieces, in milliseconds on the clip's clock. EMPTY = the
-    /// usual draft. These rows were drawn by hand, so two stages keep off
-    /// them: `shape_actions` skips its intensity scale (the band the user
-    /// typed IS the answer, not a knob to be multiplied), and the gap filler
-    /// treats them as never-still. Everything else -- extrema, RDP, seams,
-    /// the speed cap -- applies as usual.
+    /// usual draft. These rows were drawn by hand, so the model-reading
+    /// stages keep off them entirely: `compose`/`compose_level_full` stamp
+    /// their final levels straight off `Tracks::level` (which
+    /// `wave::fill_rows` filled from the wave alone), `shape_actions` skips
+    /// its intensity scale (the band the user typed IS the answer, not a knob
+    /// to be multiplied), and the gap filler treats them as never-still.
+    /// What still applies is output-domain only: extrema, RDP, seams, and the
+    /// speed cap -- the device's own limits, not the model's opinion.
     pub manual_ms: Vec<(f64, f64)>,
     /// The hedge curve's exponent.
     pub env_gain_p: f64,
@@ -1223,11 +1226,13 @@ pub fn flags_line(p: &Params) -> String {
 /// then caps how fast consecutive actions may move (so the cap reads final
 /// device units). The model's draft upstream is untouched.
 ///
-/// `manual_ms` are the hand-drawn pieces. Their positions skip the intensity
+/// `manual_ms` are the hand-drawn pieces. Their positions skip the INTENSITY
 /// scale: a manual band is not a model's guess to be nudged by a whole-clip
-/// knob -- the two numbers the user typed ARE the answer, and multiplying them
-/// would move the floor and ceiling they set. Everything after that (range,
-/// the speed cap) applies to them like anything else.
+/// stylistic knob -- the two numbers the user typed ARE the answer, and
+/// multiplying them would move the floor and ceiling they set. `range` (a
+/// device-span mapping the user set for their own hardware) and `max_speed`
+/// (a device limit) still apply: those are the user's knobs and the device's
+/// physics, not the model's opinion about the drawing.
 pub fn shape_actions(actions: &mut [Action], p: &Params, manual_ms: &[(f64, f64)]) {
     let (lo, hi) = p.range;
     for a in actions.iter_mut() {
@@ -1276,6 +1281,36 @@ fn manual_rows(times: &[f64], spans: &[(f64, f64)], n: usize) -> Vec<(usize, usi
         }
     }
     out
+}
+
+/// Stamp the hand-drawn rows back over the composed level.
+///
+/// THE COVERAGE RULE. Every stage above this one reads the MODEL's heads --
+/// `travel` off `t.env`, the snap off `t.band`, `depth_uniformize` off the
+/// written vertices, `level_lock` off `t.plat` -- and each of them is free to
+/// move a row that a user drew by hand. `manual_ms` only ever bought two
+/// exemptions (the intensity scale, the gap filler), which is why a piece
+/// could come back re-proportioned and re-parked: the model still owned its
+/// reach and its rails.
+///
+/// So the hand-drawn rows are written LAST, straight off `Tracks::level` --
+/// which `wave::fill_rows` filled from the wave alone, with no model in the
+/// path. What the panel says is what the clip gets: the band IS the band and
+/// the shape IS the shape. The output-domain stages downstream (extrema, RDP,
+/// seams, the speed cap) still apply, because those are the DEVICE's limits
+/// rather than the model's opinion. A manual span whose rows a splice left
+/// short of `level` is skipped rather than guessed at.
+fn stamp_manual(p: &mut [f64], t: &Tracks, times_ms: &[f64], spans: &[(f64, f64)]) {
+    for (lo, hi) in manual_rows(times_ms, spans, p.len()) {
+        let hi = hi.min(t.level.len());
+        if hi <= lo {
+            continue;
+        }
+        for i in lo..hi {
+            let v = t.level[i];
+            p[i] = if v.is_finite() { v.clamp(0.0, 100.0) } else { p[i] };
+        }
+    }
 }
 
 /// Row spans where `m` is true, as `[a, b)`.
@@ -2078,7 +2113,7 @@ pub fn compose(
         ),
         (None, _) => p,
     };
-    let (p, filled) = if cfg.filler_gap_s > 0.0 {
+    let (mut p, filled) = if cfg.filler_gap_s > 0.0 {
         fill_still_spans(
             &p,
             &t.vmarg,
@@ -2089,6 +2124,9 @@ pub fn compose(
     } else {
         (p, Vec::new())
     };
+    // LAST, over everything above: the hand-drawn rows are the user's, and no
+    // model head gets the final word on them. See `stamp_manual`.
+    stamp_manual(&mut p, t, times_ms, &cfg.manual_ms);
     (p, sub, force, filled, phase)
 }
 
@@ -2305,7 +2343,7 @@ pub fn compose_level_full(
     } else {
         p
     };
-    if cfg.filler_gap_s > 0.0 {
+    let (mut p, filled) = if cfg.filler_gap_s > 0.0 {
         fill_still_spans(
             &p,
             &t.vmarg,
@@ -2315,7 +2353,11 @@ pub fn compose_level_full(
         )
     } else {
         (p, Vec::new())
-    }
+    };
+    // Same coverage rule as `compose`: a hand-drawn piece is the user's, so it
+    // is stamped back over whatever the model-reading stages did to it.
+    stamp_manual(&mut p, t, times_ms, &cfg.manual_ms);
+    (p, filled)
 }
 
 pub fn compose_level(t: &Tracks, shot_edges: &[usize], cfg: &StyleCfg) -> Vec<f64> {
@@ -3105,6 +3147,92 @@ mod tests {
         assert!(capped.iter().zip(&p).all(|(c, o)| (c - o).abs() <= 25.0 + 1e-9));
     }
 
+
+    /// A hand-drawn piece has to come back EXACTLY as the panel drew it.
+    ///
+    /// End to end, the way one actually arrives: `wave::fill_rows` writes
+    /// level+vmarg off the wave alone, then the composed path has its say --
+    /// every model head here is set to fight the drawing (a tiny envelope, a
+    /// full 0..100 band, every row called a TOP dwell) -- and the stamp takes
+    /// the rows back last. Without it the piece came back re-proportioned and
+    /// re-parked, which is the bug the user hit.
+    #[test]
+    fn a_hand_drawn_piece_survives_the_composed_path() {
+        let n = 120; // 4 s at 30 rows/s
+        let times: Vec<f64> = (0..n).map(|i| i as f64 * 1000.0 / 30.0).collect();
+        let spec = crate::wave::WaveSpec {
+            id: "triangle".to_string(),
+            lo: 20.0,
+            hi: 80.0,
+            period_s: 0.5,
+            params: crate::wave::Params::new(),
+            mirror_time: false,
+            mirror_amp: false,
+        };
+        let mut t = Tracks {
+            vmarg: vec![0.0; n],
+            level: vec![50.0; n],
+            env: vec![8.0; n], // a model envelope far below the drawn reach
+            band: Some((vec![0.0; n], vec![100.0; n])),
+            plat: Some((vec![0.0; n], vec![1.0; n])), // every row a top dwell
+            rev: None,
+            period: Vec::new(),
+            conf: Vec::new(),
+        };
+        assert!(crate::wave::fill_rows(&mut t.level, &mut t.vmarg, &times, 0, n, &spec));
+        let drawn = t.level.clone();
+        let mut cfg = filler_cfg();
+        cfg.manual_ms = vec![(times[0], times[n - 1] + 1.0)];
+        let (p, _, _, _, _) = compose(&t, &[0, n], &cfg, &times);
+        for i in 0..n {
+            assert!(
+                (p[i] - drawn[i]).abs() < 1e-9,
+                "row {i}: composed {} != drawn {}",
+                p[i],
+                drawn[i]
+            );
+        }
+        // and with the span gone the same rows are NOT the drawing -- without
+        // that half this test would pass on a styler that did nothing at all
+        cfg.manual_ms.clear();
+        let (q, _, _, _, _) = compose(&t, &[0, n], &cfg, &times);
+        assert!(
+            q.iter().zip(&drawn).any(|(a, b)| (a - b).abs() > 1e-6),
+            "the model stages left the drawing alone, so nothing is proven here"
+        );
+    }
+
+    /// The `--style level` path stamps too: it has no band and no lock, but its
+    /// stroke heights come off the marginal and the gap filler rewrites still
+    /// rows, and both are free to move a hand-drawn row.
+    #[test]
+    fn a_hand_drawn_piece_survives_the_level_path() {
+        let n = 120;
+        let times: Vec<f64> = (0..n).map(|i| i as f64 * 1000.0 / 30.0).collect();
+        // a sawtooth the panel dialled in, filling the clip
+        let drawn: Vec<f64> = (0..n).map(|i| (i % 10) as f64 * 10.0).collect();
+        let t = Tracks {
+            vmarg: vec![0.0; n], // dead flat: what the styler used to see
+            level: drawn.clone(),
+            env: vec![30.0; n],
+            band: None,
+            plat: None,
+            rev: None,
+            period: Vec::new(),
+            conf: Vec::new(),
+        };
+        let mut cfg = filler_cfg();
+        cfg.manual_ms = vec![(times[0], times[n - 1] + 1.0)];
+        let (p, _) = compose_level_full(&t, &[0, n], &cfg, &times);
+        for i in 0..n {
+            assert!(
+                (p[i] - drawn[i]).abs() < 1e-9,
+                "row {i}: level-path {} != drawn {}",
+                p[i],
+                drawn[i]
+            );
+        }
+    }
 
     fn filler_cfg() -> StyleCfg {
         StyleCfg {

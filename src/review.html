@@ -543,9 +543,9 @@
             <span data-t="page.wave.to">to</span>
             <input id="wpHi" class="wpnum" type="number" min="0" max="100" step="1">
             <span class="wpsp"></span>
-            <label data-t="page.wave.cycle">cycle</label>
-            <input id="wpPeriod" class="wpnum" type="number" min="0.05" max="30" step="0.05">
-            <span data-t="page.wave.sec">s</span>
+            <label data-t="page.wave.cycle">rate</label>
+            <input id="wpPeriod" class="wpnum" type="number" min="0.03" max="20" step="0.01">
+            <span data-t="page.wave.sec">cycles/s</span>
           </div>
           <div class="wprow">
             <label><input id="wpMirrorT" type="checkbox"> <span
@@ -2950,15 +2950,35 @@ async function fetchWaves() {
 function waveById(id) {
   return (waveModels || []).find(w => w.id === id) || null;
 }
-/** A fresh recipe: the first wave in the file, over the middle of the range.
- *  Legal from the instant a piece is switched over, so `setSegModel` never has
- *  to hand the server a manual span with nothing to write it with. */
+/** A fresh recipe: the first wave in the file, across the WHOLE range (0..100
+ *  is the band a user almost always wants, and the model's own 25..75 default
+ *  would quietly hide two thirds of the travel). Legal from the instant a
+ *  piece is switched over, so `setSegModel` never has to hand the server a
+ *  manual span with nothing to write it with.
+ *
+ *  `period_s` is SECONDS per cycle -- the stored unit, and the one every old
+ *  span already speaks. The panel shows cycles per SECOND (1/period_s)
+ *  instead, because "how many times a second does it go round" is the
+ *  question a person actually asks; only the input is converted. */
 function defaultWave() {
   const w = (waveModels && waveModels[0]) || null;
-  const d = { id: w ? w.id : 'triangle', lo: 25, hi: 75, period_s: 1.0,
+  const d = { id: w ? w.id : 'triangle', lo: 0, hi: 100, period_s: 1.0,
               params: {}, mirror_time: false, mirror_amp: false };
   if (w) for (const p of (w.params || [])) d.params[p.key] = p.def;
   return d;
+}
+/** Cycles per second -> seconds per cycle. 0 or a non-finite rate reads as the
+ *  stored 1 s, since a wave still has to be drawn while the box is empty. */
+function secPerCycle(rate) {
+  const h = Number(rate);
+  return (isFinite(h) && h > 0) ? 1 / h : 1.0;
+}
+/** Seconds per cycle -> the rate the box shows, rounded to 2 places so the
+ *  field does not fill with 0.9999999999 after a round trip. */
+function cyclesPerSec(period_s) {
+  const p = Number(period_s);
+  const h = (isFinite(p) && p > 0) ? 1 / p : 1.0;
+  return Math.round(h * 100) / 100;
 }
 /** The piece the panel edits, or null when the selection is not hand-drawn. */
 function manualSeg() {
@@ -2993,7 +3013,8 @@ function renderWavePanel() {
   sel.value = w.id;
   $('wpLo').value = Math.round(w.lo);
   $('wpHi').value = Math.round(w.hi);
-  $('wpPeriod').value = w.period_s;
+  // the field speaks cycles per second; the span stores seconds per cycle
+  $('wpPeriod').value = cyclesPerSec(w.period_s);
   $('wpMirrorT').checked = !!w.mirror_time;
   $('wpMirrorA').checked = !!w.mirror_amp;
   renderWaveParams();
@@ -3104,13 +3125,19 @@ async function drawWaveThumb() {
     el.classList.toggle('bad', cap > 0 && peak > cap);
   }
 }
-for (const [id, key] of [['wpLo', 'lo'], ['wpHi', 'hi'], ['wpPeriod', 'period_s']]) {
+for (const [id, key] of [['wpLo', 'lo'], ['wpHi', 'hi']]) {
   const el = $(id);
   if (el) el.onchange = () => editWave(w => {
     const n = Number(el.value);
     if (isFinite(n)) w[key] = n;
   });
 }
+// cycles per SECOND in the box, seconds per cycle in the span: the stored unit
+// never moves, so every piece saved by an older page still reads correctly
+if ($('wpPeriod')) $('wpPeriod').onchange = () => editWave(w => {
+  const h = Number($('wpPeriod').value);
+  if (isFinite(h) && h > 0) w.period_s = secPerCycle(h);
+});
 if ($('wpId')) $('wpId').onchange = () => editWave(w => {
   w.id = $('wpId').value;
   // a different wave brings its own knobs; carrying the old ones over would

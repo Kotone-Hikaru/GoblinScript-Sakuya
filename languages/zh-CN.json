@@ -544,8 +544,8 @@
   "page.wave.wave": "波形",
   "page.wave.band": "范围",
   "page.wave.to": "到",
-  "page.wave.cycle": "周期",
-  "page.wave.sec": "秒",
+  "page.wave.cycle": "频率",
+  "page.wave.sec": "次/秒",
   "page.wave.mirrorTime": "时间反序",
   "page.wave.mirrorAmp": "上下翻转",
   "page.hist.wave": "调整波形"

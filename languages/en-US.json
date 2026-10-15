@@ -496,8 +496,8 @@
   "page.wave.wave": "wave",
   "page.wave.band": "band",
   "page.wave.to": "to",
-  "page.wave.cycle": "cycle",
-  "page.wave.sec": "s",
+  "page.wave.cycle": "rate",
+  "page.wave.sec": "cycles/s",
   "page.wave.mirrorTime": "time reverse",
   "page.wave.mirrorAmp": "flip",
   "page.hist.wave": "waveform"

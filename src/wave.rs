@@ -260,11 +260,14 @@ pub struct WaveSpec {
     pub mirror_amp: bool,
 }
 
+/// The WHOLE range is the default the panel offers too. A wave that silently
+/// swept 25..75 would spend two thirds of the hand-drawn travel on nothing, and
+/// the number the user reads back would not be the number they asked for.
 fn band_lo() -> f64 {
-    25.0
+    0.0
 }
 fn band_hi() -> f64 {
-    75.0
+    100.0
 }
 fn one_sec() -> f64 {
     1.0
@@ -302,11 +305,14 @@ impl WaveSpec {
 /// Overwrite rows `[lo, hi)` of a level track with `spec`'s wave, and hand
 /// `vmarg` the wave's own speed over those rows.
 ///
-/// Both tracks, not just `level`: the gap filler hunts rows whose |vmarg| is
-/// under `still_eps`, and a wave's own floor is exactly where it is slowest --
-/// so a manual fill that only wrote levels would offer its own valleys up as
-/// "still" and get rhythm stamped over them. False when the spec names a wave
-/// this build does not have, or when the range is empty.
+/// Both tracks, and BOTH SIGNS. `level` is what the piece IS; `vmarg` is what
+/// makes the styler see it: `compose` cuts a shot into strokes on this track's
+/// sign flips (`style::crossings`), so a wave handed over as a magnitude reads
+/// as one endless up-stroke and is composited back out as a single ramp -- the
+/// amplitude survives, the shape the user drew does not. The tracked `.abs()`
+/// readers (the gap filler's stillness test, `stroke_veto`) take their own
+/// magnitude, so a signed track costs them nothing. False when the spec names
+/// a wave this build does not have, or when the range is empty.
 pub fn fill_rows(
     level: &mut [f64],
     vmarg: &mut [f64],
@@ -336,9 +342,13 @@ pub fn fill_rows(
     for i in lo..hi {
         level[i] = spec.level_at(w, (times[i] - t0) / 1000.0, &eff);
     }
+    // SIGNED forward difference, off the wave itself rather than off the row
+    // that follows, so the last row of a piece has a real slope (the wave is a
+    // function of time, so its next value exists past `hi`) and the track never
+    // ends on a fabricated zero.
     for i in lo..hi {
-        let nxt = if i + 1 < hi { level[i + 1] } else { level[i] };
-        vmarg[i] = ((nxt - level[i]) / dt).abs();
+        let t = (times[i] - t0) / 1000.0;
+        vmarg[i] = (spec.level_at(w, t + dt, &eff) - level[i]) / dt;
     }
     true
 }
@@ -453,6 +463,55 @@ mod tests {
         );
         let q = g.eval(0.25, &p);
         assert!((q - 0.25).abs() < 1e-9, "linear is exactly linear");
+    }
+
+    /// `fill_rows` hands the styler a SIGNED marginal, and this is why.
+    ///
+    /// `compose` cuts a shot into strokes on that track's sign flips
+    /// (`style::crossings`). A wave handed over as a magnitude has no flips at
+    /// all, so the whole piece reads as one endless up-stroke and composites
+    /// back out as a single ramp: the amplitude survives, the shape the user
+    /// drew does not. That was the bug this test pins.
+    #[test]
+    fn fill_rows_writes_both_signs_so_a_drawn_wave_keeps_its_shape() {
+        let n = 30; // one second on a 30 rows/s grid
+        let times: Vec<f64> = (0..n).map(|i| i as f64 * 1000.0 / 30.0).collect();
+        let spec = WaveSpec {
+            id: "triangle".to_string(),
+            lo: 0.0,
+            hi: 100.0,
+            period_s: 1.0,
+            params: Params::new(),
+            mirror_time: false,
+            mirror_amp: false,
+        };
+        let mut level = vec![50.0; n];
+        let mut vmarg = vec![0.0; n];
+        assert!(fill_rows(&mut level, &mut vmarg, &times, 0, n, &spec));
+        // the band the user typed, not a model's: 0..100 starts at the floor
+        assert!(level[0].abs() < 1e-6, "starts at the floor, got {}", level[0]);
+        assert!(
+            level.iter().cloned().fold(f64::NEG_INFINITY, f64::max) > 95.0,
+            "the triangle must reach the ceiling it was given"
+        );
+        // both directions present
+        assert!(vmarg.iter().any(|&v| v > 1e-6), "no rising rows");
+        assert!(
+            vmarg.iter().any(|&v| v < -1e-6),
+            "a magnitude track reads as one endless up-stroke"
+        );
+        let flips = vmarg.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+        assert!(flips >= 1, "the marginal never changed sign, so one stroke");
+        // and it is the DRAWN slope, not a fabricated one
+        let dt = 1.0 / 30.0;
+        for i in 0..n - 1 {
+            let want = (level[i + 1] - level[i]) / dt;
+            assert!(
+                (vmarg[i] - want).abs() < 1e-6,
+                "row {i}: vmarg {} vs the drawn step {want}",
+                vmarg[i]
+            );
+        }
     }
 
     #[test]
