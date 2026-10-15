@@ -22,9 +22,17 @@
 //!   retuned constant. The aim was made against the picture, not against the
 //!   recipe.
 //!
-//! What the page deliberately does NOT do is change WHEN a rect changes: the
-//! segment starts are the detected cuts, and a rect that moved mid-shot would
-//! be a camera move the source never had. It edits which rect a shot gets.
+//! What the page deliberately does NOT do is move a rect WITHIN a shot on its
+//! own: a rect changes where a segment starts, and a segment start is a place
+//! in the video a person has to name. So the page CAN add, move and remove
+//! those starts -- a long shot whose subject walks out of the rect is exactly
+//! the case a detector cannot call and a person can -- and what it still never
+//! invents is a rect that drifts mid-segment.
+//!
+//! Those starts are the crop's own: they are seeded from the detected cuts, but
+//! the models read the video through `cuts` themselves, so splitting a shot
+//! here changes what a person is shown and nothing about what the goblins see.
+//! Two different questions, two different lists, deliberately.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -44,6 +52,10 @@ struct Session {
     auto: Vec<(usize, Rect)>,
     /// A rect here was drawn by hand rather than voted for.
     hand: Vec<bool>,
+    /// A segment START was placed or moved here rather than detected. Only
+    /// these make the page hand back a plan it otherwise would not: a plan
+    /// whose rects are all the probe's is the cache entry that already exists.
+    moved: bool,
     fps: f64,
     dur_ms: f64,
     /// The frame's own aspect (w/h), so the page can keep a drawn rect the
@@ -53,6 +65,29 @@ struct Session {
 }
 
 impl Session {
+    fn frames(&self) -> f64 {
+        (self.dur_ms / 1000.0 * self.fps).max(1.0)
+    }
+    /// A start the page may place: on the frame grid, inside the clip, and
+    /// strictly between its neighbours. Every edit lands through here, so the
+    /// page cannot make a list `SegmentedDecoder::open` would refuse.
+    fn clamp_frame(&self, i: usize, frame: f64) -> Option<usize> {
+        if !frame.is_finite() {
+            return None;
+        }
+        let last = self.frames() - 1.0;
+        // segment 0 is the clip's own start and is not a boundary
+        let lo = if i == 0 { 0.0 } else { self.segs[i - 1].0 as f64 + 1.0 };
+        let hi = if i + 1 < self.segs.len() {
+            self.segs[i + 1].0 as f64 - 1.0
+        } else {
+            last
+        };
+        if hi < lo {
+            return None;
+        }
+        Some(frame.round().clamp(lo, hi) as usize)
+    }
     fn json(&self) -> serde_json::Value {
         let segs: Vec<serde_json::Value> = self
             .segs
@@ -77,6 +112,9 @@ impl Session {
             "fps": self.fps,
             "aspect": self.aspect,
             "cap": crate::autocrop::MIN_SIDE_FRAC,
+            // whether anything at all has been moved, so the page can say
+            // "this is yours now" without diffing two lists
+            "edited": self.moved || self.hand.iter().any(|&h| h),
         })
     }
 }
@@ -115,6 +153,7 @@ pub fn edit(
             plan.segs.clone()
         },
         hand: vec![false; plan.segs.len()],
+        moved: false,
         fps,
         dur_ms,
         aspect,
@@ -148,16 +187,28 @@ pub fn edit(
 /// (which the review page prints, and which a drawn rect does not re-measure).
 fn finish(state: &Arc<Mutex<Session>>, src: &Plan) -> Option<Plan> {
     let s = state.lock().unwrap();
-    if !s.hand.iter().any(|&h| h) {
+    if !s.hand.iter().any(|&h| h) && !s.moved {
         return None;
     }
     // consecutive equal rects are one decode segment again: the merge the
-    // probe does for its own rects, redone now that some of them moved
+    // probe does for its own rects, redone now that some of them moved. A
+    // boundary the page placed between two halves that ended up with the SAME
+    // rect is not a boundary the decoder can use, so it goes -- and it is not
+    // lost work: a split exists to give the two halves different rects.
     let mut segs: Vec<(usize, Rect)> = Vec::with_capacity(s.segs.len());
     for &(start, r) in &s.segs {
         match segs.last() {
             Some(&(_, last)) if same(last, r) => {}
             _ => segs.push((start, r)),
+        }
+    }
+    // ...and the same rule at the very first frame: a plan whose first segment
+    // does not start the clip is refused by the decoder (is_runnable)
+    if segs.first().map(|s| s.0) != Some(0) {
+        if let Some(first) = segs.first_mut() {
+            first.0 = 0;
+        } else {
+            return None;
         }
     }
     Some(Plan {
@@ -201,6 +252,12 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             let v = apply(state, &body);
+            let _ = req.respond(json_response(&v));
+        }
+        (Method::Post, "/api/cuts") => {
+            let mut body = String::new();
+            let _ = req.as_reader().read_to_string(&mut body);
+            let v = apply_cuts(state, &body);
             let _ = req.respond(json_response(&v));
         }
         (Method::Post, "/api/done") => {
@@ -254,11 +311,112 @@ fn apply(state: &Arc<Mutex<Session>>, body: &str) -> serde_json::Value {
     v
 }
 
+/// One posted change to the segment STARTS -- the boundaries between the rects,
+/// which is the "where does this shot end" question the probe cannot always
+/// answer and the person watching can.
+///
+/// `{"op":"add","frame":F}` splits the segment containing frame F in two;
+/// `{"op":"move","i":i,"frame":F}` drags boundary i (segment i's own start);
+/// `{"op":"del","i":i}` takes boundary i out and gives its frames to the shot
+/// before it. Boundary 0 is the clip's own start and cannot be moved or
+/// removed, only added to.
+///
+/// A new shot inherits the whole of the one it came out of -- its rect, the
+/// probe's rect behind it and whether that rect was hand-drawn -- so splitting
+/// is never a change to the picture on its own. Moving the boundary is.
+fn apply_cuts(state: &Arc<Mutex<Session>>, body: &str) -> serde_json::Value {
+    let mut s = state.lock().unwrap();
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return serde_json::json!({"ok": false}),
+    };
+    let frame = v.get("frame").and_then(|x| x.as_f64());
+    let i = v.get("i").and_then(|x| x.as_i64()).unwrap_or(-1);
+    match v.get("op").and_then(|x| x.as_str()) {
+        Some("add") => {
+            let Some(frame) = frame else {
+                return serde_json::json!({"ok": false});
+            };
+            // which segment is this frame in? the last one that starts at or
+            // before it -- the page's own rule, so the two agree
+            let mut at = 0usize;
+            for (k, &(f, _)) in s.segs.iter().enumerate() {
+                if f as f64 <= frame {
+                    at = k;
+                }
+            }
+            let last = s.frames() - 1.0;
+            if at == 0 && frame.round() <= 0.0 {
+                return s.json(); // the clip's own start is not a split
+            }
+            if frame.round() >= last {
+                return s.json();
+            }
+            if at + 1 < s.segs.len() && s.segs[at + 1].0 as f64 <= frame.round() {
+                return s.json(); // a boundary is already there
+            }
+            // the split takes the frame the pointer named, so the new shot
+            // begins exactly where the person pointed
+            let f = frame.round().clamp(1.0, last) as usize;
+            if s.segs.iter().any(|&(g, _)| g == f) {
+                return s.json();
+            }
+            let (start, rect) = s.segs[at];
+            let auto = s.auto.get(at).copied().unwrap_or((start, rect));
+            let hand = s.hand.get(at).copied().unwrap_or(false);
+            s.segs.insert(at + 1, (f, rect));
+            s.auto.insert(at + 1, (f, auto.1));
+            s.hand.insert(at + 1, hand);
+            s.moved = true;
+        }
+        Some("move") => {
+            let Some(frame) = frame else {
+                return serde_json::json!({"ok": false});
+            };
+            if i <= 0 || i as usize >= s.segs.len() {
+                return s.json();
+            }
+            let k = i as usize;
+            let Some(f) = s.clamp_frame(k, frame) else {
+                return s.json();
+            };
+            if f == s.segs[k].0 {
+                return s.json();
+            }
+            s.segs[k].0 = f;
+            // the probe's own rect for a boundary it never drew is the one
+            // beside it: "auto" for a shot the person invented is the rect the
+            // shot it came out of would get
+            if let Some(a) = s.auto.get_mut(k) {
+                a.0 = f;
+            }
+            s.moved = true;
+        }
+        Some("del") => {
+            if i <= 0 || i as usize >= s.segs.len() {
+                return s.json();
+            }
+            let k = i as usize;
+            s.segs.remove(k);
+            if k < s.auto.len() {
+                s.auto.remove(k);
+            }
+            if k < s.hand.len() {
+                s.hand.remove(k);
+            }
+            s.moved = true;
+        }
+        _ => return serde_json::json!({"ok": false}),
+    }
+    let v = s.json();
+    drop(s);
+    v
+}
+
 /// A rect the decode can be handed: inside the frame, no smaller than the zoom
 /// cap on either axis, and made of real numbers. `None` refuses it outright --
 /// the page keeps what it had rather than showing a rect nothing will honour.
-fn legal(r: Rect) -> Option<Rect> {
-    let (x, y, w, h) = r;
+fn legal(r: Rect) -> Option<Rect> {    let (x, y, w, h) = r;
     if ![x, y, w, h].iter().all(|v| v.is_finite()) {
         return None;
     }
@@ -291,6 +449,7 @@ mod tests {
             auto: segs.clone(),
             hand: vec![false; segs.len()],
             segs,
+            moved: false,
             fps: 30.0,
             dur_ms: 60_000.0,
             aspect: 16.0 / 9.0,
@@ -439,5 +598,183 @@ mod tests {
         // off the frame: brought back inside it, whole
         let r = legal((0.9, -0.5, 0.8, 0.8)).unwrap();
         assert!(r.0 + r.2 <= 1.0 + 1e-12 && r.1 >= 0.0);
+    }
+
+    // ---- the segment starts -------------------------------------------------
+    // A shot is a run of frames with one rect. Splitting one is the edit the
+    // probe cannot make -- a subject that walks out of the rect mid-shot is
+    // exactly the case a person watching can call -- so these are the rules
+    // that keep that edit from producing a plan the decoder would refuse.
+
+    /// Splitting gives the new half the whole of the old one, so the picture
+    /// does not change on its own; only the boundary does.
+    #[test]
+    fn a_split_inherits_the_shot_it_came_out_of() {
+        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        apply(&s, r#"{"i":0,"rect":[0.2,0.2,0.7,0.7]}"#);
+        let after = apply_cuts(&s, r#"{"op":"add","frame":300}"#);
+        assert_eq!(after["segs"].as_array().unwrap().len(), 3);
+        // frames 300 and 900, the new one exactly where it was asked for
+        assert_eq!(after["segs"][1]["t_ms"].as_f64().unwrap(), 10_000.0);
+        assert_eq!(after["segs"][2]["t_ms"].as_f64().unwrap(), 30_000.0);
+        // the half that came out of shot 0 carries shot 0's hand-drawn rect,
+        // and is marked hand-drawn with it
+        assert!((after["segs"][1]["rect"][0].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert!(after["segs"][1]["hand"].as_bool().unwrap());
+        // the plan that comes back is the page's, and runnable
+        let p = finish(&s, &src).expect("a placed boundary is a plan");
+        assert!(p.manual);
+        assert!(p.is_runnable());
+    }
+
+    /// A boundary is a place in the video, so it has to land on the frame grid
+    /// and between its neighbours -- the page cannot make a list the decoder
+    /// would refuse, whatever it posts.
+    #[test]
+    fn a_moved_boundary_stays_on_the_grid_and_between_its_neighbours() {
+        let (_, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY, (0.2, 0.2, 0.7, 0.7)]);
+        // 900 -> 1200, the last frame before the next boundary at 1800
+        let a = apply_cuts(&s, r#"{"op":"move","i":1,"frame":1200.4}"#);
+        assert_eq!(a["segs"][1]["t_ms"].as_f64().unwrap(), 40_000.0);
+        // dragged past its right neighbour: pinned to one frame short of it
+        let b = apply_cuts(&s, r#"{"op":"move","i":1,"frame":999999}"#);
+        assert_eq!(b["segs"][1]["t_ms"].as_f64().unwrap(), 1799.0 / 30.0 * 1000.0);
+        // ...and past its left neighbour, likewise
+        let c = apply_cuts(&s, r#"{"op":"move","i":1,"frame":-50}"#);
+        assert_eq!(c["segs"][1]["t_ms"].as_f64().unwrap(), 1.0 / 30.0 * 1000.0);
+        // the clip's own start is not a boundary and never moves
+        let d = apply_cuts(&s, r#"{"op":"move","i":0,"frame":500}"#);
+        assert_eq!(d["segs"][0]["t_ms"].as_f64().unwrap(), 0.0);
+    }
+
+    /// A boundary is only a boundary if the two shots around it end up
+    /// different: the plan that leaves is merged the way the probe merges its
+    /// own, so splitting is not "one more segment" for its own sake.
+    #[test]
+    fn a_split_between_two_equal_rects_does_not_survive_the_merge() {
+        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        apply_cuts(&s, r#"{"op":"add","frame":300}"#);
+        let p = finish(&s, &src).expect("a placed boundary is a plan on its own");
+        assert_eq!(p.segs.len(), 2, "the two halves still share one rect");
+        // ...but give one of them its own rect and the split is real
+        apply(&s, r#"{"i":1,"rect":[0.35,0.1,0.7,0.7]}"#);
+        let p = finish(&s, &src).unwrap();
+        assert_eq!(p.segs.len(), 3);
+        assert_eq!(p.segs[1].0, 300);
+    }
+
+    /// Removing a boundary gives its frames back to the shot before it, and
+    /// nothing else about the plan changes.
+    #[test]
+    fn a_removed_boundary_hands_its_frames_back() {
+        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), (0.2, 0.2, 0.7, 0.7), IDENTITY]);
+        let a = apply_cuts(&s, r#"{"op":"del","i":1}"#);
+        assert_eq!(a["segs"].as_array().unwrap().len(), 2);
+        // what was the third shot is now the second, at its own frame
+        assert_eq!(a["segs"][1]["t_ms"].as_f64().unwrap(), 60_000.0);
+        assert!((a["segs"][0]["rect"][0].as_f64().unwrap() - 0.1).abs() < 1e-9);
+        // the clip's own start is not removable: the list is unchanged
+        let b = apply_cuts(&s, r#"{"op":"del","i":0}"#);
+        assert_eq!(b["segs"].as_array().unwrap().len(), 2);
+        // and a boundary the page placed survives into the plan it hands over
+        let p = finish(&s, &src).expect("a removed boundary is a plan too");
+        assert_eq!(p.segs.len(), 2);
+        assert_eq!(p.segs[1].0, 1800);
+    }
+
+    /// The page end to end over its own socket, for the boundary route: the
+    /// state it publishes, a split posted into it, and Done handing back a
+    /// plan with three shots in it.
+    #[test]
+    fn the_page_takes_a_split_and_hands_back_the_plan_it_makes() {
+        use std::io::{BufRead, BufReader, Write};
+        let _guard = crate::cancel::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::cancel::reset();
+        let (plan, _) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let worker = std::thread::spawn(move || {
+            edit(Path::new("no-such-video.mp4"), &plan, 60_000.0, 30.0, 16.0 / 9.0, false, &|url| {
+                let _ = tx.send(url.to_string());
+            })
+        });
+        let url = rx.recv_timeout(Duration::from_secs(5)).expect("the page announces itself");
+        let addr = url
+            .strip_prefix("http://")
+            .map(|a| a.trim_end_matches('/').to_string())
+            .expect("an http address");
+
+        let ask = |req: &str| -> String {
+            let mut s = std::net::TcpStream::connect(&addr).expect("the page is listening");
+            if s.write_all(req.as_bytes()).is_err() {
+                return String::new();
+            }
+            let mut r = BufReader::new(s);
+            let mut len = 0usize;
+            loop {
+                let mut l = String::new();
+                match r.read_line(&mut l) {
+                    Ok(0) | Err(_) => return String::new(),
+                    Ok(_) => {}
+                }
+                if let Some(n) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = n.trim().parse().unwrap_or(0);
+                }
+                if l.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; len];
+            match std::io::Read::read_exact(&mut r, &mut body) {
+                Ok(()) => String::from_utf8_lossy(&body).to_string(),
+                Err(_) => String::new(),
+            }
+        };
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let before: serde_json::Value = serde_json::from_str(&ask(
+            "GET /api/state HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        ))
+        .expect("state is json");
+        assert_eq!(before["segs"].as_array().unwrap().len(), 2);
+        assert!(!before["edited"].as_bool().unwrap());
+
+        let after: serde_json::Value =
+            serde_json::from_str(&ask(&post("/api/cuts", r#"{"op":"add","frame":450}"#)))
+                .expect("the post answers with the new state");
+        assert_eq!(after["segs"].as_array().unwrap().len(), 3);
+        assert!(after["edited"].as_bool().unwrap());
+        // and the new shot is a real shot the page can then aim on its own
+        let aimed: serde_json::Value =
+            serde_json::from_str(&ask(&post("/api/rects", r#"{"i":1,"rect":[0.3,0.3,0.6,0.6]}"#)))
+                .expect("the post answers with the new state");
+        assert!(aimed["segs"][1]["hand"].as_bool().unwrap());
+
+        ask(&post("/api/done", "{}"));
+        let got = worker.join().expect("the page thread ends").expect("no error");
+        let got = got.expect("a moved boundary is a plan");
+        assert!(got.manual);
+        assert_eq!(got.segs.len(), 3);
+        assert_eq!(got.segs[1].0, 450);
+        assert!(got.is_runnable());
+    }
+
+    /// A plan whose first segment does not start the clip is one the decoder
+    /// refuses, so the page's own answer is never allowed to be one.
+    #[test]
+    fn the_handed_back_plan_always_starts_at_frame_zero() {
+        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        {
+            let mut g = s.lock().unwrap();
+            g.segs[0].0 = 12;   // as if something upstream had moved the start
+            g.moved = true;
+        }
+        let p = finish(&s, &src).expect("a moved boundary is a plan");
+        assert_eq!(p.segs[0].0, 0);
+        assert!(p.is_runnable());
     }
 }

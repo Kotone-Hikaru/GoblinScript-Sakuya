@@ -7,6 +7,7 @@
 <head>
 <meta charset="utf-8">
 <title>GoblinScript crop</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCA2NCA2NCc+PHBhdGggZD0nTTIyIDIwIEwyNiAzIEwzMSAxOCBaJyBmaWxsPScjN2NiMzQyJy8+IDxwYXRoIGQ9J000MiAyMCBMMzggMyBMMzMgMTggWicgZmlsbD0nIzdjYjM0MicvPiA8cGF0aCBkPSdNMjAgNDYgTDkgMzYgTTQ0IDQ2IEw1NSAzNicgc3Ryb2tlPScjN2NiMzQyJyBzdHJva2Utd2lkdGg9JzQnIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcvPiA8cGF0aCBkPSdNMjggNTUgTDI2IDYyIE0zNiA1NSBMMzggNjInIHN0cm9rZT0nIzdjYjM0Micgc3Ryb2tlLXdpZHRoPSc0JyBzdHJva2UtbGluZWNhcD0ncm91bmQnLz4gPHJlY3QgeD0nMjQnIHk9JzQwJyB3aWR0aD0nMTYnIGhlaWdodD0nMTUnIHJ4PSc0JyBmaWxsPScjOGJjMzRhJy8+IDxlbGxpcHNlIGN4PSczMicgY3k9JzI4JyByeD0nMTcnIHJ5PScxNScgZmlsbD0nIzhiYzM0YScvPiA8Y2lyY2xlIGN4PScyNScgY3k9JzI3JyByPSc0Ljc1JyBmaWxsPScjZjFmOGU5Jy8+IDxjaXJjbGUgY3g9JzM5JyBjeT0nMjcnIHI9JzQuNzUnIGZpbGw9JyNmMWY4ZTknLz4gPGNpcmNsZSBjeD0nMjUuNScgY3k9JzI3LjUnIHI9JzIuNScgZmlsbD0nIzFiM2ExMicvPiA8Y2lyY2xlIGN4PSczOC41JyBjeT0nMjcuNScgcj0nMi41JyBmaWxsPScjMWIzYTEyJy8+IDxlbGxpcHNlIGN4PSczMicgY3k9JzMzJyByeD0nMicgcnk9JzInIGZpbGw9JyM2ODlmMzgnLz4gPHBhdGggZD0nTTI2IDM3LjUgUTMyIDQyLjUgMzggMzcuNScgZmlsbD0nbm9uZScgc3Ryb2tlPScjMWIzYTEyJyBzdHJva2Utd2lkdGg9JzIuNCcgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJy8+PC9zdmc+">
 <style>
   :root {
     --bg: #0e130c; --panel: #151d14; --panel-2: #1b241a; --edge: #4c6144;
@@ -63,6 +64,17 @@
   #hover { position: absolute; top: 0; bottom: 0; width: 1px; z-index: 2;
            background: var(--hi-bright); opacity: .7; }
   #buffer { position: absolute; top: 0; height: 3px; z-index: 2; background: var(--edge); }
+  /* The boundaries between shots, as things a hand can take hold of. They are
+     the ONE part of the bar that is a target rather than paint: the bar itself
+     stays a scrub, because judging a rect means dragging it, and a band that
+     swallowed every drag would take that away. */
+  #tl .cut { position: absolute; top: 0; bottom: 0; width: 11px; margin-left: -5px;
+             z-index: 2; cursor: col-resize; pointer-events: auto;
+             touch-action: none; }
+  #tl .cut::after { content: ''; position: absolute; left: 5px; top: 0; bottom: 0;
+                    width: 2px; background: var(--hi-bright);
+                    box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+  #tl .cut:hover::after, #tl .cut.drag::after { background: var(--danger); }
   #tlwrap { position: relative; }
   #tltime { position: absolute; bottom: 100%; transform: translateX(-50%);
             background: var(--panel); border: 1px solid var(--edge);
@@ -118,11 +130,14 @@
       <button id="next" data-t="cpage.next">shot after</button>
       <button id="loop" data-t="cpage.loop">loop this shot</button>
       <button id="gview" data-t="cpage.gview">goblin view</button>
+      <button id="split" data-t="cpage.split">split here</button>
+      <button id="unsplit" data-t="cpage.unsplit">join back</button>
       <span class="note" id="clock">0:00 / 0:00</span>
       <span class="note" id="zoom"></span>
     </div>
     <div class="note" id="hint" data-t="cpage.hint">Drag the rect to move it. Drag a corner to change its size. The goblins see only what is inside the rect.</div>
-    <div class="note" id="keys" data-t="cpage.keys">Drag the bar to scrub. Space plays. Left and right step one frame, with Shift one second. Up and down go from shot to shot. L loops the shot, G shows the goblins' own view. W A S D move the rect, + and - change its size, R gives the shot back to the goblins.</div>
+    <div class="note" id="cuthint" data-t="cpage.cut.hint">A shot is a run of frames with one rect. To give part of a shot its own rect, put the playhead there and split it &mdash; or drag a boundary on the bar above. The goblins read the video's own cuts, which are a different list, so nothing here changes what they see.</div>
+    <div class="note" id="keys" data-t="cpage.keys">Drag the bar to scrub. Space plays. Left and right step one frame, with Shift one second. Up and down go from shot to shot. L loops the shot, G shows the goblins' own view. W A S D move the rect, + and - change its size, R gives the shot back to the goblins. Enter splits the shot at the playhead, Delete joins it back.</div>
     <div class="note warn" id="shape" hidden data-t="cpage.shape">This rect is not the shape of the video. The goblins were trained on the shape of the source.</div>
   </div>
   <div id="side">
@@ -172,14 +187,18 @@ async function load() {
   applyLang();
   await pull();
 }
-async function pull(body) {
+async function pull(body, path) {
   const r = body
-    ? await fetch('/api/rects', { method: 'POST', body: JSON.stringify(body) })
+    ? await fetch(path || '/api/rects', { method: 'POST', body: JSON.stringify(body) })
     : await fetch('/api/state');
   const s = await r.json();
   if (!s.segs) return;
   segs = s.segs; dur = s.dur_ms || 1; fps = s.fps || 30;
   aspect = s.aspect || 16 / 9; cap = s.cap || 0.6667;
+  // The list can now SHRINK -- a boundary can be taken back out -- so the
+  // selected shot has to be brought back inside it. Every read of `segs[cur]`
+  // below depends on this, and a dangling index throws on the next repaint.
+  cur = Math.min(Math.max(cur, 0), Math.max(0, segs.length - 1));
   drawAll();
 }
 
@@ -270,6 +289,7 @@ function drawShots() {
 function drawTimeline() {
   const tl = $('tl');
   [...tl.querySelectorAll('.seg')].forEach(e => e.remove());
+  [...tl.querySelectorAll('.cut')].forEach(e => e.remove());
   segs.forEach((s, i) => {
     const end = i + 1 < segs.length ? segs[i + 1].t_ms : dur;
     const d = document.createElement('div');
@@ -279,7 +299,22 @@ function drawTimeline() {
     d.style.width = Math.max(100 * (end - s.t_ms) / dur, 0.2) + '%';
     tl.appendChild(d);
   });
+  // The boundaries, as grabs. Boundary 0 is the clip's own start: it is where
+  // the first shot begins, not a cut, so it gets no handle and the page never
+  // posts a move for it.
+  for (let i = 1; i < segs.length; i++) {
+    const h = document.createElement('div');
+    // this bar redraws itself on every drag move, handles included, so the one
+    // being dragged has to be told it is still being dragged -- otherwise the
+    // highlight would blink off the instant the pointer moved
+    h.className = 'cut' + (cutDrag && cutDrag.i === i ? ' drag' : '');
+    h.dataset.i = String(i);
+    h.title = T('cpage.cut.tip');
+    h.style.left = (100 * segs[i].t_ms / dur) + '%';
+    tl.appendChild(h);
+  }
   $('head').style.left = (100 * vid.currentTime * 1000 / dur) + '%';
+  labelCut();
 }
 
 // ---- editing -------------------------------------------------------------
@@ -313,6 +348,89 @@ addEventListener('pointerup', () => {
   post({ i: cur, rect: segs[cur].rect });
 });
 async function post(body) { await pull(body); }
+async function postCuts(body) { await pull(body, '/api/cuts'); }
+
+// ---- the shot boundaries --------------------------------------------------
+// A shot is a run of frames with one rect, and the boundaries are where that
+// run changes. They are seeded from the video's detected cuts -- which is what
+// makes a shot a shot -- but they are THIS page's list, not the one the goblins
+// read: the models cut the video themselves. So splitting a shot here says
+// "show me two rects over this", never "the video has a cut here".
+//
+// Everything lands on the frame grid the page already steps on, and the server
+// clamps it again on arrival -- this side clamps too, so a drag never shows a
+// boundary somewhere the answer will not put it.
+function msAtX(clientX) {
+  const b = tl.getBoundingClientRect();
+  return clamp((clientX - b.left) / b.width, 0, 1) * dur;
+}
+function frameAtX(clientX) { return Math.round(msAtX(clientX) / 1000 * fps); }
+function frames() { return Math.max(1, Math.round(dur / 1000 * fps)); }
+/** The frame boundary `i` may take: on the grid, and strictly between its
+ *  neighbours. Boundary 0 is the clip's own start and is not up for moving. */
+function clampFrame(i, f) {
+  const last = frames() - 1;
+  const lo = i <= 0 ? 0 : Math.round(segs[i - 1].t_ms / 1000 * fps) + 1;
+  const hi = i + 1 < segs.length ? Math.round(segs[i + 1].t_ms / 1000 * fps) - 1 : last;
+  return Math.min(Math.max(f, lo), Math.max(lo, hi));
+}
+/** The boundary within half a second of the playhead, or -1. This is the one
+ *  Delete would take out, and the one the hint names. */
+function boundaryNear() {
+  const ms = vid.currentTime * 1000;
+  let best = -1, bestD = Infinity;
+  for (let i = 1; i < segs.length; i++) {
+    const d = Math.abs(segs[i].t_ms - ms);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return bestD <= 500 ? best : -1;
+}
+function splitHere() {
+  const at = segAt(vid.currentTime * 1000);
+  // the frame the playhead is on, and never the frame the shot already starts
+  // at -- a split there would be an empty shot
+  const f = Math.round(vid.currentTime * 1000 / 1000 * fps);
+  const lo = Math.round(segs[at].t_ms / 1000 * fps) + 1;
+  if (f < lo || f > frames() - 1) return;
+  postCuts({ op: 'add', frame: f });
+}
+function unsplitHere() {
+  const i = boundaryNear();
+  if (i < 0) return;
+  postCuts({ op: 'del', i });
+}
+function labelCut() {
+  const el = $('cuthint');
+  if (!el) return;
+  const i = boundaryNear();
+  el.textContent = (i < 0) ? T('cpage.cut.hint')
+                           : T('cpage.cut.here', { t: fmt(segs[i].t_ms), shot: i + 1 });
+}
+$('split').onclick = splitHere;
+$('unsplit').onclick = unsplitHere;
+
+// a drag on a boundary moves it. The bar itself stays a scrub, so this is the
+// only thing on it that is a target rather than paint.
+//
+// The helpers live here, but the LISTENERS that use them are registered far
+// below, next to the transport's own: `tl` is a `const` declared down there,
+// and a top-level `tl.addEventListener` up here would run before it exists --
+// which stops the whole script, `load()` included, on a temporal dead zone.
+let cutDrag = null;
+function cutHandleAt(target) {
+  return (target && target.closest) ? target.closest('#tl .cut') : null;
+}
+function onCutMove(e) {
+  const i = cutDrag.i;
+  const f = clampFrame(i, frameAtX(e.clientX));
+  segs[i].t_ms = f / fps * 1000;
+  drawTimeline();
+  const t = $('tltime');
+  t.textContent = fmt(f / fps * 1000);
+  const b = tl.getBoundingClientRect();
+  t.style.left = (e.clientX - b.left) + 'px';
+  t.classList.remove('hidden');
+}
 
 $('lock').onclick = () => { lock = !lock; $('lock').classList.toggle('on', lock); };
 $('auto').onclick = () => post({ i: cur, rect: null });
@@ -375,6 +493,30 @@ addEventListener('pointerup', e => {
   if (resume) vid.play();
 });
 
+// ---- grabbing a boundary instead ------------------------------------------
+// Registered HERE, after `tl` exists. Capture phase, and only for a press that
+// landed on a handle: everything else on the bar keeps being the scrub above,
+// which is why a press that misses a handle simply falls through to it.
+tl.addEventListener('pointerdown', e => {
+  const h = cutHandleAt(e.target);
+  if (!h) return;
+  cutDrag = { i: parseInt(h.dataset.i, 10) };
+  try { tl.setPointerCapture(e.pointerId); } catch (err) { /* nothing to capture */ }
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+addEventListener('pointermove', e => { if (cutDrag) onCutMove(e); });
+addEventListener('pointerup', e => {
+  if (!cutDrag) return;
+  const d = cutDrag;
+  cutDrag = null;
+  try { tl.releasePointerCapture(e.pointerId); } catch (err) { /* already gone */ }
+  offBar();
+  // the server clamps again on arrival; posting the same frame twice is a no-op,
+  // so a press that never moved still lands somewhere legal
+  postCuts({ op: 'move', i: d.i, frame: clampFrame(d.i, frameAtX(e.clientX)) });
+});
+
 $('play').onclick = () => vid.paused ? vid.play() : vid.pause();
 $('back').onclick = () => step(-1);
 $('fwd').onclick = () => step(1);
@@ -414,7 +556,7 @@ function render() {
     b.classList.remove('hidden');
   }
   const i = segAt(ms);
-  if (i !== cur) { cur = i; drawAll(); } else { drawRect(); }
+  if (i !== cur) { cur = i; drawAll(); } else { drawRect(); labelCut(); }
 }
 for (const ev of ['timeupdate', 'seeked', 'seeking', 'play', 'pause']) {
   vid.addEventListener(ev, render);
@@ -434,6 +576,10 @@ addEventListener('resize', drawRect);
 // drawn on), WASD nudges the rect, R puts the goblins' own rect back.
 addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
+  // a focused button already answers Enter and Space itself: letting the page
+  // handle them too would fire both, so a split would land on whatever button
+  // was last clicked as well
+  if (e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
   const d = e.shiftKey ? 0.02 : 0.005;
   const r = segs.length ? segs[cur].rect.slice() : null;
   switch (e.key) {
@@ -456,6 +602,10 @@ addEventListener('keydown', e => {
     case '-': r[2] += d; r[3] += d; nudge(r); break;
     case 'r': $('auto').onclick(); break;
     case 'R': $('autoall').onclick(); break;
+    // splitting a shot: the boundary is what a person can call and a detector
+    // cannot, so it is a key and not a hidden gesture
+    case 'Enter': e.preventDefault(); splitHere(); break;
+    case 'Delete': case 'Backspace': e.preventDefault(); unsplitHere(); break;
   }
 });
 function nudge(r) { segs[cur].rect = fix(r); drawRect(); post({ i: cur, rect: segs[cur].rect }); }
