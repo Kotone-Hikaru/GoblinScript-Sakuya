@@ -92,6 +92,12 @@ pub struct Choice {
     pub cuts_ms: Option<Vec<f64>>,
 }
 
+/// The span "model" that is not a model: a manual fill. A piece wearing it is
+/// written by a waveform the user dialled in (`Span::wave`) instead of by any
+/// bundle, so it needs no head pass, no latents and no model at all -- and the
+/// leading `__` keeps it out of every real pack name's way.
+pub const MANUAL: &str = "__manual";
+
 /// One stretch of a script written by its own model, in video milliseconds on
 /// the clip's clock (`lo_ms` inclusive, `hi_ms` exclusive). The page edits
 /// these; the styler splices the named model's tracks in over those rows.
@@ -100,6 +106,11 @@ pub struct Span {
     pub lo_ms: f64,
     pub hi_ms: f64,
     pub model: String,
+    /// Present exactly when `model` is [`MANUAL`]: the waveform to write this
+    /// piece with. Absent on every ordinary span, so an older page's spans and
+    /// every session before this existed still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave: Option<crate::wave::WaveSpec>,
 }
 
 /// The manifest's "normal" values for the two preset axes. The page shows each
@@ -361,6 +372,64 @@ impl Work {
     }
 }
 
+/// The page served at `/`.
+///
+/// A `review.html` sitting BESIDE THE EXE wins over the copy baked in at build
+/// time. That is the whole point: a dev exe can be handed the page as a loose
+/// file, so a layout tweak costs a copy and a browser reload instead of a
+/// rebuild. Detected per request, not cached, so replacing the file is enough.
+///
+/// Deliberately narrow: the exe's own directory only. Walking up into the
+/// source tree would mean a SHIPPED exe quietly serving a page from a checkout
+/// it happens to sit next to -- and there the page and the binary are free to
+/// disagree, which is the one thing this must never allow.
+fn page_html() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Ok(s) = std::fs::read_to_string(dir.join("review.html")) {
+                return s;
+            }
+        }
+    }
+    include_str!("review.html").to_string()
+}
+
+/// Percent-decoding, for the two query strings this server reads. Values are
+/// numbers and easing names -- all ASCII -- so this stays deliberately small,
+/// but it still refuses to guess: a malformed `%` is left alone rather than
+/// mangling the name it is part of.
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn handle(
     mut req: tiny_http::Request,
     clips: &[Clip],
@@ -371,11 +440,15 @@ fn handle(
     work: &Work,
 ) -> Flow {
     let url = req.url().to_string();
-    let mut parts = url.trim_matches('/').split('/');
+    // Strip the query BEFORE splitting: without this a route whose name would
+    // be the first path segment arrives as `wave_preview?id=...` and matches
+    // nothing at all.
+    let path = url.split_once('?').map(|(p, _)| p).unwrap_or(&url);
+    let mut parts = path.trim_matches('/').split('/');
     match (req.method().clone(), parts.next().unwrap_or("")) {
         (Method::Get, "") => {
             let _ = req.respond(
-                Response::from_string(include_str!("review.html"))
+                Response::from_string(page_html())
                     .with_header(header("Content-Type", "text/html; charset=utf-8")),
             );
         }
@@ -389,6 +462,50 @@ fn handle(
         // applies it once at boot rather than on every re-style.
         (Method::Get, "lang") => {
             let _ = req.respond(json_response(&crate::lang::catalog_json()));
+        }
+        // The waveforms as data: ids, knobs, ranges, the shapes themselves.
+        // Read per request (see wave.rs), so editing waves.json and reloading
+        // the page IS the edit loop for a shape -- no rebuild anywhere in it.
+        (Method::Get, "waves") => {
+            let _ = req.respond(json_response(&crate::wave::value()));
+        }
+        // One cycle of one wave, sampled, for the panel's thumbnail. The page
+        // sends its current knob values, so the curve it draws is the curve the
+        // export will write -- the page owns no second copy of the maths.
+        (Method::Get, "wave_preview") => {
+            let q = req
+                .url()
+                .split_once('?')
+                .map(|(_, q)| q.to_string())
+                .unwrap_or_default();
+            let mut id = String::new();
+            let mut n = 160usize;
+            let mut given: crate::wave::Params = Default::default();
+            for kv in q.split('&').filter(|s| !s.is_empty()) {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                let v = url_decode(v);
+                if k == "id" {
+                    id = v;
+                } else if k == "n" {
+                    n = v.parse().unwrap_or(160);
+                } else if let Ok(num) = v.parse::<f64>() {
+                    given.insert(k.to_string(), crate::wave::Val::Num(num));
+                } else {
+                    given.insert(k.to_string(), crate::wave::Val::Str(v));
+                }
+            }
+            let body = match crate::wave::load().get(&id) {
+                Some(w) => {
+                    let p = w.resolve(&given);
+                    serde_json::json!({
+                        "id": id,
+                        "periodic": w.periodic,
+                        "v": w.sample(&p, n.min(2048)),
+                    })
+                }
+                None => serde_json::json!({ "error": format!("no wave {id}") }),
+            };
+            let _ = req.respond(json_response(&body));
         }
         (Method::Get, "script") => {
             if let Some(c) = parts.next().and_then(|i| i.parse::<usize>().ok()).and_then(|i| clips.get(i)) {
@@ -704,7 +821,19 @@ fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
     let dur = clip.duration_ms;
     let mut out: Vec<Span> = Vec::new();
     for mut s in spans {
-        if !clip.models.iter().any(|m| m.name == s.model) {
+        // A manual piece names no bundle, so it is exempt from the model test
+        // -- but it has to carry a recipe, or there is nothing to write it
+        // with and it would silently become a model piece.
+        if s.model == MANUAL {
+            match &s.wave {
+                Some(w) => {
+                    if w.id.is_empty() {
+                        continue;
+                    }
+                }
+                None => continue,
+            }
+        } else if !clip.models.iter().any(|m| m.name == s.model) {
             continue;
         }
         s.lo_ms = s.lo_ms.clamp(0.0, dur);
@@ -1219,7 +1348,7 @@ mod tests {
         let base = Choice {
             model: "a".into(),
             compare: None,
-            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into() }],
+            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None }],
             cuts_ms: None,
         };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
@@ -1240,9 +1369,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into() },
-                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into() },
-                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into() },
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None },
             ]
         );
         // an empty list is a real answer: back to one model over the whole clip
@@ -1477,6 +1606,120 @@ mod tests {
             bad.is_empty(),
             "a local shadows the page's own state, so the read above it throws in the temporal \
              dead zone -- rename the local:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    /// A flush-left line that reads a binding the script declares FURTHER DOWN
+    /// dies in the temporal dead zone, and a dead top-level line stops the WHOLE
+    /// script -- `load()` included, so the page comes up empty and says nothing
+    /// about why. That is how the crop page once shipped: a
+    /// `tl.addEventListener(...)` sat above `const tl = $('tl')`, and every
+    /// later step of that page was silently missing.
+    ///
+    /// The guard above catches the shadowing form of the same trap; this catches
+    /// the ordering form. Only what a top-level statement reads WHERE IT STANDS
+    /// is examined, so a binding used inside a function body or an arrow is left
+    /// alone -- those run later, which is the normal way a page is written.
+    #[test]
+    fn no_top_level_line_reads_a_binding_declared_below_it() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        fn ident(s: &str) -> &str {
+            let n = s
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(s.len());
+            &s[..n]
+        }
+        /// Every name a flush-left `let`/`const`/`var` line binds: `let a = [],
+        /// b = []` binds two. Only commas at bracket depth zero separate, so a
+        /// list inside an initializer is not mistaken for more bindings.
+        fn names(line: &str) -> Vec<String> {
+            let mut chunks = Vec::new();
+            let mut depth = 0i32;
+            let mut start = 0usize;
+            for (i, b) in line.bytes().enumerate() {
+                match b {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b',' if depth == 0 => {
+                        chunks.push(&line[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            chunks.push(&line[start..]);
+            let mut out = Vec::new();
+            for c in chunks {
+                let c = c.trim();
+                let c = ["let ", "const ", "var "]
+                    .iter()
+                    .find_map(|k| c.strip_prefix(k))
+                    .unwrap_or(c)
+                    .trim();
+                let name = ident(c);
+                // a destructuring pattern binds names this cannot chase, and a
+                // lone `$` is not a name anyone reads back out of a statement
+                if name.chars().next().is_some_and(|c| c.is_alphabetic()) {
+                    out.push(name.to_string());
+                }
+            }
+            out
+        }
+
+        let mut bad = Vec::new();
+        for page in ["review.html", "cropedit.html", "vr.html"] {
+            let html = std::fs::read_to_string(dir.join(page)).expect("a page is missing");
+            let all: Vec<&str> = html.lines().collect();
+            let open = all
+                .iter()
+                .position(|l| l.trim_start().starts_with("<script>"))
+                .expect("the page has no <script>");
+            let close = all[open..]
+                .iter()
+                .position(|l| l.trim_start().starts_with("</script>"))
+                .map(|i| open + i)
+                .unwrap_or(all.len());
+
+            let mut declared: Vec<(String, usize)> = Vec::new();
+            for (i, line) in all[open..close].iter().enumerate() {
+                if line.starts_with(char::is_whitespace) {
+                    continue; // indented: not a top-level declaration
+                }
+                if !matches!(line.split_whitespace().next(), Some("let" | "const" | "var")) {
+                    continue;
+                }
+                for name in names(line) {
+                    declared.push((name, open + i));
+                }
+            }
+
+            for (i, line) in all[open..close].iter().enumerate() {
+                if line.starts_with(char::is_whitespace) {
+                    continue; // indented: inside a body, so it runs later
+                }
+                let head = ident(line);
+                // `x.y`, `x(...)`, `x[...]` is a read of x where it stands; a
+                // bare word is a declaration, a label, or nothing at all
+                if head.is_empty() || !line[head.len()..].starts_with(['.', '(', '[']) {
+                    continue;
+                }
+                if let Some((_, at)) = declared.iter().find(|(n, _)| n == head) {
+                    if *at > open + i {
+                        bad.push(format!(
+                            "{page}:{} reads `{head}` at top level, but it is declared at line {}",
+                            open + i + 1,
+                            at + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a top-level line reads a binding declared below it, so the script stops there in \
+             the temporal dead zone and the page never finishes booting:\n  {}",
             bad.join("\n  ")
         );
     }

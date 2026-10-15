@@ -565,6 +565,13 @@ pub struct StyleCfg {
     pub amp_cap_x_rows: Vec<f64>,
     /// Per-row twin of `amp_cap_f0`; same emptiness rule.
     pub amp_cap_f0_rows: Vec<f64>,
+    /// Manual-fill pieces, in milliseconds on the clip's clock. EMPTY = the
+    /// usual draft. These rows were drawn by hand, so two stages keep off
+    /// them: `shape_actions` skips its intensity scale (the band the user
+    /// typed IS the answer, not a knob to be multiplied), and the gap filler
+    /// treats them as never-still. Everything else -- extrema, RDP, seams,
+    /// the speed cap -- applies as usual.
+    pub manual_ms: Vec<(f64, f64)>,
     /// The hedge curve's exponent.
     pub env_gain_p: f64,
     pub plat_thr: f64,
@@ -1215,10 +1222,21 @@ pub fn flags_line(p: &Params) -> String {
 /// about mid-range, `range` maps 0..100 onto the device's span, `max_speed`
 /// then caps how fast consecutive actions may move (so the cap reads final
 /// device units). The model's draft upstream is untouched.
-pub fn shape_actions(actions: &mut [Action], p: &Params) {
+///
+/// `manual_ms` are the hand-drawn pieces. Their positions skip the intensity
+/// scale: a manual band is not a model's guess to be nudged by a whole-clip
+/// knob -- the two numbers the user typed ARE the answer, and multiplying them
+/// would move the floor and ceiling they set. Everything after that (range,
+/// the speed cap) applies to them like anything else.
+pub fn shape_actions(actions: &mut [Action], p: &Params, manual_ms: &[(f64, f64)]) {
     let (lo, hi) = p.range;
     for a in actions.iter_mut() {
-        let x = (50.0 + (a.pos as f64 - 50.0) * p.intensity).clamp(0.0, 100.0);
+        let k = if in_manual(manual_ms, a.at as f64) {
+            1.0
+        } else {
+            p.intensity
+        };
+        let x = (50.0 + (a.pos as f64 - 50.0) * k).clamp(0.0, 100.0);
         a.pos = (lo + x / 100.0 * (hi - lo)).round() as i64;
     }
     if p.max_speed > 0.0 {
@@ -1238,6 +1256,26 @@ pub fn shape_actions(actions: &mut [Action], p: &Params) {
             }
         }
     }
+}
+
+/// Is `t` (milliseconds on the clip's clock) inside a hand-drawn piece?
+fn in_manual(spans: &[(f64, f64)], t: f64) -> bool {
+    spans.iter().any(|&(a, b)| t >= a && t < b)
+}
+
+/// The rows a set of millisecond spans covers, `[lo, hi)`, clamped to `n`.
+/// `times` is the row clock, so this is the same partition the styler itself
+/// uses -- a boundary that falls inside a row belongs to the row it lands in.
+fn manual_rows(times: &[f64], spans: &[(f64, f64)], n: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(a, b) in spans {
+        let lo = times.partition_point(|&t| t < a).min(n);
+        let hi = times.partition_point(|&t| t < b).min(n);
+        if hi > lo {
+            out.push((lo, hi));
+        }
+    }
+    out
 }
 
 /// Row spans where `m` is true, as `[a, b)`.
@@ -2041,7 +2079,13 @@ pub fn compose(
         (None, _) => p,
     };
     let (p, filled) = if cfg.filler_gap_s > 0.0 {
-        fill_still_spans(&p, &t.vmarg, &t.level, cfg)
+        fill_still_spans(
+            &p,
+            &t.vmarg,
+            &t.level,
+            cfg,
+            &manual_rows(times_ms, &cfg.manual_ms, t.vmarg.len()),
+        )
     } else {
         (p, Vec::new())
     };
@@ -2098,6 +2142,7 @@ fn fill_still_spans(
     vmarg: &[f64],
     level: &[f64],
     cfg: &StyleCfg,
+    protect: &[(usize, usize)],
 ) -> (Vec<f64>, Vec<(usize, usize)>) {
     let fps = cfg.fps;
     let dt = 1.0 / fps;
@@ -2108,6 +2153,16 @@ fn fill_still_spans(
     let lv: Vec<f64> = level.iter().map(|&v| if v.is_finite() { v } else { 50.0 }).collect();
     let base = box_same(&lv, k);
     let mut still: Vec<bool> = sm.iter().map(|&s| s < cfg.still_eps).collect();
+    // Hand-drawn rows are never still. A wave's own floor IS its slowest point,
+    // so left alone the filler would read every valley as an invitation and
+    // stamp a rhythm over the piece the user just dialled in. Cleared on the
+    // FLAG rather than by inflating vmarg, so every other reader of that track
+    // -- stroke_veto, the amplitude bound -- still sees the wave's real speed.
+    for &(a, b) in protect {
+        for i in a.min(still.len())..b.min(still.len()) {
+            still[i] = false;
+        }
+    }
     let gap_rows = rows_at(cfg.filler_gap_s, fps, false);
     let min_real = rows_at(cfg.filler_min_real_s, fps, false);
     let max_bridge = rows_at(cfg.filler_max_bridge_s, fps, false);
@@ -2251,7 +2306,13 @@ pub fn compose_level_full(
         p
     };
     if cfg.filler_gap_s > 0.0 {
-        fill_still_spans(&p, &t.vmarg, &t.level, cfg)
+        fill_still_spans(
+            &p,
+            &t.vmarg,
+            &t.level,
+            cfg,
+            &manual_rows(times_ms, &cfg.manual_ms, t.vmarg.len()),
+        )
     } else {
         (p, Vec::new())
     }
@@ -2994,14 +3055,14 @@ mod tests {
         // 75 units over 200 ms is 375 pos/s -- inside the device cap, so the
         // defaults have nothing to do to it
         let mut a = vec![Action { at: 0, pos: 13 }, Action { at: 200, pos: 88 }];
-        shape_actions(&mut a, &Params::default());
+        shape_actions(&mut a, &Params::default(), &[]);
         assert_eq!((a[0].pos, a[1].pos), (13, 88));
     }
 
     #[test]
     fn max_speed_caps_the_step() {
         let mut a = vec![Action { at: 0, pos: 0 }, Action { at: 1000, pos: 100 }];
-        shape_actions(&mut a, &Params { max_speed: 40.0, ..Params::default() });
+        shape_actions(&mut a, &Params { max_speed: 40.0, ..Params::default() }, &[]);
         assert_eq!(a[1].pos, 40); // 40 units/s over one second
     }
 
@@ -3011,11 +3072,11 @@ mod tests {
         // this on every list it writes; a draft that ships it is a decode the
         // harness never scored.
         let mut a = vec![Action { at: 0, pos: 13 }, Action { at: 67, pos: 88 }];
-        shape_actions(&mut a, &Params::default());
+        shape_actions(&mut a, &Params::default(), &[]);
         assert_eq!(a[1].pos, 53); // 13 + trunc(600 * 0.067)
         // ...and 0 is still the way out of it
         let mut b = vec![Action { at: 0, pos: 13 }, Action { at: 67, pos: 88 }];
-        shape_actions(&mut b, &Params { max_speed: 0.0, ..Params::default() });
+        shape_actions(&mut b, &Params { max_speed: 0.0, ..Params::default() }, &[]);
         assert_eq!(b[1].pos, 88);
     }
 
@@ -3024,7 +3085,7 @@ mod tests {
         // 1 ms at 600 pos/s allows 0.6 units: rounding would write 1 and hand
         // back 1000 pos/s, which is the bug this clamp exists to prevent.
         let mut a = vec![Action { at: 0, pos: 50 }, Action { at: 1, pos: 90 }];
-        shape_actions(&mut a, &Params::default());
+        shape_actions(&mut a, &Params::default(), &[]);
         assert_eq!(a[1].pos, 50);
     }
 
@@ -3053,6 +3114,7 @@ mod tests {
             amp_cap_x: 0.0,
             amp_cap_f0: 0.0,
             amp_cap_x_rows: Vec::new(),
+            manual_ms: Vec::new(),
             amp_cap_f0_rows: Vec::new(),
             env_gain_p: 0.6,
             plat_thr: 0.5,
@@ -3112,7 +3174,7 @@ mod tests {
         let level = vec![50.0; n];
         // a garbage carrier that wiggles off the level everywhere
         let p: Vec<f64> = (0..n).map(|i| 50.0 + ((i % 7) as f64) - 3.0).collect();
-        let (out, spans) = fill_still_spans(&p, &v, &level, &filler_cfg());
+        let (out, spans) = fill_still_spans(&p, &v, &level, &filler_cfg(), &[]);
         assert!((out[0] - p[0]).abs() < 1e-9); // clip-start seam = carrier
         // deep inside the first gap the wiggle is GONE: the track is the
         // level base +- the wave, whose extremes hit 50 +- 20
@@ -3158,7 +3220,7 @@ mod tests {
         let p = vec![40.0; n];
         let mut cfg = filler_cfg();
         cfg.filler_min_real_s = 2.0;
-        let (out, spans) = fill_still_spans(&p, &v, &level, &cfg);
+        let (out, spans) = fill_still_spans(&p, &v, &level, &cfg, &[]);
         // the whole clip is ONE filled gap: the island is gone
         assert_eq!(spans, vec![(0, n)]);
         // deep inside, the rhythm asserts exactly (peak row: base + amp)
@@ -3179,7 +3241,7 @@ mod tests {
         }
         let level = vec![50.0; n];
         let p = vec![40.0; n];
-        let (out, spans) = fill_still_spans(&p, &v, &level, &filler_cfg());
+        let (out, spans) = fill_still_spans(&p, &v, &level, &filler_cfg(), &[]);
         assert_eq!(spans.len(), 2);
         assert_eq!(&out[210..250], &p[210..250]); // island untouched
         assert!((out[0] - 40.0).abs() < 1e-9); // seam = carrier
@@ -3209,17 +3271,17 @@ mod tests {
             (0..n).map(|i| 40.0 + 20.0 * i as f64 / (n - 1) as f64).collect();
         let p = vec![40.0; n];
         let cfg = filler_cfg();
-        let (w1, s1) = fill_still_spans(&p, &v, &level, &cfg);
+        let (w1, s1) = fill_still_spans(&p, &v, &level, &cfg, &[]);
         assert_eq!(s1.len(), 2); // island kept: two filled runs, one gap
         assert_eq!(&w1[420..440], &p[420..440]);
         let mut cfg_h = filler_cfg();
         cfg_h.filler_model_w = 0.5;
-        let (wh, sh) = fill_still_spans(&p, &v, &level, &cfg_h);
+        let (wh, sh) = fill_still_spans(&p, &v, &level, &cfg_h, &[]);
         assert_eq!(sh, vec![(0, n)]); // bar risen past the island
         assert!((wh[430] - p[430]).abs() > 0.5);
         let mut cfg_0 = filler_cfg();
         cfg_0.filler_model_w = 0.0;
-        let (w0, s0) = fill_still_spans(&p, &v, &level, &cfg_0);
+        let (w0, s0) = fill_still_spans(&p, &v, &level, &cfg_0, &[]);
         assert_eq!(s0, vec![(0, n)]);
         // rate 60/min at 30 fps: one full period = 60 rows. Anchored
         // base -> equal values a period apart; level base -> drift
@@ -3240,7 +3302,7 @@ mod tests {
         }
         let level = vec![50.0; n];
         let p = vec![40.0; n];
-        let (out, spans) = fill_still_spans(&p, &v, &level, &filler_cfg());
+        let (out, spans) = fill_still_spans(&p, &v, &level, &filler_cfg(), &[]);
         assert!(spans.is_empty());
         assert_eq!(out, p);
     }
@@ -3258,7 +3320,7 @@ mod tests {
         cfg.filler_pattern = FillerPattern::Burst;
         cfg.filler_burst = 2;
         cfg.filler_rest_s = 1.0;
-        let (out, _) = fill_still_spans(&p, &v, &level, &cfg);
+        let (out, _) = fill_still_spans(&p, &v, &level, &cfg, &[]);
         assert!((out[75] - 50.0).abs() < 1e-9); // rest: parked at base
         // first full-strength burst peak (past the seam ramp): x = 3.5
         // legs -> cycle pos 0.5 -> +amp

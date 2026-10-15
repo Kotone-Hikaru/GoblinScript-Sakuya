@@ -364,8 +364,80 @@
   .segrow .n { flex: 0 0 auto; color: var(--hi-dim); font: 700 10px var(--chrome); }
   /* a shot row is a time and a delete: the time grows, the ✕ sits at the end */
   .segrow .x { flex: 0 0 auto; margin-left: auto; padding: 0 6px; line-height: 1.4; }
+  /* the piece's own confidence: ONE number, no ramp, no second series -- a
+     readout this narrow says how sure and nothing else */
+  .segrow .cf { flex: 0 0 auto; min-width: 30px; text-align: right;
+                font: 11px var(--chrome); color: var(--ink-soft); }
+  .segrow .cf.lo { color: var(--danger-soft); }
   .segnote { font-size: 11px; color: var(--ink-soft); opacity: .85; }
+  /* The manual-fill panel. It exists only while a hand-drawn piece is the
+     selected one, and it is `hidden` rather than styled away so nothing about
+     a model piece ever shows a wave control. */
+  .wavepanel { display: flex; flex-direction: column; gap: 5px; margin-top: 5px;
+               padding: 6px; border: 1px solid var(--edge); }
+  .wavepanel[hidden] { display: none; }
+  .wphead { font: 700 10px var(--chrome); letter-spacing: .06em;
+            color: var(--hi-dim); }
+  .wprow { display: flex; align-items: center; gap: 6px; font-size: 11px;
+           flex-wrap: wrap; }
+  .wprow > label { flex: 0 0 auto; color: var(--ink-soft); }
+  /* NOT `.fine`: that class is taken (and hidden) elsewhere on this page */
+  .wpnum { width: 54px; font-size: 11px; }
+  .wprow select { flex: 1 1 0; min-width: 0; font-size: 11px; }
+  .wpsp { flex: 1 1 auto; }
+  .wpnote { font-size: 10px; color: var(--ink-soft); opacity: .8; }
+  .wpnote.bad { color: var(--danger-soft); opacity: 1; }
+  #wpThumb { width: 100%; height: 70px; border: 1px solid var(--edge);
+             background: rgba(0,0,0,.35); }
+  /* the legend is the one place the two layers are named in words: the bar
+     carries colours and dashes, which mean nothing until they are spelled out */
+  .legend { font-size: 11px; color: var(--ink-soft); opacity: .8;
+            display: flex; flex-direction: column; gap: 1px; margin-top: 2px; }
+  .legend i { font-style: normal; display: inline-block; width: 22px; }
+  .legend .band { color: var(--hi-bright); }
+  .legend .ammo { color: #e0a04a; }   /* ARTIFACT_AMBER: the cut ticks */
   #drawer .sec-h { display: block; }
+  /* The history readout says WHAT the next Ctrl+Z takes back, not just how
+     many are queued: a count alone is the thing that made undo unreadable. */
+  .histline { font: 11px var(--chrome); color: var(--ink-soft); opacity: .9; }
+  .histline b { color: var(--hi-bright); font-weight: 700; }
+
+  /* The bar's own transport switch, next to the speed it already owns. Both
+     modes sit on screen at once and the lit half is the one you are in, so
+     "how do I get to edit" is answered by looking rather than by clicking to
+     find out. Each half sets the mode it names -- neither is a toggle. */
+  .modesw { display: inline-flex; border: 2px solid var(--edge); }
+  .modesw .mode { border: 0; padding: 2px 9px; background: var(--panel-2);
+                  text-transform: none; letter-spacing: 0; }
+  .modesw .mode + .mode { border-left: 2px solid var(--edge); }
+  .modesw .mode:hover { background: color-mix(in srgb, var(--hi) 14%, var(--panel-2)); }
+  .modesw .mode.on { background: color-mix(in srgb, var(--hi) 32%, var(--panel-2));
+                     color: var(--hi-bright); }
+  .modesw .mode:active { padding: 2px 9px; }
+
+  /* what Ctrl+Z just took back, said in words -- transient, never a lock */
+  #toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+           background: rgba(0,0,0,.86); border: 1px solid var(--edge);
+           color: var(--ink); font: 12px var(--chrome); padding: 5px 12px;
+           opacity: 0; pointer-events: none; transition: opacity .18s;
+           z-index: 40; white-space: nowrap; }
+  #toast.on { opacity: 1; }
+
+  /* A right-click on the bar is where the two layers are easiest to reach, so
+     the bar answers with its own menu rather than the browser's. */
+  #tlmenu { position: fixed; z-index: 50; min-width: 172px; display: none;
+            background: var(--panel); border: 2px solid var(--edge);
+            padding: 3px; box-shadow: 0 6px 20px rgba(0,0,0,.5); }
+  #tlmenu.on { display: block; }
+  #tlmenu .mi { display: flex; align-items: center; gap: 6px; padding: 3px 8px;
+                font: 12px var(--chrome); cursor: pointer; white-space: nowrap; }
+  #tlmenu .mi:hover { background: var(--panel-2); color: var(--hi-bright); }
+  #tlmenu .mi.on { color: var(--hi-bright); }
+  #tlmenu .mi .sw { width: 9px; height: 9px; flex: 0 0 auto;
+                    border: 1px solid var(--edge); }
+  #tlmenu .mh { padding: 4px 8px 2px; margin-top: 3px;
+                border-top: 1px solid var(--edge);
+                font: 700 10px var(--chrome); color: var(--hi-dim); }
 
   /* Narrow windows have no flanks to spend, so the rail lies back down under
      the stage as a dock: the same sections, wrapped into rows, capped at a
@@ -437,23 +509,61 @@
           <button type="button" id="magBtn" class="tool"
                   data-t-title="page.spans.magnet.tip"><b>S</b> <span data-t="page.spans.magnet">snap</span></button>
         </div>
+        <!-- two layers meet on this bar and they look nothing alike, so the
+             legend names them once instead of leaving it to the tooltips -->
+        <div class="legend">
+          <span><i class="band">▬</i><span data-t="page.spans.legend.band">band = the model that writes that piece (right-click the bar to change it)</span></span>
+          <span><i class="ammo">┊</i><span data-t="page.spans.legend.cut">tick = the video's own shot cut &mdash; press B to move one, which re-runs the models (about half a minute)</span></span>
+          <span><i>S</i><span data-t="page.spans.legend.snap">snap = while dragging a piece edge, land it on the nearest shot cut</span></span>
+        </div>
         <div class="drow">
           <button type="button" id="segCut" data-t-title="page.spans.cutat.tip">✂ <span
                   data-t="page.spans.cutat">cut at the playhead</span></button>
           <button type="button" id="segMerge" data-t-title="page.spans.merge.tip">⇥⇤ <span
                   data-t="page.spans.merge">merge right</span></button>
-          <button type="button" id="segUndo" data-t-title="page.spans.undo.tip">↶ <span id="undoN">0</span></button>
-          <button type="button" id="segRedo" data-t-title="page.spans.redo.tip">↷ <span id="redoN">0</span></button>
+          <button type="button" id="segUndo" data-t-title="page.hist.undo.tip">↶ <span id="undoN">0</span></button>
+          <button type="button" id="segRedo" data-t-title="page.hist.redo.tip">↷ <span id="redoN">0</span></button>
         </div>
+        <div id="histNote" class="histline"></div>
         <div id="segList" class="seglist"></div>
         <div id="segNote" class="segnote"></div>
+        <!-- Manual fill. Shows only while the selected piece is a hand-drawn
+             one: wave, band, cadence and the two mirrors. Every control here
+             re-posts the spans, and the server redraws that piece's rows from
+             the wave alone -- no model sees it, so nothing needs re-running. -->
+        <div id="wavePanel" class="wavepanel" hidden>
+          <div class="wphead" data-t="page.wave.head">manual fill</div>
+          <div class="wprow">
+            <label data-t="page.wave.wave">wave</label>
+            <select id="wpId"></select>
+          </div>
+          <div class="wprow">
+            <label data-t="page.wave.band">band</label>
+            <input id="wpLo" class="wpnum" type="number" min="0" max="100" step="1">
+            <span data-t="page.wave.to">to</span>
+            <input id="wpHi" class="wpnum" type="number" min="0" max="100" step="1">
+            <span class="wpsp"></span>
+            <label data-t="page.wave.cycle">cycle</label>
+            <input id="wpPeriod" class="wpnum" type="number" min="0.05" max="30" step="0.05">
+            <span data-t="page.wave.sec">s</span>
+          </div>
+          <div class="wprow">
+            <label><input id="wpMirrorT" type="checkbox"> <span
+                    data-t="page.wave.mirrorTime">time reverse</span></label>
+            <label><input id="wpMirrorA" type="checkbox"> <span
+                    data-t="page.wave.mirrorAmp">flip</span></label>
+            <span class="wpsp"></span>
+            <span id="wpSpeed" class="wpnote"></span>
+          </div>
+          <canvas id="wpThumb" width="520" height="140"></canvas>
+          <div id="wpParams" class="wprow"></div>
+          <div id="wpNote" class="wpnote"></div>
+        </div>
       </div>
       <div class="sec" id="shotSec">
         <span class="sec-h" data-t="page.shots">shot cuts</span>
         <span class="hint" data-t="page.shots.hint">the cuts the video was read with. adding or removing one re-runs the head pass (about half a minute) &mdash; it changes what the models were shown, so the script follows.</span>
         <div class="drow">
-          <button type="button" id="shotUndo" data-t-title="page.shots.undo.tip">↶ <span id="shotUndoN">0</span></button>
-          <button type="button" id="shotRedo" data-t-title="page.shots.redo.tip">↷ <span id="shotRedoN">0</span></button>
           <button type="button" id="shotReset" data-t-title="page.shots.reset.tip"><span
                   data-t="page.shots.reset">reset to detected</span></button>
         </div>
@@ -509,12 +619,24 @@
             <option value="2">2×</option>
           </select>
         </span>
+        <!-- the strip is a transport in one mode and the razor's second bench in
+             the other, and the difference is what a drag means -- so it is a
+             switch you can see, not a hidden modifier. A single button that
+             relabelled itself read as a status line ("am I in edit, or is this
+             the way there?"), so both modes stay on screen and the lit one is
+             where you are -->
+        <span class="modesw" data-t-title="page.strip.tip">
+          <button type="button" id="stripModePlay" class="mode">▶ <span
+                  data-t="page.strip.play">play</span></button>
+          <button type="button" id="stripModeEdit" class="mode">✎ <span
+                  data-t="page.strip.edit">edit</span></button>
+        </span>
         <span id="confcap" class="hidden"></span>
         <span id="cmpcap" class="hidden">
-          <label for="model"><span class="swatch"></span> <span data-t="page.script">script</span></label>
+          <label for="model"><span class="swatch" id="modelSw"></span> <span data-t="page.piece">this piece</span></label>
           <select id="model"></select>
           <button type="button" id="cmpSwap" data-t-title="page.compare.swap.title"
-                  title="swap the script and the line under it (x)">⇄</button>
+                  title="swap your own model and the line under it (x)">⇄</button>
           <label for="cmpSel"><span class="swatch dash"></span> <span data-t="page.compare">vs</span></label>
           <select id="cmpSel"></select>
           <button type="button" id="cmpPin" data-t-title="page.compare.pin.title"
@@ -534,7 +656,6 @@
       </div>
       <div id="err"></div>
     </main>
-
     <aside id="rail">
       <!-- the batch's other scripts, when there are any: style is per script,
            so this is also what says which one the knobs below are editing -->
@@ -730,6 +851,8 @@
       </div>
     </aside>
   </div>
+<div id="toast"></div>
+<div id="tlmenu"></div>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -787,7 +910,10 @@ function applyLang() {
   labelDrawer();
   labelShots();
   labelSuggest();
+  labelHist();      // the history line and the piece rows are the page's words
+  labelStripMode();
   renderShots();   // the per-row delete titles are built in the new language
+  renderSegs();
   renderSuggest();
   document.title = T('page.title');
 }
@@ -819,6 +945,16 @@ let triedFallback = false;
 // model confidence for the current clip: the raw per-row [0,1] track (nulls
 // where unknown), a smoothed copy for display, its row clock, and the clip
 // mean. All null when the bundle has no conf head -- the UI then hides itself.
+//
+// The track is the SPLICED one: the server lays each piece's rows over with the
+// model that wrote that piece, so a razor cut or a model switch moves the rows
+// it covers and nothing else. One mean per piece is therefore that piece's own
+// model answering about that piece. `confSmooth` is the same track run through
+// a ~1.5 s moving average -- the quantity the head is actually supervised on,
+// which is what the band and the live readout want; `confRaw` is kept for the
+// per-piece mean, where an average that bled in rows from the neighbouring
+// piece would be exactly the thing in question.
+let confRaw = null;
 let confSmooth = null;
 let confFps = 30;
 let confRow0 = 0;   // ms of row 0 -- the row clock's offset, not zero
@@ -848,6 +984,9 @@ const C = {
   inkSoft: '#d3e2c7',
   edge: '#4c6144',
   cool: '150,180,200',
+  // Span boundaries. Deliberately NOT one of SPAN_HUES: a cut drawn in some
+  // model's own colour reads as part of the band it is supposed to divide.
+  cut: '#ff3b30',
 };
 /** rgba() from the cool slate at alpha `a` -- the confidence band is that one
  *  hue at a dozen different weights. */
@@ -916,12 +1055,13 @@ async function fetchScript() {
 // Confidence is fixed by the frozen trunk -- fetched once per clip, never on a
 // re-style. `conf: null` (no head in the bundle) hides the readout entirely.
 async function fetchConf() {
-  confSmooth = null; confMean = null;
+  confRaw = null; confSmooth = null; confMean = null;
   try {
     const c = await (await fetch('/conf/' + cur)).json();
     if (c && Array.isArray(c.conf)) {
       confFps = c.fps || 30;
       confRow0 = c.row0 || 0;
+      confRaw = c.conf;
       confSmooth = smoothConf(c.conf, confFps);
       let sum = 0, n = 0;
       for (const v of c.conf) if (v != null) { sum += v; n++; }
@@ -1222,6 +1362,9 @@ async function selectClip(i) {
   shotLoad();      // ...and its own shot cuts
   updateStylingUI();
   await Promise.all([fetchScript(), fetchConf(), fetchCompare()]);
+  // the conf arrives after the pieces do, and every piece row carries a number
+  // off it -- so the list is redrawn once it is here
+  renderSegs();
 }
 
 // ---- models ------------------------------------------------------------------
@@ -1244,7 +1387,11 @@ function syncModels() {
   const sel = $('model');
   sel.innerHTML = '';
   for (const m of models) opt(sel, m.name, m.name);
-  sel.value = c ? c.model : '';
+  // the one entry that is not a model: a hand-drawn piece. It rides this menu
+  // (and the piece list's, and the bar's) so that choosing it needs no new
+  // gesture -- the razor, the selection, undo and the history all just work.
+  opt(sel, MANUAL, '✎ ' + T('page.wave.head'));
+  labelModelSel();
   // the script's own model stays listed, so the menu keeps its order
   // through a swap, but a line cannot lie under itself
   const cmp = $('cmpSel');
@@ -1260,6 +1407,35 @@ function syncModels() {
   renderSegs();
   updateSegNote();
 }
+
+// The menu under the video is the CURRENT PIECE's menu. It shows the model the
+// piece under the playhead is written by, and picking from it re-tags that
+// piece and nothing else. An untouched piece follows the clip's own model, which
+// is what the menu reads while the playhead sits on one of those -- so the menu
+// is still never empty and still says something true everywhere.
+//
+// It used to be the whole script's model, which is why one pick used to repaint
+// the entire timeline's band: every piece that followed the base was dragged
+// along with it. The base is now reached only through the compare row's swap,
+// where changing it is a deliberate act with a visible counterpart.
+let menuPiece = -2, menuModel = null;   // what the menu is currently labelled for
+function syncModelSel(ms) {
+  const sel = $('model');
+  const c = state && state.clips[cur];
+  if (!sel || !c) return;
+  // never yank the list out from under one the user has open
+  if (document.activeElement === sel) return;
+  const i = segAt(ms);
+  const want = (i >= 0 && segs[i]) ? segs[i].model : c.model;
+  if (i === menuPiece && want === menuModel) return;
+  menuPiece = i; menuModel = want;
+  sel.value = want;
+  const sw = $('modelSw');
+  if (sw) sw.style.background = modelColor(want);
+}
+/** Force the next sync to re-label, for the moments the pieces moved under the
+ *  playhead without the playhead moving (a cut, a merge, an applied proposal). */
+function labelModelSel() { menuPiece = -2; menuModel = null; syncModelSel(vid.currentTime * 1000); }
 async function fetchCompare() {
   cmpActions = [];
   if (pinOn[cur]) { cmpActions = pinned[cur].actions; return; }
@@ -1284,18 +1460,23 @@ function swap() {
     pinned[cur] = pinNow();
     cmpActions = pinned[cur].actions;
     seedControls(p.params);
-    $('model').value = p.model;
-    postParams();
+    postParams({ model: p.model });
   } else {
-    $('model').value = v;
-    postParams({ compare: c.model });
+    // the model on the line comes up, and the one that was writing goes under
+    postParams({ model: v, compare: c.model });
   }
 }
-// choosing the compared model for the script is the same swap
+// Picking in the piece menu re-tags the piece under the playhead, and ONLY that
+// piece: the clip's own model is reached through the swap above, so an
+// accidental pick here can no longer rewrite every piece that follows the base.
 $('model').addEventListener('change', () => {
   const c = state.clips[cur];
-  const back = !pinOn[cur] && $('model').value === $('cmpSel').value;
-  postParams(back ? { compare: c.model } : {});
+  const was = menuModel;
+  if (!c || c.styling) { menuModel = null; syncModelSel(vid.currentTime * 1000); return; }
+  const i = segAt(vid.currentTime * 1000);
+  if (i < 0 || !segs[i]) { menuModel = null; syncModelSel(vid.currentTime * 1000); return; }
+  setSegModel(i, $('model').value);
+  if (segs[i].model === was) { menuModel = null; syncModelSel(vid.currentTime * 1000); }
 });
 $('cmpSel').addEventListener('change', () => {
   pinOn[cur] = $('cmpSel').value === '#pinned';
@@ -1349,7 +1530,12 @@ async function postParams(over = {}) {
   syncFillerKnobs();
   const body = {
     clip: cur,  // the change is for the current script only
-    model: $('model').value || undefined,
+    // The clip's OWN model, which is the base every untouched piece follows.
+    // The menu under the video no longer owns it: that menu is the CURRENT
+    // PIECE's (see syncModelSel), so it cannot be read here without sending one
+    // piece's model as the whole script's. A swap names the new base itself, in
+    // `over`, which is why this is the state and not a control.
+    model: (state.clips[cur] || {}).model || undefined,
     compare: (!pinOn[cur] && $('cmpSel').value) || null,
     style: $('style').value,
     dwells: $('dwells').value,
@@ -1417,6 +1603,7 @@ async function settle(epoch) {
   // the file on disk is this change's, now -- and so are the compared line
   // and the confidence, both of which follow the model
   await Promise.all([fetchScript(), fetchCompare(), fetchConf()]);
+  renderSegs();   // ...which is what each piece row's own number is drawn from
 }
 // The one thing the page says while it waits: the knobs stay live (a change
 // mid-style is the supersede case, which is cheaper than making the user wait
@@ -1666,6 +1853,8 @@ document.addEventListener('keydown', e => {
     case 'r': case 'R': setTool('razor'); break;
     case 'b': case 'B': setTool('shot'); break;
     case 's': case 'S': magnet = !magnet; labelMagnet(); break;
+    // the strip's own switch: play is a transport, edit is the razor's bench
+    case 'e': case 'E': setStripEdit(!stripEdit); break;
     // the crop overlay covers the picture it describes, so it wants a switch
     // right under the hand that is already stepping frames
     case 'c': case 'C':
@@ -1740,7 +1929,7 @@ function drawTimeline(ms) {
   tlctx.clearRect(0, 0, w, h);
   // the span bar FIRST, so the elapsed tint and every band below pass over it:
   // one colour per model, cut where the razor cut it (see the drawer)
-  drawSpanBand(X, w, h, dur);
+  drawSpanBand(X, w, h);
   // faint elapsed fill, so progress reads even where nothing else is drawn
   const px = X(ms);
   tlctx.fillStyle = hexA(C.hi, .10);
@@ -1800,6 +1989,9 @@ function drawTimeline(ms) {
       tlctx.fillRect(x, h - bh, 1, bh);
     }
   }
+  // the span boundaries, last of the bands so nothing passes over them; the
+  // playhead still goes on top, it is the thing you move most often
+  drawSpanEdges(tlctx, X, w, h, 20);
   // playhead: a bright line + a little top wedge you can grab
   tlctx.strokeStyle = hexA(C.ink, .9);
   tlctx.lineWidth = 1;
@@ -1840,6 +2032,16 @@ function edgeAt(clientX) {
   }
   return -1;
 }
+/** The span edge within `tol` MILLISECONDS of `ms`, or -1. The timeline asks
+ *  this in pixels (edgeAt); a bar whose window is not the whole clip -- the
+ *  strip in edit mode -- asks in time, because a pixel there is a different
+ *  number of milliseconds depending on how far it is zoomed. */
+function edgeAtMs(ms, tol) {
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (Math.abs(segs[i].hi - ms) <= tol) return i;
+  }
+  return -1;
+}
 // The bar answers to whichever tool is armed. Scrub stays on the bare drag, so
 // the timeline is a scrubber first whatever the tool -- the razor and the
 // shot cutter take only the press they recognize.
@@ -1859,7 +2061,7 @@ timeline.addEventListener('pointerdown', e => {
   }
   const edge = edgeAt(e.clientX);
   if (edge >= 0) {
-    pushSegUndo();
+    pushSegUndo('page.hist.edge', segs[edge].hi);
     dragEdge = edge;
     selSeg = edge;
     renderSegs();
@@ -1912,8 +2114,165 @@ timeline.addEventListener('pointercancel', () => {
   tlDrag = false;
 });
 
+// ---- the bar's own menu ---------------------------------------------------
+// A right-click on the bar is where the two layers are easiest to reach -- cut
+// here, and which model writes the piece under the pointer -- so the bar
+// answers with its own menu instead of the browser's page menu. It is one menu
+// for both bars: the timeline and the strip in edit mode differ in how they map
+// an x to a time, and in nothing else.
+function openBarMenu(clientX, clientY, ms) {
+  const el = $('tlmenu');
+  if (!el) return;
+  const c = state.clips[cur];
+  const i = segAt(ms);
+  selSeg = i;
+  renderSegs();
+  el.innerHTML = '';
+  const item = (fn, cls) => {
+    const d = document.createElement('div');
+    d.className = 'mi' + (cls ? ' ' + cls : '');
+    d.onclick = () => { closeBarMenu(); fn(); };
+    return d;
+  };
+  const head = document.createElement('div');
+  head.className = 'mh';
+  head.textContent = fmtClock(ms);
+  el.append(head);
+
+  const cut = item(() => cutAt(ms));
+  cut.textContent = '✂  ' + T('page.menu.cut');
+  el.append(cut);
+  if (i >= 0 && i + 1 < segs.length) {
+    const merge = item(() => mergeWith(i));
+    merge.textContent = '⇥⇤  ' + T('page.menu.merge');
+    el.append(merge);
+  }
+
+  // the one thing this menu exists for: one piece, one model, no repaint of
+  // everything that follows the base
+  const mh = document.createElement('div');
+  mh.className = 'mh';
+  mh.textContent = i < 0 ? T('page.menu.nowhere') : T('page.menu.model');
+  el.append(mh);
+  if (i >= 0) {
+    const cur0 = segs[i] ? segs[i].model : null;
+    for (const m of ((c && c.models) || [])) {
+      const row = item(() => { setSegModel(i, m.name); selSeg = i; renderSegs(); },
+                       m.name === cur0 ? 'on' : '');
+      const sw = document.createElement('span');
+      sw.className = 'sw';
+      sw.style.background = modelColor(m.name);
+      const tx = document.createElement('span');
+      tx.textContent = (m.name === cur0 ? '● ' : '· ') + m.name;
+      row.append(sw, tx);
+      el.append(row);
+    }
+    // and the thing that is not a model, under a rule so the list is read as
+    // "the models, then the other option"
+    const sep = document.createElement('div');
+    sep.className = 'mh';
+    el.append(sep);
+    const mrow = item(() => { setSegModel(i, MANUAL); selSeg = i; renderSegs(); },
+                      cur0 === MANUAL ? 'on' : '');
+    const msw = document.createElement('span');
+    msw.className = 'sw';
+    msw.style.background = MANUAL_HUE;
+    const mtx = document.createElement('span');
+    mtx.textContent = (cur0 === MANUAL ? '● ' : '· ') + '✎ ' + T('page.wave.head');
+    mrow.append(msw, mtx);
+    el.append(mrow);
+  }
+
+  el.classList.add('on');
+  // measure off-screen, then keep the whole menu inside the window
+  el.style.left = '0px';
+  el.style.top = '0px';
+  const r = el.getBoundingClientRect();
+  el.style.left = Math.max(8, Math.min(clientX, innerWidth - r.width - 8)) + 'px';
+  el.style.top = Math.max(8, Math.min(clientY, innerHeight - r.height - 8)) + 'px';
+}
+function closeBarMenu() {
+  const el = $('tlmenu');
+  if (el) el.classList.remove('on');
+}
+// closing on the press that lands OUTSIDE is what lets a press inside reach its
+// own click; capture phase, so a handler that stops propagation cannot keep the
+// menu open behind it
+addEventListener('pointerdown', e => {
+  if (!e.target || !e.target.closest || !e.target.closest('#tlmenu')) closeBarMenu();
+}, true);
+addEventListener('keydown', e => { if (e.key === 'Escape') closeBarMenu(); });
+addEventListener('blur', closeBarMenu);
+
+timeline.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  openBarMenu(e.clientX, e.clientY, tlMs(e.clientX));
+});
+
 // ---- script strip ----------------------------------------------------------------
 const WINDOW_MS = 30000;  // +-15 s around the playhead
+// The strip is two things depending on the switch in its caption.
+//
+// PLAY is what it has always been: a window that follows the playhead, with a
+// click meaning "jump, relative to the middle". EDIT hands the same bar to the
+// razor. The window stops following -- it would otherwise slide out from under
+// the piece being dragged -- the wheel pans it, ctrl+wheel zooms it, a drag on
+// empty bar scrubs, a drag on a piece edge moves the model's boundary, a click
+// with the razor cuts, and a right-click opens the same menu the timeline has.
+// Nothing about play mode changes; the switch only ADDS.
+let stripEdit = false;
+let sv0 = 0, sv1 = 0;      // edit mode's window, in ms
+let svInit = false;
+let stripDrag = null;      // {kind:'seek'|'edge'|'razor', edge?, x0?}
+/** The strip's window, in ms. Play mode derives it from the playhead every
+ *  frame; edit mode owns it until asked to come back. */
+function stripRange(ms) {
+  if (stripEdit) {
+    if (!svInit) { sv0 = ms - WINDOW_MS / 2; sv1 = ms + WINDOW_MS / 2; svInit = true; }
+    return [sv0, sv1];
+  }
+  return [ms - WINDOW_MS / 2, ms + WINDOW_MS / 2];
+}
+function stripSpan() { return Math.max(1, sv1 - sv0); }
+/** The time under a client X on the strip. */
+function stripMs(clientX) {
+  const b = strip.getBoundingClientRect();
+  const [t0, t1] = stripRange(vid.currentTime * 1000);
+  const f = Math.min(1, Math.max(0, (clientX - b.left) / b.width));
+  return t0 + f * (t1 - t0);
+}
+/** Canvas-local X of a time, for the blade's preview. */
+function stripX(ms) {
+  const [t0, t1] = stripRange(vid.currentTime * 1000);
+  return (ms - t0) / Math.max(1, t1 - t0) * strip.clientWidth;
+}
+/** Keep the window inside the clip: pan back if it ran off, and if it is wider
+ *  than the clip let it show the whole thing. */
+function clampView() {
+  const dur = curDurationMs();
+  if (!(dur > 0)) return;
+  if (sv1 - sv0 >= dur) { sv0 = 0; sv1 = dur; return; }
+  if (sv0 < 0) { sv1 -= sv0; sv0 = 0; }
+  if (sv1 > dur) { sv0 -= sv1 - dur; sv1 = dur; }
+  if (sv0 < 0) { sv0 = 0; sv1 = Math.min(dur, sv0 + WINDOW_MS); }
+}
+function setStripEdit(on) {
+  stripEdit = on;
+  if (on) svInit = false;   // open on wherever the playhead is
+  stripDrag = null;
+  stripRazorX = null;
+  strip.style.cursor = on ? 'ew-resize' : '';
+  labelStripMode();
+  drawStrip(vid.currentTime * 1000);
+}
+function labelStripMode() {
+  const p = $('stripModePlay'), e = $('stripModeEdit');
+  if (!p || !e) return;
+  // the lit half IS the mode: no relabelling, so nothing here needs the
+  // catalog to be re-applied when the language changes
+  p.classList.toggle('on', !stripEdit);
+  e.classList.toggle('on', stripEdit);
+}
 // speed (pos-units/s) -> a cool-to-hot colour, so the strip reads as a heatmap
 // of the script's own intensity. ~500 u/s is already a fast stroke; the ramp
 // saturates there.
@@ -1950,14 +2309,19 @@ canvasBoxes.observe(strip);
 canvasBoxes.observe(timeline);
 function drawStrip(ms) {
   const w = strip.clientWidth, h = strip.clientHeight;
-  const t0 = ms - WINDOW_MS / 2, t1 = ms + WINDOW_MS / 2;
-  const X = t => (t - t0) / WINDOW_MS * w;
+  const [t0, t1] = stripRange(ms);
+  const win = Math.max(1, t1 - t0);
+  const X = t => (t - t0) / win * w;
   const Y = p => 6 + (h - 12) * (1 - p / 100);
   sctx.clearRect(0, 0, w, h);
+  // Edit mode draws the two layers the timeline draws, on this bar's own clock:
+  // without them a boundary would be a thing you drag toward nothing.
+  if (stripEdit) drawStripLayers(X, w, h);
   // second ticks
   sctx.strokeStyle = 'rgba(255,255,255,.05)';
   sctx.beginPath();
-  for (let t = Math.ceil(t0 / 5000) * 5000; t <= t1; t += 5000) {
+  const tickMs = win > 120000 ? 30000 : (win > 40000 ? 10000 : 5000);
+  for (let t = Math.ceil(t0 / tickMs) * tickMs; t <= t1; t += tickMs) {
     sctx.moveTo(X(t), 0); sctx.lineTo(X(t), h);
   }
   sctx.stroke();
@@ -1967,7 +2331,7 @@ function drawStrip(ms) {
   if (confSmooth) {
     const CONF_H = 16;
     for (let x = 0; x < w; x++) {
-      const t = t0 + (x + 0.5) / w * WINDOW_MS;
+      const t = t0 + (x + 0.5) / w * win;
       const i = Math.round((t - confRow0) / 1000 * confFps);
       if (i < 0 || i >= confSmooth.length) continue;
       const v = confSmooth[i];
@@ -2018,16 +2382,172 @@ function drawStrip(ms) {
       }
     }
   }
-  // playhead -- a light line, so it is never mistaken for a hot (fast) segment
+  // playhead -- a light line, so it is never mistaken for a hot (fast) segment.
+  // In play mode it IS the middle, which is where the click's arithmetic puts
+  // it; in edit mode it sits where the video actually is, and carries a wedge
+  // because there it is the thing the hand grabs.
+  const ph = stripEdit ? X(ms) : w / 2;
   sctx.strokeStyle = hexA(C.ink, .85);
   sctx.lineWidth = 1;
-  sctx.beginPath(); sctx.moveTo(w / 2, 0); sctx.lineTo(w / 2, h); sctx.stroke();
+  sctx.beginPath(); sctx.moveTo(ph, 0); sctx.lineTo(ph, h); sctx.stroke();
+  if (stripEdit) {
+    sctx.fillStyle = C.hiBright;
+    sctx.beginPath();
+    sctx.moveTo(ph - 4, 0); sctx.lineTo(ph + 4, 0); sctx.lineTo(ph, 6);
+    sctx.closePath(); sctx.fill();
+  }
+  // same boundaries as the timeline, on this bar's own clock. Above the
+  // playhead so a selected edge is never hidden by it, below the blade.
+  if (stripEdit) drawSpanEdges(sctx, X, w, h, 24);
+  // the blade's preview, over everything, so the cut lands where it is drawn
+  if (stripEdit && tool === 'razor' && stripRazorX != null) {
+    sctx.save();
+    sctx.setLineDash([3, 3]);
+    sctx.strokeStyle = hexA(C.dangerSoft || C.hiBright, .9);
+    sctx.beginPath(); sctx.moveTo(stripRazorX, 0); sctx.lineTo(stripRazorX, h); sctx.stroke();
+    sctx.restore();
+  }
 }
-// a click anywhere on the strip seeks, relative to the centered playhead
+/** The two layers, on the strip's own clock, while it is in edit mode: the band
+ *  that says which model writes each piece, and the ticks that say where the
+ *  video's own shot cuts are. Same shapes as the timeline's, same meaning. */
+function drawStripLayers(X, w, h) {
+  sctx.fillStyle = 'rgba(0,0,0,.30)';
+  sctx.fillRect(0, 0, w, 5);
+  for (const s of segs) {
+    const x0 = Math.max(0, Math.min(w, X(s.lo))), x1 = Math.max(0, Math.min(w, X(s.hi)));
+    if (x1 <= x0) continue;
+    sctx.fillStyle = hexA(modelColor(s.model), s.gap ? .30 : .70);
+    sctx.fillRect(x0, 1, Math.max(1, x1 - x0), 4);
+  }
+  sctx.fillStyle = hexA(ARTIFACT_AMBER, .8);
+  for (const s of shots) {
+    const x = X(s.t_ms);
+    if (x < 0 || x > w) continue;
+    for (let y = 10; y < 22 && y < h; y += 4) sctx.fillRect(x, y, 1, 2);
+  }
+}
+// a click anywhere on the strip seeks, relative to the centered playhead --
+// PLAY mode only. Edit mode owns the pointer instead (below), because there a
+// click is the razor's and a drag is the hand's.
 strip.addEventListener('click', e => {
+  if (stripEdit) return;
   const frac = e.offsetX / strip.clientWidth - 0.5;
   vid.currentTime = Math.max(0, vid.currentTime + frac * WINDOW_MS / 1000);
 });
+// the grab radius, in ms: a fixed number of PIXELS, so it stays the same size
+// under the hand however far the window is zoomed
+function stripTol() { return 7 / Math.max(1, strip.clientWidth) * stripSpan(); }
+
+strip.addEventListener('wheel', e => {
+  if (!stripEdit) return;
+  e.preventDefault();
+  const [t0, t1] = stripRange(vid.currentTime * 1000);
+  const span = Math.max(1, t1 - t0);
+  if (e.ctrlKey || e.metaKey) {
+    // zoom about the pointer, so the moment under it stays where it is
+    const at = stripMs(e.clientX);
+    const k = e.deltaY > 0 ? 1.25 : 0.8;
+    const dur = Math.max(1, curDurationMs());
+    const ns = Math.min(Math.max(span * k, 1000), dur);
+    sv0 = at - (at - t0) * ns / span;
+    sv1 = sv0 + ns;
+  } else {
+    // slide the window; a horizontal wheel (deltaX) is the same gesture
+    const d = (e.deltaY || 0) + (e.deltaX || 0);
+    const step = d / 1000 * span;
+    sv0 += step;
+    sv1 += step;
+  }
+  svInit = true;
+  clampView();
+  drawStrip(vid.currentTime * 1000);
+}, { passive: false });
+
+strip.addEventListener('pointerdown', e => {
+  if (!stripEdit || e.button !== 0) return;
+  strip.setPointerCapture(e.pointerId);
+  const ms = stripMs(e.clientX);
+  if (tool === 'razor') {
+    // both ends of the drag are kept in CANVAS pixels, the blade's own unit --
+    // the timeline's razor works the same way, and mixing in a client X here
+    // would silently drag the cut to the wrong second on a scrolled page
+    stripDrag = { kind: 'razor', x0: stripX(ms) };
+    stripRazorX = stripX(ms);
+    e.preventDefault();
+    return;
+  }
+  if (tool === 'shot') {
+    shotPress(e.clientX, ms, stripTol());
+    e.preventDefault();
+    return;
+  }
+  const edge = edgeAtMs(ms, stripTol());
+  if (edge >= 0) {
+    pushSegUndo('page.hist.edge', segs[edge].hi);
+    stripDrag = { kind: 'edge', edge };
+    selSeg = edge;
+    renderSegs();
+    e.preventDefault();
+    return;
+  }
+  // the bare drag is the playhead: it is the grab this bar has to offer
+  stripDrag = { kind: 'seek' };
+  seekMs(ms);
+  e.preventDefault();
+});
+strip.addEventListener('pointermove', e => {
+  if (!stripEdit) return;
+  if (stripDrag && stripDrag.kind === 'razor') {
+    stripRazorX = stripX(stripMs(e.clientX));
+    drawStrip(vid.currentTime * 1000);
+    return;
+  }
+  if (stripDrag && stripDrag.kind === 'edge') {
+    moveEdge(stripDrag.edge, stripMs(e.clientX));
+    drawStrip(vid.currentTime * 1000);
+    return;
+  }
+  if (stripDrag && stripDrag.kind === 'seek') { seekMs(stripMs(e.clientX)); return; }
+  const ms = stripMs(e.clientX);
+  strip.style.cursor = tool === 'razor' ? 'crosshair'
+    : (tool === 'shot' ? 'copy'
+    : (edgeAtMs(ms, stripTol()) >= 0 ? 'col-resize' : 'ew-resize'));
+});
+strip.addEventListener('pointerup', e => {
+  if (!stripEdit || !stripDrag) return;
+  const d = stripDrag;
+  stripDrag = null;
+  try { strip.releasePointerCapture(e.pointerId); } catch (err) { /* already gone */ }
+  if (d.kind === 'razor') {
+    const x1 = stripX(stripMs(e.clientX));
+    const b = strip.getBoundingClientRect();
+    const a = stripMs(Math.min(d.x0, x1) + b.left);
+    const c = stripMs(Math.max(d.x0, x1) + b.left);
+    stripRazorX = null;
+    if (c - a < 60) cutAt(stripMs(e.clientX)); else razorCut(a, c);
+    return;
+  }
+  if (d.kind === 'edge') { commitSegs(); return; }
+});
+strip.addEventListener('pointercancel', () => {
+  if (stripDrag && stripDrag.kind === 'edge') commitSegs();
+  stripDrag = null;
+  stripRazorX = null;
+});
+strip.addEventListener('contextmenu', e => {
+  // the same menu in either mode: the moment under the pointer is just as well
+  // defined when the window is following the playhead, and the browser's own
+  // page menu has nothing to do with either layer
+  e.preventDefault();
+  openBarMenu(e.clientX, e.clientY, stripMs(e.clientX));
+});
+strip.addEventListener('pointerleave', () => {
+  strip.style.cursor = stripEdit ? 'ew-resize' : '';
+  if (stripDrag && stripDrag.kind === 'razor') { stripRazorX = null; drawStrip(vid.currentTime * 1000); }
+});
+$('stripModePlay').onclick = () => setStripEdit(false);
+$('stripModeEdit').onclick = () => setStripEdit(true);
 
 function tick() {
   const ms = vid.currentTime * 1000;
@@ -2036,6 +2556,9 @@ function tick() {
   drawStrip(ms);
   drawConfReadout(ms);
   drawCrop(ms);
+  // the script menu is the current PIECE's, so it follows the playhead rather
+  // than the clip: this is what makes it agree with the band under the cursor
+  syncModelSel(ms);
   requestAnimationFrame(tick);
 }
 
@@ -2052,30 +2575,40 @@ function tick() {
 // leaves the pieces you placed alone (the untouched ones follow the new base).
 let segs = [];            // [{lo, hi, model, gap}] contiguous over the clip
 let selSeg = -1;
-let spanUndo = [], spanRedo = [];
+// ONE history for the whole bench. There used to be two -- one for the pieces
+// and one for the shot cuts -- and which one Ctrl+Z answered depended on which
+// control was touched last, so the shortcut silently undid a different kind of
+// edit depending on where you had been. A snapshot now carries BOTH layers and
+// names its own edit, so the shortcut is always self-consistent and the readout
+// can say what it is about to take back.
+let hist = [], fut = [];   // [{label, at, segs, shots}]
 let tool = 'select';      // 'select' | 'razor' | 'shot'
 let magnet = false;
 let dragEdge = null;
 let razorDrag = null;
 let razorX = null;        // the blade's preview, in canvas pixels
+let stripRazorX = null;   // ...and the strip's own, which shares none of it
 let hoverSeg = -1;        // the piece under the pointer, for the hover tint
 // The shot layer (the video's own cuts) shares this bar with the razor. Read
 // and edited further down; declared here because the span band draws it and
 // the magnet snaps to it.
 let shots = [];          // [{t_ms}] the CURRENT set: detected, plus this session's
 let shotsDraft = [];     // the detected set as decoded -- what "reset" returns to
-let shotUndo = [], shotRedo = [];
-// Which stack Ctrl+Z answers to: the span edits or the shot edits. Set by
-// whichever the user last touched, so the shortcut undoes the thing they did.
-let lastEdit = 'span';
 
 // A colour per model, so a piece is identified at a glance. Fixed hues rather
 // than palette variables: these must stay distinct from EACH OTHER, and every
 // palette the app ships is dark, so the ramp is tuned for a dark bar.
 const SPAN_HUES = ['#8bc34a', '#ffb000', '#55c0ff', '#e06ce0', '#ff6b5a',
                    '#3ad6b0', '#d8d84a', '#9a8cff'];
+/** A hand-drawn piece is not a model, so it wears a hue outside SPAN_HUES --
+ *  the same rule the cut line follows, and for the same reason: a band that
+ *  borrows a model's colour reads as that model. The server knows this value
+ *  as the span model `__manual`. */
+const MANUAL = '__manual';
+const MANUAL_HUE = '#cfe3ff';
 function modelColor(name) {
-  const c = state.clips[cur];
+  if (name === MANUAL) return MANUAL_HUE;
+  const c = state && state.clips[cur];
   const ms = (c && c.models) || [];
   const i = ms.findIndex(m => m.name === name);
   return SPAN_HUES[(i < 0 ? 0 : i) % SPAN_HUES.length];
@@ -2098,7 +2631,7 @@ function partitionOf(c) {
     const hi = Math.max(0, Math.min(dur, e.hi_ms));
     if (hi <= lo) continue;
     if (lo > t) out.push({ lo: t, hi: lo, model: c.model, gap: true });
-    out.push({ lo, hi, model: e.model, gap: false });
+    out.push({ lo, hi, model: e.model, gap: false, wave: e.wave || null });
     t = hi;
   }
   if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
@@ -2109,7 +2642,13 @@ function spansPayload() {
   const c = state.clips[cur];
   if (!c) return [];
   return segs.filter(s => s.model !== c.model)
-             .map(s => ({ lo_ms: s.lo, hi_ms: s.hi, model: s.model }));
+             .map(s => {
+               const o = { lo_ms: s.lo, hi_ms: s.hi, model: s.model };
+               // the recipe rides ONLY on a manual piece, so every ordinary
+               // span stays exactly the shape it always was
+               if (s.model === MANUAL && s.wave) o.wave = s.wave;
+               return o;
+             });
 }
 function retagGaps() {
   const c = state.clips[cur];
@@ -2118,37 +2657,97 @@ function retagGaps() {
 }
 function spanLoad() {
   const c = state.clips[cur];
-  spanUndo = []; spanRedo = [];
+  hist = []; fut = [];
   selSeg = -1;
   segs = c ? partitionOf(c) : [];
+  labelHist();
+  labelModelSel();
   renderSegs();
 }
 function commitSegs() {
   renderSegs();
   updateSegNote();
+  labelModelSel();
   postParams({ spans: spansPayload() });
 }
-function pushSegUndo() {
-  spanUndo.push(JSON.stringify(segs));
-  if (spanUndo.length > 64) spanUndo.shift();
-  spanRedo.length = 0;
-  lastEdit = 'span';
+
+// ---- the edit history -----------------------------------------------------
+// A snapshot is the WHOLE bench: the pieces and the cut list together, because
+// they are one session's edits and a Ctrl+Z that restored one and not the other
+// would leave the two layers disagreeing. It also carries a label, so undo can
+// say what it did instead of leaving the user to diff two pictures.
+function snap(label, at) {
+  return { label, at: (at == null ? null : at), segs: JSON.stringify(segs),
+           shots: shots.map(s => s.t_ms) };
 }
-function segUndoNow() {
-  if (!spanUndo.length) return;
-  spanRedo.push(JSON.stringify(segs));
-  if (spanRedo.length > 64) spanRedo.shift();
-  segs = JSON.parse(spanUndo.pop());
+function pushHist(label, at) {
+  hist.push(snap(label, at));
+  if (hist.length > 64) hist.shift();
+  fut.length = 0;
+  labelHist();
+}
+/** One Ctrl+Z step: put both layers back and post them in one ask, so the
+ *  server never styles a partition against the other layer's cuts. */
+function applySnap(s) {
+  segs = JSON.parse(s.segs);
+  shots = s.shots.map(t => ({ t_ms: t }));
   selSeg = Math.min(selSeg, segs.length - 1);
-  commitSegs();
+  labelModelSel();
+  renderSegs();
+  renderShots();
+  updateSegNote();
+  postParams({ spans: spansPayload(), cuts_ms: shotsPayload() });
 }
-function segRedoNow() {
-  if (!spanRedo.length) return;
-  spanUndo.push(JSON.stringify(segs));
-  segs = JSON.parse(spanRedo.pop());
-  selSeg = Math.min(selSeg, segs.length - 1);
-  commitSegs();
+function histWhat(s) {
+  const what = T(s.label);
+  return s.at == null ? what : what + ' @ ' + fmtClock(s.at);
 }
+function undoNow() {
+  const s = hist.pop();
+  if (!s) return;
+  fut.push(snap(s.label, s.at));
+  if (fut.length > 64) fut.shift();
+  applySnap(s);
+  labelHist();
+  toast(T('page.hist.undid', { what: histWhat(s) }));
+}
+function redoNow() {
+  const s = fut.pop();
+  if (!s) return;
+  hist.push(snap(s.label, s.at));
+  if (hist.length > 64) hist.shift();
+  applySnap(s);
+  labelHist();
+  toast(T('page.hist.redid', { what: histWhat(s) }));
+}
+function labelHist() {
+  const n = $('undoN'), r = $('redoN');
+  if (n) n.textContent = String(hist.length);
+  if (r) r.textContent = String(fut.length);
+  const el = $('histNote');
+  if (!el) return;
+  const top = hist[hist.length - 1];
+  el.innerHTML = '';
+  if (!top) { el.textContent = T('page.hist.none'); return; }
+  const pre = document.createElement('span');
+  pre.textContent = T('page.hist.next') + ' ';
+  const b = document.createElement('b');
+  b.textContent = histWhat(top);
+  el.append(pre, b);
+}
+let toastT = 0;
+function toast(msg) {
+  const el = $('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('on');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => el.classList.remove('on'), 2200);
+}
+// Kept so the two layers' call sites read as what they are; both land in the
+// one history.
+function pushSegUndo(label, at) { pushHist(label || 'page.hist.piece', at); }
+function pushShotUndo(label, at) { pushHist(label || 'page.hist.shot', at); }
 
 // ---- edits ----------------------------------------------------------------
 function segAt(ms) {
@@ -2167,24 +2766,30 @@ function cutInPlace(ms) {
 }
 function cutAt(ms) {
   const before = segs.length;
-  pushSegUndo();
+  pushSegUndo('page.hist.cut', ms);
   cutInPlace(ms);
-  if (segs.length === before) { spanUndo.pop(); return; }   // nothing to cut
+  if (segs.length === before) { hist.pop(); labelHist(); return; }   // nothing to cut
   commitSegs();
 }
 function razorCut(a, b) {
   if (b - a < 80) { cutAt(a); return; }
   const before = segs.length;
-  pushSegUndo();
+  pushSegUndo('page.hist.razor', a);
   cutInPlace(a); cutInPlace(b);
-  if (segs.length === before) { spanUndo.pop(); return; }
+  if (segs.length === before) { hist.pop(); labelHist(); return; }
   commitSegs();
 }
 function setSegModel(i, model) {
   const s = segs[i];
   if (!s || s.model === model) return;
-  pushSegUndo();
+  // the label names the tempo the piece starts at, which is how a piece this
+  // narrow is recognized in a history line
+  pushSegUndo('page.hist.model', s.lo);
   s.model = model;
+  // A piece that becomes hand-drawn needs a recipe BEFORE it is posted: the
+  // server drops a manual span with no wave (it would have nothing to write
+  // the rows with), so an empty one would silently vanish.
+  if (model === MANUAL && !s.wave) s.wave = defaultWave();
   retagGaps();
   commitSegs();
 }
@@ -2192,7 +2797,7 @@ function setSegModel(i, model) {
  *  piece's model -- said out loud in the note, because PR asks instead. */
 function mergeWith(i) {
   if (i < 0 || i + 1 >= segs.length) return;
-  pushSegUndo();
+  pushSegUndo('page.hist.merge', segs[i].lo);
   segs[i].hi = segs[i + 1].hi;
   segs.splice(i + 1, 1);
   selSeg = i;
@@ -2217,9 +2822,11 @@ function setTool(t) {
   tool = t;
   for (const [id, name] of TOOL_BTNS) $(id).classList.toggle('on', name === t);
   timeline.style.cursor = t === 'razor' ? 'crosshair' : (t === 'shot' ? 'copy' : 'pointer');
-  if (t !== 'razor') { razorX = null; razorDrag = null; }
+  if (t !== 'razor') { razorX = null; razorDrag = null; stripRazorX = null; }
   updateSegNote();
   renderSegs();
+  // the strip wears the same tool when it is in edit mode, so it repaints
+  drawStrip(vid.currentTime * 1000);
 }
 function labelMagnet() {
   $('magBtn').classList.toggle('on', magnet);
@@ -2229,23 +2836,9 @@ for (const [id, name] of TOOL_BTNS) $(id).onclick = () => setTool(name);
 $('magBtn').onclick = () => { magnet = !magnet; labelMagnet(); };
 $('segCut').onclick = () => cutAt(vid.currentTime * 1000);
 $('segMerge').onclick = () => mergeWith(selSeg);
-$('segUndo').onclick = segUndoNow;
-$('segRedo').onclick = segRedoNow;
-$('shotUndo').onclick = shotUndoNow;
-$('shotRedo').onclick = shotRedoNow;
+$('segUndo').onclick = undoNow;
+$('segRedo').onclick = redoNow;
 $('shotReset').onclick = shotReset;
-// Ctrl+Z / Ctrl+Shift+Z answer to whichever bench the user last touched, and
-// fall back to the other when that stack is empty -- one shortcut, two layers.
-function undoNow() {
-  if (lastEdit === 'shot' && shotUndo.length) return shotUndoNow();
-  if (spanUndo.length) return segUndoNow();
-  if (shotUndo.length) return shotUndoNow();
-}
-function redoNow() {
-  if (lastEdit === 'shot' && shotRedo.length) return shotRedoNow();
-  if (spanRedo.length) return segRedoNow();
-  if (shotRedo.length) return shotRedoNow();
-}
 
 // ---- the drawer -----------------------------------------------------------
 function labelDrawer() {
@@ -2266,6 +2859,7 @@ function renderSegs() {
   const list = $('segList');
   if (!list) return;
   list.innerHTML = '';
+  if (!state) return;
   const c = state.clips[cur];
   if (!c) return;
   const models = c.models || [];
@@ -2288,19 +2882,257 @@ function renderSegs() {
       o.textContent = m.name;
       sel.append(o);
     }
+    // the piece list carries the manual entry too, so switching a piece over
+    // does not mean going back to the bar's right-click menu
+    const om = document.createElement('option');
+    om.value = MANUAL;
+    om.textContent = '✎ ' + T('page.wave.head');
+    sel.append(om);
     sel.value = s.model;
     sel.onchange = () => setSegModel(i, sel.value);
     sel.onclick = ev => ev.stopPropagation();
-    row.append(sw, n, t, sel);
+    // how sure the model that WROTE this piece was, over this piece's rows:
+    // `conf` follows the mixed tracks row for row, so one mean per piece is
+    // that piece's own model's answer. One number, because that is all a list
+    // this narrow can carry without becoming a table. A hand-drawn piece has
+    // no model to ask, so it shows its own mark instead of a borrowed number.
+    const cf = document.createElement('span');
+    cf.className = 'cf';
+    if (s.model === MANUAL) {
+      cf.textContent = '✎';
+      cf.title = T('page.wave.head');
+    } else {
+      const v = segConf(s);
+      cf.textContent = v == null ? '–' : Math.round(v * 100) + '%';
+      if (v != null && v < 0.5) cf.classList.add('lo');
+      cf.title = T('page.spans.conf.tip');
+    }
+    row.append(sw, n, t, sel, cf);
     row.onclick = () => { selSeg = i; renderSegs(); seekMs(s.lo + 1); };
     list.append(row);
   });
-  $('undoN').textContent = String(spanUndo.length);
-  $('redoN').textContent = String(spanRedo.length);
+  labelHist();
+  // the panel follows the selection, and it is rebuilt from the piece every
+  // time: a manual piece shows its wave controls, anything else hides them
+  renderWavePanel();
 }
+/** The mean confidence over one piece's rows, or null when there is none to
+ *  read -- a piece is where the split lines are drawn, and this is the only
+ *  per-piece number the page has.
+ *
+ *  Measured on the RAW track, over exactly this piece's rows: the server has
+ *  already laid this piece's model's rows over this piece, so the number is
+ *  that model answering about these rows and nothing else. Reading it off
+ *  `confSmooth` instead would drag in ±0.75 s of whatever is next door, which
+ *  for a short piece is most of its number. */
+function segConf(s) {
+  if (!confRaw || !confRaw.length) return null;
+  const hz = confFps || 30, row0 = confRow0 || 0;
+  const a = Math.max(0, Math.round((s.lo - row0) / 1000 * hz));
+  const b = Math.min(confRaw.length, Math.round((s.hi - row0) / 1000 * hz));
+  let sum = 0, n = 0;
+  for (let r = a; r < b; r++) { const v = confRaw[r]; if (v != null) { sum += v; n++; } }
+  return n ? sum / n : null;
+}
+// ---- the manual-fill panel ------------------------------------------------
+// A hand-drawn piece is written from a waveform and nothing else: no model, no
+// latents, no head pass. Its controls can be honest about that -- each one
+// re-posts the spans and the server redraws that piece's rows straight from
+// the wave, which is why this is the one part of the page a knob change costs
+// no model time at all.
+let waveModels = null;   // /waves, fetched once at boot
+
+async function fetchWaves() {
+  try {
+    waveModels = (await (await fetch('/waves')).json()).waves || [];
+  } catch (e) { waveModels = []; }
+}
+function waveById(id) {
+  return (waveModels || []).find(w => w.id === id) || null;
+}
+/** A fresh recipe: the first wave in the file, over the middle of the range.
+ *  Legal from the instant a piece is switched over, so `setSegModel` never has
+ *  to hand the server a manual span with nothing to write it with. */
+function defaultWave() {
+  const w = (waveModels && waveModels[0]) || null;
+  const d = { id: w ? w.id : 'triangle', lo: 25, hi: 75, period_s: 1.0,
+              params: {}, mirror_time: false, mirror_amp: false };
+  if (w) for (const p of (w.params || [])) d.params[p.key] = p.def;
+  return d;
+}
+/** The piece the panel edits, or null when the selection is not hand-drawn. */
+function manualSeg() {
+  const s = (selSeg >= 0 && selSeg < segs.length) ? segs[selSeg] : null;
+  return (s && s.model === MANUAL) ? s : null;
+}
+/** One edit to the selected piece's recipe, with one undo step and one post. */
+function editWave(fn) {
+  const s = manualSeg();
+  if (!s) return;
+  pushSegUndo('page.hist.wave', s.lo);
+  fn(s.wave);
+  commitSegs();
+}
+function renderWavePanel() {
+  const el = $('wavePanel');
+  if (!el) return;
+  const s = manualSeg();
+  el.hidden = !s;
+  if (!s) return;
+  const w = s.wave || (s.wave = defaultWave());
+  const sel = $('wpId');
+  if (!sel.options.length) {
+    for (const m of (waveModels || [])) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = T(m.name);
+      o.title = m.hint ? T(m.hint) : '';
+      sel.append(o);
+    }
+  }
+  sel.value = w.id;
+  $('wpLo').value = Math.round(w.lo);
+  $('wpHi').value = Math.round(w.hi);
+  $('wpPeriod').value = w.period_s;
+  $('wpMirrorT').checked = !!w.mirror_time;
+  $('wpMirrorA').checked = !!w.mirror_amp;
+  renderWaveParams();
+  drawWaveThumb();
+}
+/** This wave's own knobs, built from the file's declaration -- so adding a
+ *  knob to waves.json is the entire job and no front-end work exists for it. */
+function renderWaveParams() {
+  const host = $('wpParams');
+  if (!host) return;
+  host.innerHTML = '';
+  const s = manualSeg();
+  const w = s && waveById(s.wave.id);
+  if (!s || !w || !(w.params || []).length) return;
+  for (const p of w.params) {
+    const lab = document.createElement('label');
+    lab.textContent = T(p.label);
+    lab.title = p.unit || '';
+    const cur = (s.wave.params && s.wave.params[p.key] != null)
+      ? s.wave.params[p.key] : p.def;
+    let ctl;
+    if (p.kind === 'choice') {
+      ctl = document.createElement('select');
+      for (const o of (p.options || [])) {
+        const op = document.createElement('option');
+        op.value = o; op.textContent = o;
+        ctl.append(op);
+      }
+      ctl.style.flex = '0 0 auto';
+      ctl.value = cur;
+    } else {
+      ctl = document.createElement('input');
+      ctl.type = 'number';
+      ctl.className = 'wpnum';
+      if (p.min != null) ctl.min = p.min;
+      if (p.max != null) ctl.max = p.max;
+      ctl.step = (p.max != null && p.max <= 2) ? 0.01 : 1;
+      ctl.value = cur;
+    }
+    ctl.onchange = () => editWave(w2 => {
+      if (!w2.params) w2.params = {};
+      w2.params[p.key] = (p.kind === 'choice') ? ctl.value : Number(ctl.value);
+    });
+    ctl.onclick = ev => ev.stopPropagation();
+    host.append(lab, ctl);
+  }
+}
+/** The piece as it will actually be written: ONE cycle sampled by the SERVER,
+ *  repeated across the span at its real cadence. So the page still owns no
+ *  second copy of the maths -- it only repeats what it was handed -- and an
+ *  asymmetric wave is not shown as one idealized loop. */
+async function drawWaveThumb() {
+  const cv = $('wpThumb');
+  const s = manualSeg();
+  if (!cv || !s || !s.wave) return;
+  const w = s.wave;
+  const q = new URLSearchParams({ id: w.id, n: '129' });
+  for (const [k, v] of Object.entries(w.params || {})) q.set(k, v);
+  let v = null;
+  try {
+    v = (await (await fetch('/wave_preview?' + q.toString())).json()).v;
+  } catch (e) { v = null; }
+  const c = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  c.clearRect(0, 0, W, H);
+  if (!v || v.length < 2) return;
+  const lo = Math.min(w.lo, w.hi), hi = Math.max(w.lo, w.hi);
+  const spanS = Math.max(0.05, (s.hi - s.lo) / 1000);
+  const period = Math.max(0.05, w.period_s || 1);
+  const yOf = lv => H - 4 - (lv / 100) * (H - 8);
+  const lvAt = t => {
+    let u = t / period;
+    u -= Math.floor(u);
+    if (w.mirror_time) u = ((1 - u) % 1 + 1) % 1;
+    const k = u * (v.length - 1);
+    const i0 = Math.floor(k), i1 = Math.min(v.length - 1, i0 + 1);
+    let y = v[i0] + (v[i1] - v[i0]) * (k - i0);
+    if (w.mirror_amp) y = 1 - y;
+    return lo + (hi - lo) * y;
+  };
+  c.strokeStyle = 'rgba(255,255,255,.18)';
+  c.setLineDash([2, 3]);
+  for (const lv of [lo, hi]) {
+    c.beginPath(); c.moveTo(0, yOf(lv)); c.lineTo(W, yOf(lv)); c.stroke();
+  }
+  c.setLineDash([]);
+  c.strokeStyle = MANUAL_HUE;
+  c.lineWidth = 2;
+  c.beginPath();
+  for (let x = 0; x <= W; x++) {
+    const lv = lvAt(x / W * spanS);
+    if (x === 0) c.moveTo(x, yOf(lv)); else c.lineTo(x, yOf(lv));
+  }
+  c.stroke();
+  // The speed, off the STEEPEST leg: for an asymmetric wave the peak is
+  // nothing like amplitude x frequency, and that is exactly the case that
+  // overshoots the device. `mspeed` 0 means the cap is off.
+  const dt = period / (v.length - 1);
+  let vmax = 0;
+  for (let i = 0; i + 1 < v.length; i++) {
+    vmax = Math.max(vmax, Math.abs(v[i + 1] - v[i]) / dt);
+  }
+  const peak = vmax * (hi - lo);
+  const cap = Number(($('mspeed') || {}).value) || 0;
+  const el = $('wpSpeed');
+  if (el) {
+    el.textContent = '≈ ' + Math.round(peak) + ' / ' + (cap > 0 ? Math.round(cap) : '∞') + ' u/s';
+    el.classList.toggle('bad', cap > 0 && peak > cap);
+  }
+}
+for (const [id, key] of [['wpLo', 'lo'], ['wpHi', 'hi'], ['wpPeriod', 'period_s']]) {
+  const el = $(id);
+  if (el) el.onchange = () => editWave(w => {
+    const n = Number(el.value);
+    if (isFinite(n)) w[key] = n;
+  });
+}
+if ($('wpId')) $('wpId').onchange = () => editWave(w => {
+  w.id = $('wpId').value;
+  // a different wave brings its own knobs; carrying the old ones over would
+  // be inventing values the new shape never declared
+  w.params = {};
+  const nw = waveById(w.id);
+  if (nw) for (const p of (nw.params || [])) w.params[p.key] = p.def;
+});
+if ($('wpMirrorT')) $('wpMirrorT').onchange = () => editWave(w => {
+  w.mirror_time = $('wpMirrorT').checked;
+});
+if ($('wpMirrorA')) $('wpMirrorA').onchange = () => editWave(w => {
+  w.mirror_amp = $('wpMirrorA').checked;
+});
+
 function updateSegNote() {
   const el = $('segNote');
   if (!el) return;
+  // the tool keys work the moment the drawer is on screen, and the drawer is
+  // there before /state answers -- so every readout below has to survive a
+  // null state rather than assume the page has been fed
+  if (!state) { el.textContent = ''; return; }
   const c = state.clips[cur];
   if (!c) { el.textContent = ''; return; }
   if (tool === 'razor') { el.textContent = T('page.spans.razor.hint'); return; }
@@ -2337,7 +3169,6 @@ function shotsPayload() {
 }
 function shotLoad() {
   const c = state.clips[cur];
-  shotUndo = []; shotRedo = [];
   if (!c) { shots = []; shotsDraft = []; renderShots(); return; }
   shotsDraft = (c.cuts_ms || []).slice();
   // `cuts_cur` null = the draft's own; an EMPTY array is a real answer (no cuts).
@@ -2352,29 +3183,11 @@ function commitShots() {
   labelShots();
   postParams({ cuts_ms: shotsPayload() });
 }
-function pushShotUndo() {
-  shotUndo.push(shots.map(s => s.t_ms));
-  if (shotUndo.length > 64) shotUndo.shift();
-  shotRedo.length = 0;
-  lastEdit = 'shot';
-}
-function shotUndoNow() {
-  if (!shotUndo.length) return;
-  shotRedo.push(shots.map(s => s.t_ms));
-  shots = shotUndo.pop().map(t => ({ t_ms: t }));
-  commitShots();
-}
-function shotRedoNow() {
-  if (!shotRedo.length) return;
-  shotUndo.push(shots.map(s => s.t_ms));
-  shots = shotRedo.pop().map(t => ({ t_ms: t }));
-  commitShots();
-}
 /** Throw this session's cut edits away and go back to what the video was read
  *  with. Undoable like any other edit, and a no-op when nothing was moved. */
 function shotReset() {
   if (sameCuts(shots.map(s => s.t_ms), shotsDraft)) return;
-  pushShotUndo();
+  pushShotUndo('page.hist.shot.reset');
   shots = shotsDraft.map(t => ({ t_ms: t }));
   commitShots();
 }
@@ -2395,23 +3208,26 @@ function addShot(ms) {
     if (best != null && Math.abs(best - t) < 350) t = best;
   }
   if (shots.some(s => Math.abs(s.t_ms - t) < 1)) return;   // already one there
-  pushShotUndo();
+  pushShotUndo('page.hist.shot.add', t);
   shots.push({ t_ms: t });
   shots.sort((a, b) => a.t_ms - b.t_ms);
   commitShots();
 }
 function removeShot(hit) {
-  pushShotUndo();
+  pushShotUndo('page.hist.shot.del', hit.t_ms);
   shots = shots.filter(s => s !== hit);
   commitShots();
 }
 /** A press on the bar in shot mode: on a cut takes it out, between two places
- *  one. */
-function shotPress(clientX, ms) {
+ *  one. `tolMs` is the grab radius, in ms, for a bar that is not the timeline. */
+function shotPress(clientX, ms, tolMs) {
   const r = timeline.getBoundingClientRect();
   const dur = curDurationMs();
   if (!(dur > 0)) return;
-  const hit = shots.find(s => Math.abs(s.t_ms / dur * r.width - (clientX - r.left)) <= 6);
+  const tol = (tolMs == null) ? 6 : tolMs;
+  const hit = (tolMs == null)
+    ? shots.find(s => Math.abs(s.t_ms / dur * r.width - (clientX - r.left)) <= tol)
+    : shots.find(s => Math.abs(s.t_ms - ms) <= tol);
   if (hit) { removeShot(hit); return; }
   addShot(ms);
 }
@@ -2440,9 +3256,8 @@ function renderShots() {
     row.onclick = () => seekMs(s.t_ms);
     list.append(row);
   });
-  $('shotUndoN').textContent = String(shotUndo.length);
-  $('shotRedoN').textContent = String(shotRedo.length);
   labelShots();
+  labelHist();
 }
 
 // ---- the conf suggestion --------------------------------------------------
@@ -2567,7 +3382,7 @@ function applySuggestion() {
   if (!suggestSpans || !suggestSpans.length) return;
   const c = state.clips[cur];
   if (!c) return;
-  pushSegUndo();
+  pushSegUndo('page.hist.suggest');
   segs = partitionOf({ ...c, spans: suggestSpans.map(p => ({ lo_ms: p.lo_ms, hi_ms: p.hi_ms, model: p.model })) });
   selSeg = -1;
   suggestSpans = null;
@@ -2581,26 +3396,36 @@ $('confApply').onclick = applySuggestion;
 $('confDrop').onclick = () => { suggestSpans = null; suggestMsg = null; renderSuggest(); };
 
 // ---- drawing the bar ------------------------------------------------------
-function drawSpanBand(X, w, h, dur) {
+function drawSpanBand(X, w, h) {
   if (!segs.length) return;
   const clampX = v => Math.max(0, Math.min(w, v));
   for (const s of segs) {
     const x0 = clampX(X(s.lo)), x1 = clampX(X(s.hi));
     if (x1 <= x0) continue;
+    if (s.model === MANUAL) {
+      // A hand-drawn piece wears its own hue AND diagonal stripes. The hue
+      // alone would be one more colour to memorise; the hatch says "drawn"
+      // without the legend having to spell it out.
+      tlctx.fillStyle = hexA(MANUAL_HUE, s.gap ? .28 : .62);
+      tlctx.fillRect(x0, 1, Math.max(1, x1 - x0), 4);
+      tlctx.save();
+      tlctx.beginPath();
+      tlctx.rect(x0, 1, Math.max(1, x1 - x0), 4);
+      tlctx.clip();
+      tlctx.strokeStyle = 'rgba(11,18,11,.6)';
+      tlctx.lineWidth = 1;
+      for (let x = x0 - 5; x < x1 + 5; x += 4) {
+        tlctx.beginPath(); tlctx.moveTo(x, 5); tlctx.lineTo(x + 4, 1); tlctx.stroke();
+      }
+      tlctx.restore();
+      continue;
+    }
     tlctx.fillStyle = hexA(modelColor(s.model), s.gap ? .28 : .62);
     tlctx.fillRect(x0, 1, Math.max(1, x1 - x0), 4);
   }
-  // the edges, full height so a cut is unmistakable against the bands below
-  const d = (dur > 0 ? dur : 1);
-  for (let i = 0; i < segs.length - 1; i++) {
-    const x = clampX(segs[i].hi / d * w);
-    const on = (i === selSeg || i + 1 === selSeg);
-    tlctx.strokeStyle = hexA(C.hiBright, on ? .95 : .5);
-    tlctx.lineWidth = 1;
-    tlctx.beginPath(); tlctx.moveTo(x, 0); tlctx.lineTo(x, h); tlctx.stroke();
-    // a grip at the top, so the edge reads as grabbable
-    tlctx.fillRect(x - 2, 0, 5, 3);
-  }
+  // The boundaries are NOT drawn here on purpose: this function runs FIRST, so
+  // the elapsed tint and every band below would pass straight over them. They
+  // go on top instead, via drawSpanEdges().
   // the razor's preview: where the blade would land
   if (tool === 'razor' && razorX != null) {
     tlctx.save();
@@ -2614,7 +3439,7 @@ function drawSpanBand(X, w, h, dur) {
   if (shots.length) {
     tlctx.fillStyle = hexA(ARTIFACT_AMBER, .8);
     for (const s of shots) {
-      const x = clampX(s.t_ms / d * w);
+      const x = clampX(X(s.t_ms));
       for (let y = 6; y < (h - 14); y += 4) tlctx.fillRect(x, y, 1, 2);
     }
   }
@@ -2629,11 +3454,43 @@ function drawSpanBand(X, w, h, dur) {
   }
 }
 
+/** The span boundaries, drawn over every band that shares their bar.
+ *
+ *  Two things make a cut legible here. First an opaque dark underlay, then a
+ *  2px pure red on top of it -- `C.cut` sits outside SPAN_HUES precisely so a
+ *  boundary never reads as part of the band it divides. Second a height that
+ *  stops at the band strip (the top ~20px, where all four bands live), UNLESS
+ *  one of the two segments it divides is selected. Selecting is what a drag
+ *  does, so grabbing a boundary makes it run the full height and thicken under
+ *  the hand -- which is when you actually need to see where it is.
+ *
+ *  Takes the 2d context as an argument because the timeline and the strip each
+ *  own one; both bars show the same boundaries at different heights. */
+function drawSpanEdges(ctx, X, w, h, bandH) {
+  // The TOOL decides the weight, not the selection. A selection used to be
+  // what made an edge run the full height, which meant a drag left its
+  // boundary tall until the selection happened to move somewhere else --
+  // a state that read as "the cut line got stuck". Select mode is exactly
+  // "I am working on the pieces", so there every boundary is loud; any other
+  // tool is working on something else, so the cuts drop back to stubs.
+  const loud = (tool === 'select');
+  for (let i = 0; i < segs.length - 1; i++) {
+    const x = X(segs[i].hi);
+    if (x < -3 || x > w + 3) continue;
+    const hh = loud ? h : Math.min(h, bandH);
+    ctx.fillStyle = 'rgba(0,0,0,.85)';
+    ctx.fillRect(x - 2, 0, 4, hh);
+    ctx.fillStyle = C.cut;
+    ctx.fillRect(x - (loud ? 1.5 : 1), 0, loud ? 3 : 2, hh);
+  }
+}
+
 
 // ---- boot ----------------------------------------------------------------
 (async () => {
   // the words first: every label built below is built in the right language
   await fetchLang();
+  await fetchWaves();    // the wave list is data, and the panel needs it first
   await fetchState();
   buildPresetOptions();  // dropdown labels carry each preset's number
   sizeStrip();

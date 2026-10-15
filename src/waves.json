@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "_comment": [
+    "Waveforms for manual spans, kept as DATA so a shape change costs an edit",
+    "and a page reload rather than a rebuild. Evaluated by src/wave.rs.",
+    "",
+    "A wave is a list of SEGMENTS, walked in order from the start of a cycle:",
+    "  w    relative duration -- a number, or the name of one of this wave's",
+    "       params. Weights are normalized, so 13/37/50 means the first segment",
+    "       takes 13% of the cycle. Editing one weight redistributes the rest,",
+    "       which is what 'rise 13% / fall 37% / floor 50%' has to mean.",
+    "  to   the level at the END of the segment, 0-100 on the wave's own scale",
+    "       (0 = lower bound, 100 = upper bound), or the name of a param.",
+    "  ease the easing curve for this segment; see EASINGS in src/wave.rs.",
+    "",
+    "A cycle always STARTS at level 0. Phase, the two mirror switches, the",
+    "repeat count, the cadence and the absolute lower/upper bounds are all",
+    "applied by the caller -- never here. Keeping that split is what lets one",
+    "wave be previewed, exported and tested by the same code path.",
+    "",
+    "Params carry the UI contract: def/min/max/unit drive the auto-built",
+    "controls, so adding a knob to a wave is one entry in this file."
+  ],
+  "waves": [
+    {
+      "id": "triangle",
+      "name": "wave.triangle",
+      "hint": "wave.triangle.h",
+      "periodic": true,
+      "params": [],
+      "segments": [
+        { "w": 1, "to": 100, "ease": "linear" },
+        { "w": 1, "to": 0, "ease": "linear" }
+      ]
+    },
+    {
+      "id": "sine",
+      "name": "wave.sine",
+      "hint": "wave.sine.h",
+      "periodic": true,
+      "params": [],
+      "segments": [
+        { "w": 1, "to": 100, "ease": "sine" },
+        { "w": 1, "to": 0, "ease": "sine" }
+      ]
+    },
+    {
+      "id": "rounded_tri",
+      "name": "wave.rounded_tri",
+      "hint": "wave.rounded_tri.h",
+      "periodic": true,
+      "params": [
+        { "key": "round", "label": "wave.p.round", "def": 25, "min": 0, "max": 100, "unit": "%" }
+      ],
+      "segments": [
+        { "w": 1, "to": 100, "ease": "out" },
+        { "w": 1, "to": 0, "ease": "out" }
+      ]
+    },
+    {
+      "id": "single_peak",
+      "name": "wave.single_peak",
+      "hint": "wave.single_peak.h",
+      "periodic": true,
+      "params": [
+        { "key": "rise",  "label": "wave.p.rise",  "def": 13, "min": 1,  "max": 60, "unit": "%" },
+        { "key": "fall",  "label": "wave.p.fall",  "def": 37, "min": 1,  "max": 80, "unit": "%" },
+        { "key": "floor", "label": "wave.p.floor", "def": 50, "min": 0,  "max": 90, "unit": "%" },
+        { "key": "rest",  "label": "wave.p.rest",  "def": 10, "min": 0,  "max": 60, "unit": "%" }
+      ],
+      "segments": [
+        { "w": "rise",  "to": 100,    "ease": "out" },
+        { "w": "fall",  "to": "rest", "ease": "out3" },
+        { "w": "floor", "to": 0,      "ease": "out" }
+      ]
+    },
+    {
+      "id": "pulse",
+      "name": "wave.pulse",
+      "hint": "wave.pulse.h",
+      "periodic": true,
+      "params": [
+        { "key": "charge", "label": "wave.p.charge", "def": 30, "min": 5, "max": 70, "unit": "%" },
+        { "key": "drop",   "label": "wave.p.drop",   "def": 13, "min": 3, "max": 50, "unit": "%" },
+        { "key": "depth",  "label": "wave.p.depth",  "def": 4,  "min": 0, "max": 40, "unit": "%" }
+      ],
+      "segments": [
+        { "w": 6,        "to": 0,       "ease": "linear" },
+        { "w": "charge", "to": 100,     "ease": "in3" },
+        { "w": "drop",   "to": "depth", "ease": "in" },
+        { "w": 9,        "to": 12,      "ease": "out" },
+        { "w": 40,       "to": 0,       "ease": "out" }
+      ]
+    },
+    {
+      "id": "glide",
+      "name": "wave.glide",
+      "hint": "wave.glide.h",
+      "periodic": false,
+      "params": [
+        { "key": "ease", "label": "wave.p.glide_ease", "kind": "choice", "def": "smooth",
+          "options": ["linear", "in", "out", "smooth"] }
+      ],
+      "segments": [
+        { "w": 1, "to": 100, "ease": "ease" }
+      ]
+    }
+  ]
+}

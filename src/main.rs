@@ -33,6 +33,7 @@ mod throttle;
 mod tui;
 mod viz;
 mod vr;
+mod wave;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -1347,6 +1348,7 @@ fn style_cfg(man: &bundle::Manifest, p: &style::Params) -> style::StyleCfg {
         // leaves them empty so the scalars above cover the whole clip
         amp_cap_x_rows: Vec::new(),
         amp_cap_f0_rows: Vec::new(),
+        manual_ms: Vec::new(),
         env_gain_p: man.env_gain_p,
         plat_thr: man.plat_thr,
         plat_lo: man.plat_lo,
@@ -1548,8 +1550,9 @@ fn restyle_mixed(
     tracks: &style::Tracks,
     cap_x: &[f64],
     cap_f0: &[f64],
+    manual_ms: &[(f64, f64)],
 ) -> Result<(usize, Vec<[i64; 2]>, f64)> {
-    let s = style_draft_with(d, man, params, &[], tracks, cap_x, cap_f0);
+    let s = style_draft_with(d, man, params, &[], tracks, cap_x, cap_f0, manual_ms);
     write_styled(&d.dst, &s, man, params)?;
     Ok((s.actions.len(), s.artifacts, s.art_rate))
 }
@@ -1598,8 +1601,9 @@ fn review_style(
         // The rows the script is written from: the chosen model's tracks over the
         // whole clip, each span's own model spliced in on its rows, with the
         // per-row amplitude bound that follows (each pack keeps its own `amp_cap_x`).
-        let (mixed, cap_x, cap_f0, conf) = mixed_tracks(d, b, p, choice, &bb)?;
-        let (actions, _, _) = restyle_mixed(d, &bb.manifest, p, &mixed, &cap_x, &cap_f0)?;
+        let (mixed, cap_x, cap_f0, conf, manual_ms) = mixed_tracks(d, b, p, choice, &bb)?;
+        let (actions, _, _) =
+            restyle_mixed(d, &bb.manifest, p, &mixed, &cap_x, &cap_f0, &manual_ms)?;
         Ok(review::Restyled { actions, conf })
     })
 }
@@ -1665,19 +1669,35 @@ fn mixed_tracks(
     p: &style::Params,
     choice: &review::Choice,
     base: &Bundle,
-) -> Result<(style::Tracks, Vec<f64>, Vec<f64>, Vec<f64>)> {
+) -> Result<(style::Tracks, Vec<f64>, Vec<f64>, Vec<f64>, Vec<(f64, f64)>)> {
     let n = d.tracks.vmarg.len();
+    let none = Vec::new();
     if choice.spans.is_empty() {
-        return Ok((d.tracks.clone(), Vec::new(), Vec::new(), d.tracks.conf.clone()));
+        return Ok((
+            d.tracks.clone(),
+            Vec::new(),
+            Vec::new(),
+            d.tracks.conf.clone(),
+            none,
+        ));
     }
     let mut mixed = d.tracks.clone();
     // the base model's bound over the clip; each span overwrites its own rows
     let mut cap_x = vec![base.manifest.amp_cap_x; n];
     let mut cap_f0 = vec![base.manifest.amp_cap_f0; n];
+    // Manual pieces, in the clip's milliseconds. Reported back so the styler
+    // can keep two things off them: the output-domain intensity scale (a hand-
+    // dialled band is already the answer) and the gap filler (whose whole job
+    // is to stamp rhythm over rows that look still, which a wave's own floor
+    // always does).
+    let mut manual_ms: Vec<(f64, f64)> = Vec::new();
     // Resolve every span's tracks FIRST (this can need a head pass, which
     // borrows `d` mutably), then splice from the owned copies.
     let mut pieces: Vec<(usize, usize, style::Tracks, f64, f64)> = Vec::new();
     for sp in &choice.spans {
+        if sp.model == review::MANUAL {
+            continue; // written over the splice below, from its own recipe
+        }
         // a span naming a model this bundle no longer has is skipped, not fatal
         let sb = match b.select(&sp.model) {
             Ok(s) => s,
@@ -1698,8 +1718,26 @@ fn mixed_tracks(
             cap_f0[i] = cf;
         }
     }
+    // Manual LAST, so a model splice can never land on top of a hand-drawn
+    // piece. These rows owe no model anything: no shelf key, no head pass.
+    for sp in &choice.spans {
+        if sp.model != review::MANUAL {
+            continue;
+        }
+        let spec = match &sp.wave {
+            Some(w) => w,
+            None => continue,
+        };
+        let (lo, hi) = span_rows(&d.times, sp.lo_ms, sp.hi_ms);
+        if hi <= lo {
+            continue;
+        }
+        if crate::wave::fill_rows(&mut mixed.level, &mut mixed.vmarg, &d.times, lo, hi, spec) {
+            manual_ms.push((sp.lo_ms, sp.hi_ms));
+        }
+    }
     let conf = mixed.conf.clone();
-    Ok((mixed, cap_x, cap_f0, conf))
+    Ok((mixed, cap_x, cap_f0, conf, manual_ms))
 }
 
 /// The tracks `b`'s model at `seed` would make, WITHOUT disturbing the
@@ -1737,7 +1775,7 @@ fn style_draft(
     params: &style::Params,
     pins: &[style::Action],
 ) -> Styled {
-    style_draft_with(d, man, params, pins, &d.tracks, &[], &[])
+    style_draft_with(d, man, params, pins, &d.tracks, &[], &[], &[])
 }
 
 /// `style_draft` on tracks the caller supplies instead of the draft's own --
@@ -1756,12 +1794,14 @@ fn style_draft_with(
     tracks: &style::Tracks,
     cap_x: &[f64],
     cap_f0: &[f64],
+    manual_ms: &[(f64, f64)],
 ) -> Styled {
     let mut cfg = style_cfg(man, params);
     if !cap_x.is_empty() {
         cfg.amp_cap_x_rows = cap_x.to_vec();
         cfg.amp_cap_f0_rows = cap_f0.to_vec();
     }
+    cfg.manual_ms = manual_ms.to_vec();
     // Level styling is carrier-only: no event segmentation, no sub-frame
     // times, no forced apexes -- exactly jepa_infer's non-composed path.
     let (p, sub, force, filled, phase_runs) = match params.style {
@@ -1785,7 +1825,7 @@ fn style_draft_with(
         &force,
         cfg.cut_ease,
     );
-    style::shape_actions(&mut actions, params);
+    style::shape_actions(&mut actions, params, manual_ms);
     // Back onto the source clock. A VR prep that trimmed a range drafted a
     // CLIP, and every row above is on the clip's clock -- but the file the user
     // plays is the whole video, so the script that lands beside it has to be
@@ -4664,7 +4704,14 @@ mod retrack_tests {
         //    shelf is still the edited cut set (spans never touch cuts)
         let spanned = review::Choice {
             model: a.name.clone(), compare: None,
-            spans: vec![review::Span { lo_ms: 100.0, hi_ms: man.row_ms(1100), model: other.name.clone() }],
+            spans: vec![review::Span {
+                lo_ms: 100.0,
+                hi_ms: man.row_ms(1100),
+                model: other.name.clone(),
+                // a model span, not a hand-drawn one: it names a bundle and
+                // carries no waveform
+                wave: None,
+            }],
             cuts_ms: Some(cuts1.clone()),
         };
         review_style(&mut d, &b, &p, &spanned, &compare).unwrap();
