@@ -555,6 +555,17 @@
             <span class="wpsp"></span>
             <span id="wpSpeed" class="wpnote"></span>
           </div>
+          <!-- The two exemptions. Both are the author taking the piece as
+               their own: one from the device's speed cap, the other from the
+               shot-cut seam treatment. They live here, on the drawing they
+               apply to, and nowhere else -- a model span has no drawing to
+               exempt. -->
+          <div class="wprow">
+            <label data-t-title="page.wave.noLimit.tip"><input id="wpNoLimit"
+                    type="checkbox"> <span data-t="page.wave.noLimit">ignore limits</span></label>
+            <label data-t-title="page.wave.noCuts.tip"><input id="wpNoCuts"
+                    type="checkbox"> <span data-t="page.wave.noCuts">ignore cuts</span></label>
+          </div>
           <canvas id="wpThumb" width="520" height="140"></canvas>
           <div id="wpParams" class="wprow"></div>
           <div id="wpNote" class="wpnote"></div>
@@ -2223,7 +2234,14 @@ const WINDOW_MS = 30000;  // +-15 s around the playhead
 let stripEdit = false;
 let sv0 = 0, sv1 = 0;      // edit mode's window, in ms
 let svInit = false;
-let stripDrag = null;      // {kind:'seek'|'edge'|'razor', edge?, x0?}
+let stripDrag = null;      // {kind:'seek'|'edge'|'razor'|'scrub', edge?, x0?, at0?}
+// Where the playhead is allowed to reach before an EDIT-mode window is dragged
+// along with it. Play mode has no such number -- there the playhead is pinned
+// to the middle and the window always follows. Edit mode owns its window, so
+// following is a decision rather than a default: while the video runs and the
+// playhead passes this fraction, the whole bar slides so the playhead stays
+// pinned there and the piece being watched stays on screen.
+const STRIP_FOLLOW = 0.8;
 /** The strip's window, in ms. Play mode derives it from the playhead every
  *  frame; edit mode owns it until asked to come back. */
 function stripRange(ms) {
@@ -2255,6 +2273,32 @@ function clampView() {
   if (sv0 < 0) { sv1 -= sv0; sv0 = 0; }
   if (sv1 > dur) { sv0 -= sv1 - dur; sv1 = dur; }
   if (sv0 < 0) { sv0 = 0; sv1 = Math.min(dur, sv0 + WINDOW_MS); }
+}
+/** Carry an EDIT-mode window along with a running playhead.
+ *
+ *  Play mode needs nothing here: its playhead is pinned to the middle and the
+ *  window is derived from it every frame, so it follows for free. Edit mode
+ *  OWNS its window -- that is the whole point of the mode -- and the window
+ *  used to sit still while the playhead walked out the right edge, so the
+ *  piece being watched left the bar and the hand had to hunt for it. Once the
+ *  playhead passes `STRIP_FOLLOW` of the span the whole window slides by
+ *  exactly as much as the playhead just crossed, which parks the playhead at
+ *  that fraction and keeps going: the bar travels, the playhead stays put on
+ *  screen.
+ *
+ *  Nothing runs while a drag of the author's own is in flight -- a pan, a
+ *  scrub or an edge being moved -- because fighting the hand is worse than a
+ *  playhead walking off. A paused bar never follows either: a still frame
+ *  should not drift off the screen while it is being looked at. */
+function stripFollow(ms) {
+  if (!stripEdit || !svInit || stripDrag) return;
+  if (vid.paused || vid.ended) return;
+  const edge = sv0 + stripSpan() * STRIP_FOLLOW;
+  if (ms <= edge) return;
+  const step = ms - edge;
+  sv0 += step;
+  sv1 += step;
+  clampView();
 }
 function setStripEdit(on) {
   stripEdit = on;
@@ -2308,6 +2352,10 @@ const canvasBoxes = new ResizeObserver(() => { sizeStrip(); sizeTimeline(); });
 canvasBoxes.observe(strip);
 canvasBoxes.observe(timeline);
 function drawStrip(ms) {
+  // Before the window is read: an edit-mode bar has to decide whether it is
+  // being carried by the playhead (see `stripFollow`) BEFORE anything below
+  // maps a time onto it, or the frame it draws is one window behind.
+  stripFollow(ms);
   const w = strip.clientWidth, h = strip.clientHeight;
   const [t0, t1] = stripRange(ms);
   const win = Math.max(1, t1 - t0);
@@ -2464,9 +2512,30 @@ strip.addEventListener('wheel', e => {
   drawStrip(vid.currentTime * 1000);
 }, { passive: false });
 
+// The middle button has no other job on this bar, so it can always mean the
+// one gesture the bar was missing: grab the playhead and drag it. That is why
+// it is not gated on the mode -- in play mode the left button seeks and lets
+// go, which is a click and not a scrub, and edit mode's left button belongs to
+// the razor, the shot tool and the segment edges.
+strip.addEventListener('mousedown', e => { if (e.button === 1) e.preventDefault(); });
+strip.addEventListener('auxclick', e => { if (e.button === 1) e.preventDefault(); });
 strip.addEventListener('pointerdown', e => {
+  if (e.button === 1) {
+    // State first, capture second: capture is an optimization (it keeps the
+    // drag alive past the canvas edge) and it can refuse -- a pointer the
+    // browser does not consider active, which is exactly what a test harness
+    // sending synthetic events looks like. A refused capture must not cost the
+    // gesture its meaning.
+    stripDrag = { kind: 'scrub' };
+    try { strip.setPointerCapture(e.pointerId); } catch (err) { /* best effort */ }
+    seekMs(stripMs(e.clientX));
+    e.preventDefault();
+    return;
+  }
   if (!stripEdit || e.button !== 0) return;
-  strip.setPointerCapture(e.pointerId);
+  // best effort, same as the scrub above: a refused capture costs the drag its
+  // reach past the canvas edge, and must not cost it its meaning
+  try { strip.setPointerCapture(e.pointerId); } catch (err) { /* best effort */ }
   const ms = stripMs(e.clientX);
   if (tool === 'razor') {
     // both ends of the drag are kept in CANVAS pixels, the blade's own unit --
@@ -2497,6 +2566,7 @@ strip.addEventListener('pointerdown', e => {
   e.preventDefault();
 });
 strip.addEventListener('pointermove', e => {
+  if (stripDrag && stripDrag.kind === 'scrub') { seekMs(stripMs(e.clientX)); return; }
   if (!stripEdit) return;
   if (stripDrag && stripDrag.kind === 'razor') {
     stripRazorX = stripX(stripMs(e.clientX));
@@ -2515,6 +2585,11 @@ strip.addEventListener('pointermove', e => {
     : (edgeAtMs(ms, stripTol()) >= 0 ? 'col-resize' : 'ew-resize'));
 });
 strip.addEventListener('pointerup', e => {
+  if (stripDrag && stripDrag.kind === 'scrub') {
+    stripDrag = null;
+    try { strip.releasePointerCapture(e.pointerId); } catch (err) { /* already gone */ }
+    return;
+  }
   if (!stripEdit || !stripDrag) return;
   const d = stripDrag;
   stripDrag = null;
@@ -2631,7 +2706,11 @@ function partitionOf(c) {
     const hi = Math.max(0, Math.min(dur, e.hi_ms));
     if (hi <= lo) continue;
     if (lo > t) out.push({ lo: t, hi: lo, model: c.model, gap: true });
-    out.push({ lo, hi, model: e.model, gap: false, wave: e.wave || null });
+    // the two exemptions travel with the piece the same way its recipe does.
+    // Absent (every span written before they existed) reads as the defaults:
+    // limits ignored, cuts kept.
+    out.push({ lo, hi, model: e.model, gap: false, wave: e.wave || null,
+               noLimit: e.no_limit !== false, noCuts: e.no_cuts === true });
     t = hi;
   }
   if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
@@ -2646,7 +2725,13 @@ function spansPayload() {
                const o = { lo_ms: s.lo, hi_ms: s.hi, model: s.model };
                // the recipe rides ONLY on a manual piece, so every ordinary
                // span stays exactly the shape it always was
-               if (s.model === MANUAL && s.wave) o.wave = s.wave;
+               if (s.model === MANUAL && s.wave) {
+                 o.wave = s.wave;
+                 // ...and so do its two switches, for the same reason: a
+                 // model span has no drawing to exempt from anything
+                 o.no_limit = s.noLimit !== false;
+                 o.no_cuts = s.noCuts === true;
+               }
                return o;
              });
 }
@@ -2854,10 +2939,30 @@ function setDrawer(off) {
 $('drawerToggle').onclick = () => setDrawer(!document.body.classList.contains('drawer-off'));
 $('drawerGrip').onclick = () => setDrawer(false);
 
+// The manual-fill panel is MOVED beside the selected piece (see
+// `renderSegs`), which puts it inside `#segList` -- a node `renderSegs`
+// empties every pass. A live reference is held here so the panel survives
+// its own container being cleared: `list.innerHTML = ''` detaches the node,
+// it does not destroy it, and `$('wavePanel')` would be null the second time
+// round. Resolved once, at first use, and never rebuilt.
+let wavePanelEl = null;
+function wavePanel() {
+  if (!wavePanelEl) wavePanelEl = $('wavePanel');
+  return wavePanelEl;
+}
+
 // ---- the list -------------------------------------------------------------
 function renderSegs() {
   const list = $('segList');
   if (!list) return;
+  // The panel rides INSIDE the list when a hand-drawn piece is selected, and
+  // the list is emptied on every pass -- so it is lifted out and parked at its
+  // home position first. Parking it up front (rather than only when nothing is
+  // selected) means every early return below leaves it in the document, where
+  // `getElementById` can still find it, instead of detached.
+  const wp = wavePanel();
+  const note = $('segNote');
+  if (wp && note && note.parentNode) note.parentNode.insertBefore(wp, note.nextSibling);
   list.innerHTML = '';
   if (!state) return;
   const c = state.clips[cur];
@@ -2910,6 +3015,10 @@ function renderSegs() {
     row.append(sw, n, t, sel, cf);
     row.onclick = () => { selSeg = i; renderSegs(); seekMs(s.lo + 1); };
     list.append(row);
+    // ...and the controls for a hand-drawn piece go right under the row they
+    // edit. With a dozen pieces the panel used to sit at the foot of the list,
+    // a screen away from the piece it changes.
+    if (i === selSeg && s.model === MANUAL && wp) row.after(wp);
   });
   labelHist();
   // the panel follows the selection, and it is rebuilt from the piece every
@@ -2993,8 +3102,18 @@ function editWave(fn) {
   fn(s.wave);
   commitSegs();
 }
+/** The same for the two switches, which belong to the PIECE rather than to
+ *  its recipe: the wave says what shape it is, these say how much of the
+ *  model's own machinery still applies to it. */
+function editPiece(fn) {
+  const s = manualSeg();
+  if (!s) return;
+  pushSegUndo('page.hist.wave', s.lo);
+  fn(s);
+  commitSegs();
+}
 function renderWavePanel() {
-  const el = $('wavePanel');
+  const el = wavePanel();
   if (!el) return;
   const s = manualSeg();
   el.hidden = !s;
@@ -3017,6 +3136,10 @@ function renderWavePanel() {
   $('wpPeriod').value = cyclesPerSec(w.period_s);
   $('wpMirrorT').checked = !!w.mirror_time;
   $('wpMirrorA').checked = !!w.mirror_amp;
+  // absent reads as the defaults the server also assumes: limits ignored
+  // (drawing by hand IS taking responsibility) and cuts kept
+  $('wpNoLimit').checked = s.noLimit !== false;
+  $('wpNoCuts').checked = s.noCuts === true;
   renderWaveParams();
   drawWaveThumb();
 }
@@ -3151,6 +3274,12 @@ if ($('wpMirrorT')) $('wpMirrorT').onchange = () => editWave(w => {
 });
 if ($('wpMirrorA')) $('wpMirrorA').onchange = () => editWave(w => {
   w.mirror_amp = $('wpMirrorA').checked;
+});
+if ($('wpNoLimit')) $('wpNoLimit').onchange = () => editPiece(s => {
+  s.noLimit = $('wpNoLimit').checked;
+});
+if ($('wpNoCuts')) $('wpNoCuts').onchange = () => editPiece(s => {
+  s.noCuts = $('wpNoCuts').checked;
 });
 
 function updateSegNote() {
