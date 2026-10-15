@@ -532,6 +532,7 @@
   "wave.glide": "单向长滑",
   "wave.glide.h": "只走一趟、不回来。不是周期波形，所以它忽略周期，整段滑一趟。",
   "wave.p.round": "圆角占比",
+  "wave.p.peak": "顶点位置 (0-1)",
   "wave.p.rise": "上升占比",
   "wave.p.fall": "下降占比",
   "wave.p.floor": "平底占比",
@@ -548,5 +549,9 @@
   "page.wave.sec": "次/秒",
   "page.wave.mirrorTime": "时间反序",
   "page.wave.mirrorAmp": "上下翻转",
+  "page.wave.noLimit": "无视限制",
+  "page.wave.noLimit.tip": "按图形自己的斜率写盘：这一段直接从波形解出，不再套速度上限。比设备更快的手绘，就是你画的那张图。",
+  "page.wave.noCuts": "忽略切点",
+  "page.wave.noCuts.tip": "这一段不理会视频本身的镜头切点。不勾时，落在段内的切点和其他段一样保留接缝保护。",
   "page.hist.wave": "调整波形"
 }

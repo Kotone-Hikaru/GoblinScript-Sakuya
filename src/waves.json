@@ -5,13 +5,18 @@
     "and a page reload rather than a rebuild. Evaluated by src/wave.rs.",
     "",
     "A wave is a list of SEGMENTS, walked in order from the start of a cycle:",
-    "  w    relative duration -- a number, or the name of one of this wave's",
-    "       params. Weights are normalized, so 13/37/50 means the first segment",
-    "       takes 13% of the cycle. Editing one weight redistributes the rest,",
-    "       which is what 'rise 13% / fall 37% / floor 50%' has to mean.",
+    "  w    relative duration -- a number, or an ARITHMETIC EXPRESSION over this",
+    "       wave's params: names, numbers, + - * / and parentheses. Weights are",
+    "       normalized, so 13/37/50 means the first segment takes 13% of the",
+    "       cycle. Editing one weight redistributes the rest, which is what",
+    "       'rise 13% / fall 37% / floor 50%' has to mean.",
     "  to   the level at the END of the segment, 0-100 on the wave's own scale",
-    "       (0 = lower bound, 100 = upper bound), or the name of a param.",
+    "       (0 = lower bound, 100 = upper bound), or such an expression.",
     "  ease the easing curve for this segment; see EASINGS in src/wave.rs.",
+    "",
+    "The expressions are what let a knob MOVE a vertex with no code at all:",
+    "'peak / (1-peak)' puts the apex where the apex slider says, 'round/2'",
+    "sizes a corner off the radius slider, and each still reads as its meaning.",
     "",
     "A cycle always STARTS at level 0. Phase, the two mirror switches, the",
     "repeat count, the cadence and the absolute lower/upper bounds are all",
@@ -27,10 +32,12 @@
       "name": "wave.triangle",
       "hint": "wave.triangle.h",
       "periodic": true,
-      "params": [],
+      "params": [
+        { "key": "peak", "label": "wave.p.peak", "def": 0.5, "min": 0.05, "max": 0.95 }
+      ],
       "segments": [
-        { "w": 1, "to": 100, "ease": "linear" },
-        { "w": 1, "to": 0, "ease": "linear" }
+        { "w": "peak",     "to": 100, "ease": "linear" },
+        { "w": "1 - peak", "to": 0,   "ease": "linear" }
       ]
     },
     {
@@ -50,11 +57,16 @@
       "hint": "wave.rounded_tri.h",
       "periodic": true,
       "params": [
-        { "key": "round", "label": "wave.p.round", "def": 25, "min": 0, "max": 100, "unit": "%" }
+        { "key": "round", "label": "wave.p.round", "def": 25,  "min": 0,    "max": 100, "unit": "%" },
+        { "key": "peak",  "label": "wave.p.peak",  "def": 0.5, "min": 0.05, "max": 0.95 }
       ],
       "segments": [
-        { "w": 1, "to": 100, "ease": "out" },
-        { "w": 1, "to": 0, "ease": "out" }
+        { "w": "round*peak*2",         "to": "round/2",       "ease": "in" },
+        { "w": "(100-round)*peak*2",   "to": "100-round/2",   "ease": "linear" },
+        { "w": "round*peak*2",         "to": 100,             "ease": "out" },
+        { "w": "round*(1-peak)*2",     "to": "100-round/2",   "ease": "in" },
+        { "w": "(100-round)*(1-peak)*2", "to": "round/2",     "ease": "linear" },
+        { "w": "round*(1-peak)*2",     "to": 0,               "ease": "out" }
       ]
     },
     {

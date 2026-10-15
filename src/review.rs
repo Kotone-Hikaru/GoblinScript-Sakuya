@@ -111,6 +111,21 @@ pub struct Span {
     /// every session before this existed still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wave: Option<crate::wave::WaveSpec>,
+    /// Manual only, and ON when absent: write the piece at its own slopes
+    /// rather than running the device's speed cap over it. A page built before
+    /// this existed sends no field, and ignoring the cap is what a drawing
+    /// wants -- the cap is what used to flatten a fast piece's peaks.
+    #[serde(default = "yes")]
+    pub no_limit: bool,
+    /// Manual only, and OFF when absent: leave the video's own shot cuts out of
+    /// this piece. Off, a cut inside the piece keeps the seam protection every
+    /// other piece gets.
+    #[serde(default)]
+    pub no_cuts: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The manifest's "normal" values for the two preset axes. The page shows each
@@ -1348,7 +1363,7 @@ mod tests {
         let base = Choice {
             model: "a".into(),
             compare: None,
-            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None }],
+            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false }],
             cuts_ms: None,
         };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
@@ -1369,9 +1384,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None },
-                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None },
-                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None },
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: false },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false },
             ]
         );
         // an empty list is a real answer: back to one model over the whole clip

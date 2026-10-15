@@ -1226,17 +1226,29 @@ pub fn flags_line(p: &Params) -> String {
 /// then caps how fast consecutive actions may move (so the cap reads final
 /// device units). The model's draft upstream is untouched.
 ///
-/// `manual_ms` are the hand-drawn pieces. Their positions skip the INTENSITY
+/// `manual` are the hand-drawn pieces. Their positions skip the INTENSITY
 /// scale: a manual band is not a model's guess to be nudged by a whole-clip
 /// stylistic knob -- the two numbers the user typed ARE the answer, and
 /// multiplying them would move the floor and ceiling they set. `range` (a
-/// device-span mapping the user set for their own hardware) and `max_speed`
-/// (a device limit) still apply: those are the user's knobs and the device's
-/// physics, not the model's opinion about the drawing.
-pub fn shape_actions(actions: &mut [Action], p: &Params, manual_ms: &[(f64, f64)]) {
+/// device-span mapping the user set for their own hardware) still applies:
+/// that is the user's knob, not the model's opinion about the drawing.
+///
+/// `max_speed` applies to everything EXCEPT a piece that asked to be written
+/// at its own slopes (`ManualSpan::no_limit`, the panel's default): the cap is
+/// what used to grind a fast drawing's peaks down a unit at a time. A span
+/// that keeps the cap gets the clamp's own causal rule, and one that a
+/// clamped action sits in does NOT re-anchor the cap for its neighbours -- the
+/// walk skips over exempt actions rather than reading a position this stage
+/// did not write.
+pub fn shape_actions(actions: &mut [Action], p: &Params, manual: &[crate::wave::ManualSpan]) {
     let (lo, hi) = p.range;
+    let exempt = |at: i64| -> bool {
+        manual
+            .iter()
+            .any(|m| m.no_limit && at as f64 >= m.lo_ms && (at as f64) < m.hi_ms)
+    };
     for a in actions.iter_mut() {
-        let k = if in_manual(manual_ms, a.at as f64) {
+        let k = if in_manual(manual, a.at as f64) {
             1.0
         } else {
             p.intensity
@@ -1249,23 +1261,153 @@ pub fn shape_actions(actions: &mut [Action], p: &Params, manual_ms: &[(f64, f64)
         // causal on the ALREADY-CLAMPED predecessor, and the step TRUNCATED
         // rather than rounded -- across a 1-2 ms gap half a unit is hundreds
         // of pos/s, so rounding can hand back a transition above the cap.
-        for i in 1..actions.len() {
-            let dt = (actions[i].at - actions[i - 1].at) as f64 / 1000.0;
+        // Exempt actions are left alone AND skipped as predecessors: reading a
+        // position the cap never wrote would let a drawing hand the next model
+        // action a step off its own timing.
+        let mut prev: Option<usize> = None;
+        for i in 0..actions.len() {
+            if exempt(actions[i].at) {
+                prev = None;
+                continue;
+            }
+            let j = match prev {
+                Some(j) => j,
+                None => {
+                    prev = Some(i);
+                    continue;
+                }
+            };
+            let dt = (actions[i].at - actions[j].at) as f64 / 1000.0;
             let lim = p.max_speed * dt;
-            let prev = actions[i - 1].pos;
-            let d = actions[i].pos - prev;
+            let pj = actions[j].pos;
+            let d = actions[i].pos - pj;
             if (d as f64).abs() > lim {
                 let step = lim as i64;
-                actions[i].pos = (prev + if d > 0 { step } else { -step })
-                    .clamp(0, 100);
+                actions[i].pos = (pj + if d > 0 { step } else { -step }).clamp(0, 100);
             }
+            prev = Some(i);
+        }
+    }
+}
+
+/// Replace every action inside a hand-drawn piece with the piece SOLVED from
+/// its wave.
+///
+/// This is the last word on a drawing's SHAPE, and it is deliberately not a
+/// filter over the styler's output. The row scan that produced those actions
+/// can only report a wave at row times, and it reads the integer-rounding
+/// jitter of the smoothed marginal as extra reversals. So a peak lands wherever
+/// the nearest rows happen to sit (93 on a 0.5 s triangle at 30 rows/s) and the
+/// middle of a long piece grows stray vertices. The wave is a function of time:
+/// evaluating it off the row grid gives exact boundary times and levels, and
+/// thinning each leg to `eps` units keeps an eased arc while a straight leg
+/// stays two points.
+///
+/// A piece's actions all go, including any the model's vertex decoder FORCED
+/// into it -- those carry no mark saying they were forced, and a piece written
+/// by hand owes the model nothing. Where the two lists share a millisecond the
+/// drawing wins, including at the piece's own last moment: `hi_ms` is where the
+/// drawing ends, and the model's action there is the next piece's opening.
+///
+/// `cuts_ms` are the clip's interior shot cuts. A piece that keeps its cuts
+/// (`no_cuts` false, the panel's default) still gets the seam protection every
+/// other piece gets, because the drawing's vertices were spliced in AFTER the
+/// vertex pass ran its own seam ease and slew. A cut inside the piece is real
+/// video, and a 336 ms hole in the drawing is not what the user drew; the panel
+/// offers the switch for the times it is.
+pub fn splice_manual(
+    actions: &mut Vec<Action>,
+    manual: &[crate::wave::ManualSpan],
+    cuts_ms: &[f64],
+    p: &Params,
+    row_ms: f64,
+) {
+    if manual.is_empty() {
+        return;
+    }
+    let (rlo, rhi) = p.range;
+    let mut kept: Vec<Action> = actions
+        .iter()
+        .filter(|a| !in_manual(manual, a.at as f64))
+        .copied()
+        .collect();
+    let mut drawn: Vec<Action> = Vec::new();
+    for m in manual {
+        if m.hi_ms <= m.lo_ms {
+            continue;
+        }
+        let from = drawn.len();
+        for (t, lv) in
+            crate::wave::span_vertices(&m.spec, m.hi_ms - m.lo_ms, crate::wave::VERTEX_EPS)
+        {
+            // `range` is the user's device-span mapping, and a solved drawing
+            // has to wear it exactly as the row scan's positions did -- the
+            // band the wave sweeps is in 0..100 and this is what puts it on
+            // the hardware. Intensity deliberately does NOT apply: the band
+            // the user typed is the answer, not a knob to be multiplied.
+            let x = (rlo + lv / 100.0 * (rhi - rlo)).clamp(0.0, 100.0);
+            drawn.push(Action {
+                at: (m.lo_ms + t).round() as i64,
+                pos: x.round() as i64,
+            });
+        }
+        if !m.no_limit && p.max_speed > 0.0 {
+            // the switch is OFF: this piece keeps the device's cap, exactly as
+            // the rest of the list does. Its own run only -- a neighbour's
+            // timing is not this drawing's to re-anchor.
+            clamp_run(&mut drawn[from..], p.max_speed);
+        }
+    }
+    // keep the model first, so a stable sort leaves the drawing later in a run
+    // of equal times; dedup backwards, and the drawing is what survives
+    kept.append(&mut drawn);
+    kept.sort_by_key(|a| a.at);
+    kept.reverse();
+    kept.dedup_by_key(|a| a.at);
+    kept.reverse();
+    *actions = kept;
+    if p.cut_ease > 0.0 {
+        let keepers: Vec<f64> = cuts_ms
+            .iter()
+            .copied()
+            .filter(|&c| {
+                manual
+                    .iter()
+                    .any(|m| !m.no_cuts && c > m.lo_ms && c < m.hi_ms)
+            })
+            .collect();
+        if !keepers.is_empty() {
+            slew_cut_seams(actions, &keepers, p.cut_ease, row_ms);
+        }
+    }
+}
+
+/// `common.clamp_speed` over one contiguous run: causal on the ALREADY-CLAMPED
+/// predecessor, the step TRUNCATED rather than rounded -- across a 1-2 ms gap
+/// half a unit is hundreds of pos/s, so rounding can hand back a transition
+/// above the cap.
+fn clamp_run(actions: &mut [Action], max_speed: f64) {
+    for i in 1..actions.len() {
+        let dt = (actions[i].at - actions[i - 1].at) as f64 / 1000.0;
+        let lim = max_speed * dt;
+        let prev = actions[i - 1].pos;
+        let d = actions[i].pos - prev;
+        if (d as f64).abs() > lim {
+            let step = lim as i64;
+            actions[i].pos = (prev + if d > 0 { step } else { -step }).clamp(0, 100);
         }
     }
 }
 
 /// Is `t` (milliseconds on the clip's clock) inside a hand-drawn piece?
-fn in_manual(spans: &[(f64, f64)], t: f64) -> bool {
-    spans.iter().any(|&(a, b)| t >= a && t < b)
+fn in_manual(spans: &[crate::wave::ManualSpan], t: f64) -> bool {
+    spans.iter().any(|m| t >= m.lo_ms && t < m.hi_ms)
+}
+
+/// The pieces' clocks alone, for the row partition and the stamp -- and for
+/// `StyleCfg`, which carries only what the in-compose stages need.
+pub fn manual_pairs(spans: &[crate::wave::ManualSpan]) -> Vec<(f64, f64)> {
+    spans.iter().map(|m| (m.lo_ms, m.hi_ms)).collect()
 }
 
 /// The rows a set of millisecond spans covers, `[lo, hi)`, clamped to `n`.
@@ -3131,9 +3273,195 @@ mod tests {
         assert_eq!(a[1].pos, 50);
     }
 
+    /// A piece's recipe, for the splice tests below.
+    fn drawn_spec(id: &str, period_s: f64, lo: f64, hi: f64) -> crate::wave::WaveSpec {
+        crate::wave::WaveSpec {
+            id: id.to_string(),
+            lo,
+            hi,
+            period_s,
+            params: crate::wave::Params::new(),
+            mirror_time: false,
+            mirror_amp: false,
+        }
+    }
+
+    fn drawn_span(
+        lo_ms: f64,
+        hi_ms: f64,
+        spec: crate::wave::WaveSpec,
+        no_limit: bool,
+        no_cuts: bool,
+    ) -> crate::wave::ManualSpan {
+        crate::wave::ManualSpan { lo_ms, hi_ms, spec, no_limit, no_cuts }
+    }
+
+    /// The bug the user photographed: a piece written by hand came back with
+    /// spurious vertices in the middle and peaks that never reached the band.
+    /// Both were the row scan's doing -- the piece was never solved, only
+    /// sampled at 30 Hz and handed the model's own forced apexes.
     #[test]
-    fn shift_cap_bounds_the_lock_correction() {
-        // a flat mid track called a top dwell against a far rail: uncapped,
+    fn a_hand_drawn_piece_is_solved_rather_than_scanned() {
+        // a model list flat at mid-range, on the 30 Hz row clock, 3 s long
+        let n = 90;
+        let mut a: Vec<Action> = (0..n)
+            .map(|i| Action { at: (i as f64 * 1000.0 / 30.0).round() as i64, pos: 50 })
+            .collect();
+        // ...with a triangle drawn over the middle second, 0.5 s a cycle
+        let m = drawn_span(1000.0, 2000.0, drawn_spec("triangle", 0.5, 0.0, 100.0), true, false);
+        splice_manual(&mut a, &[m], &[], &Params::default(), 1000.0 / 30.0);
+
+        // nothing of the model survives inside: every row there is the drawing
+        for x in &a {
+            if x.at > 1000 && x.at < 2000 {
+                assert!(
+                    x.pos == 0 || x.pos == 100,
+                    "a scanned row at {} survived at {}",
+                    x.at,
+                    x.pos
+                );
+            }
+        }
+        // and the peak lands ON the ceiling, which is the whole complaint: on
+        // this cadence a row scan can only ever report 93
+        assert!(
+            a.iter().any(|x| x.at == 1250 && x.pos == 100),
+            "the peak must be written at its own time and its own level: {:?}",
+            a.iter().filter(|x| (1000..=2000).contains(&x.at)).collect::<Vec<_>>()
+        );
+        // a triangle's corners and nothing else: two cycles of floor/peak/floor
+        let inside: Vec<Action> =
+            a.iter().filter(|x| (1000..=2000).contains(&x.at)).copied().collect();
+        assert_eq!(inside.len(), 5, "got {inside:?}");
+        // and the rows outside are untouched
+        assert!(a.iter().any(|x| x.at == 100 && x.pos == 50));
+    }
+
+    /// The device cap is the OTHER thing that flattened a fast drawing, and
+    /// the switch beside the piece is how the author says "this one is mine".
+    #[test]
+    fn the_limit_switch_is_the_drawings_own_slope() {
+        // 10 cycles a second across the band: 100 units every 50 ms is 2000
+        // pos/s, three times the device cap
+        let spec = drawn_spec("triangle", 0.1, 0.0, 100.0);
+        let mk = || {
+            let mut a: Vec<Action> = (0..30)
+                .map(|i| Action { at: (i as f64 * 1000.0 / 30.0).round() as i64, pos: 50 })
+                .collect();
+            splice_manual(&mut a, &[drawn_span(0.0, 1000.0, spec.clone(), true, false)], &[], &Params::default(), 1000.0 / 30.0);
+            a
+        };
+        let free = mk();
+        let top = free.iter().map(|x| x.pos).max().unwrap();
+        assert_eq!(top, 100, "the drawing's own slope must reach the ceiling");
+
+        // now with the switch OFF it keeps the device's cap, like every other
+        // row: 30 units per 50 ms, so the swing collapses to 0..30
+        let mut a: Vec<Action> = (0..30)
+            .map(|i| Action { at: (i as f64 * 1000.0 / 30.0).round() as i64, pos: 50 })
+            .collect();
+        splice_manual(
+            &mut a,
+            &[drawn_span(0.0, 1000.0, spec.clone(), false, false)],
+            &[],
+            &Params::default(),
+            1000.0 / 30.0,
+        );
+        let top = a.iter().map(|x| x.pos).max().unwrap();
+        assert_eq!(top, 30, "capped: one cap-step above the floor and no more");
+        // every step is inside the cap, which is the promise the switch makes
+        for w in a.windows(2) {
+            let dt = (w[1].at - w[0].at) as f64 / 1000.0;
+            assert!(
+                (w[1].pos - w[0].pos).abs() as f64 <= 600.0 * dt + 1e-9,
+                "a capped piece stepped {} in {dt} s",
+                (w[1].pos - w[0].pos).abs()
+            );
+        }
+    }
+
+    /// `range` is the user's device-span mapping and a solved drawing has to
+    /// wear it. It deliberately does NOT wear `intensity`: the band the user
+    /// typed into the panel is the answer, not a knob to be multiplied.
+    #[test]
+    fn a_drawing_wears_the_range_and_not_the_intensity() {
+        let spec = drawn_spec("triangle", 1.0, 0.0, 100.0);
+        let run = |range: (f64, f64), intensity: f64| {
+            let mut a = vec![Action { at: -5000, pos: 50 }];
+            let p = Params { range, intensity, ..Params::default() };
+            splice_manual(
+                &mut a,
+                &[drawn_span(0.0, 1000.0, spec.clone(), true, false)],
+                &[],
+                &p,
+                1000.0 / 30.0,
+            );
+            let inside: Vec<Action> = a.iter().filter(|x| (0..=1000).contains(&x.at)).copied().collect();
+            inside.iter().map(|x| x.pos).collect::<Vec<_>>()
+        };
+        // a triangle over 0..1000 ms, one cycle: 0, 100, 0
+        assert_eq!(run((0.0, 100.0), 1.0), vec![0, 100, 0]);
+        // a device span of 20..80 maps the same drawing onto those limits
+        let r = run((20.0, 80.0), 1.0);
+        assert_eq!(r, vec![20, 80, 20], "the drawing ignored the device range");
+        // and intensity, which scales every other row, must not touch it
+        let half = run((0.0, 100.0), 0.5);
+        assert_eq!(half, vec![0, 100, 0], "intensity scaled a hand-drawn band");
+    }
+
+    /// The cut switch. With cuts KEPT the seam is eased exactly as it is for
+    /// any other row; a piece the author has called their own can be taken
+    /// out from under it.
+    #[test]
+    fn the_cut_switch_decides_whether_a_seam_is_eased() {
+        let spec = drawn_spec("triangle", 0.1, 0.0, 100.0);
+        let run = |no_cuts: bool| {
+            let mut a: Vec<Action> = (0..30)
+                .map(|i| Action { at: (i as f64 * 1000.0 / 30.0).round() as i64, pos: 50 })
+                .collect();
+            let p = Params { cut_ease: 250.0, ..Params::default() };
+            splice_manual(
+                &mut a,
+                &[drawn_span(0.0, 1000.0, spec.clone(), true, no_cuts)],
+                &[500.0],
+                &p,
+                1000.0 / 30.0,
+            );
+            a
+        };
+        let kept = run(false);
+        let ignored = run(true);
+        let near = |v: &[Action]| {
+            v.iter()
+                .filter(|x| (400..=600).contains(&x.at))
+                .map(|x| (x.at, x.pos))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            near(&kept),
+            near(&ignored),
+            "the cut switch changed nothing, so it is not wired"
+        );
+        // with the cut ignored the piece is exactly its own vertices
+        let mut bare: Vec<Action> = (0..30)
+            .map(|i| Action { at: (i as f64 * 1000.0 / 30.0).round() as i64, pos: 50 })
+            .collect();
+        splice_manual(
+            &mut bare,
+            &[drawn_span(0.0, 1000.0, spec.clone(), true, true)],
+            &[],
+            &Params::default(),
+            1000.0 / 30.0,
+        );
+        assert_eq!(
+            near(&ignored),
+            near(&bare),
+            "ignoring the cut must leave the drawing completely alone"
+        );
+    }
+
+    #[test]
+    fn shift_cap_bounds_the_lock_correction() {        // a flat mid track called a top dwell against a far rail: uncapped,
         // the lock walks the mean the whole way; capped, no row moves more
         // than the cap (0 = uncapped stays the pre-cap behavior)
         let n = 60;

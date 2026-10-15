@@ -1550,7 +1550,7 @@ fn restyle_mixed(
     tracks: &style::Tracks,
     cap_x: &[f64],
     cap_f0: &[f64],
-    manual_ms: &[(f64, f64)],
+    manual_ms: &[crate::wave::ManualSpan],
 ) -> Result<(usize, Vec<[i64; 2]>, f64)> {
     let s = style_draft_with(d, man, params, &[], tracks, cap_x, cap_f0, manual_ms);
     write_styled(&d.dst, &s, man, params)?;
@@ -1669,7 +1669,13 @@ fn mixed_tracks(
     p: &style::Params,
     choice: &review::Choice,
     base: &Bundle,
-) -> Result<(style::Tracks, Vec<f64>, Vec<f64>, Vec<f64>, Vec<(f64, f64)>)> {
+) -> Result<(
+    style::Tracks,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<crate::wave::ManualSpan>,
+)> {
     let n = d.tracks.vmarg.len();
     let none = Vec::new();
     if choice.spans.is_empty() {
@@ -1686,11 +1692,11 @@ fn mixed_tracks(
     let mut cap_x = vec![base.manifest.amp_cap_x; n];
     let mut cap_f0 = vec![base.manifest.amp_cap_f0; n];
     // Manual pieces, in the clip's milliseconds. Reported back so the styler
-    // can keep two things off them: the output-domain intensity scale (a hand-
-    // dialled band is already the answer) and the gap filler (whose whole job
-    // is to stamp rhythm over rows that look still, which a wave's own floor
-    // always does).
-    let mut manual_ms: Vec<(f64, f64)> = Vec::new();
+    // can keep the model off them (the output-domain intensity scale, and the
+    // gap filler, whose whole job is to stamp rhythm over rows that look still
+    // -- which a wave's own floor always does) and so the finished list can be
+    // rewritten here from the waves themselves.
+    let mut manual_ms: Vec<crate::wave::ManualSpan> = Vec::new();
     // Resolve every span's tracks FIRST (this can need a head pass, which
     // borrows `d` mutably), then splice from the owned copies.
     let mut pieces: Vec<(usize, usize, style::Tracks, f64, f64)> = Vec::new();
@@ -1733,7 +1739,13 @@ fn mixed_tracks(
             continue;
         }
         if crate::wave::fill_rows(&mut mixed.level, &mut mixed.vmarg, &d.times, lo, hi, spec) {
-            manual_ms.push((sp.lo_ms, sp.hi_ms));
+            manual_ms.push(crate::wave::ManualSpan {
+                lo_ms: sp.lo_ms,
+                hi_ms: sp.hi_ms,
+                spec: spec.clone(),
+                no_limit: sp.no_limit,
+                no_cuts: sp.no_cuts,
+            });
         }
     }
     let conf = mixed.conf.clone();
@@ -1794,14 +1806,14 @@ fn style_draft_with(
     tracks: &style::Tracks,
     cap_x: &[f64],
     cap_f0: &[f64],
-    manual_ms: &[(f64, f64)],
+    manual_ms: &[crate::wave::ManualSpan],
 ) -> Styled {
     let mut cfg = style_cfg(man, params);
     if !cap_x.is_empty() {
         cfg.amp_cap_x_rows = cap_x.to_vec();
         cfg.amp_cap_f0_rows = cap_f0.to_vec();
     }
-    cfg.manual_ms = manual_ms.to_vec();
+    cfg.manual_ms = style::manual_pairs(manual_ms);
     // Level styling is carrier-only: no event segmentation, no sub-frame
     // times, no forced apexes -- exactly jepa_infer's non-composed path.
     let (p, sub, force, filled, phase_runs) = match params.style {
@@ -1826,6 +1838,17 @@ fn style_draft_with(
         cfg.cut_ease,
     );
     style::shape_actions(&mut actions, params, manual_ms);
+    // The drawing's own vertices LAST, before the clock moves: a piece written
+    // by hand is solved from its wave rather than read off the row scan above,
+    // so its peaks land on the band it was given and its middle stays as clean
+    // as the shape is. On the CLIP's clock, like `manual_ms` itself.
+    style::splice_manual(
+        &mut actions,
+        manual_ms,
+        &d.cuts_ms,
+        params,
+        1000.0 / cfg.fps,
+    );
     // Back onto the source clock. A VR prep that trimmed a range drafted a
     // CLIP, and every row above is on the clip's clock -- but the file the user
     // plays is the whole video, so the script that lands beside it has to be
@@ -4711,6 +4734,8 @@ mod retrack_tests {
                 // a model span, not a hand-drawn one: it names a bundle and
                 // carries no waveform
                 wave: None,
+                no_limit: true,
+                no_cuts: false,
             }],
             cuts_ms: Some(cuts1.clone()),
         };

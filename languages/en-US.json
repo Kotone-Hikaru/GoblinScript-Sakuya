@@ -484,6 +484,7 @@
   "wave.glide": "one-way glide",
   "wave.glide.h": "Travels once and does not come back. Not a periodic wave, so it ignores the cycle and glides across the whole piece.",
   "wave.p.round": "corner radius",
+  "wave.p.peak": "apex at (0-1)",
   "wave.p.rise": "rise share",
   "wave.p.fall": "fall share",
   "wave.p.floor": "floor share",
@@ -500,5 +501,9 @@
   "page.wave.sec": "cycles/s",
   "page.wave.mirrorTime": "time reverse",
   "page.wave.mirrorAmp": "flip",
+  "page.wave.noLimit": "ignore limits",
+  "page.wave.noLimit.tip": "write the drawing at its own slopes: the piece is solved from the wave, so no speed cap is run over it. A drawing faster than the device can play is the drawing you asked for.",
+  "page.wave.noCuts": "ignore cuts",
+  "page.wave.noCuts.tip": "leave the video's shot cuts out of this piece. Off, a cut inside the piece keeps its seam protection like any other piece.",
   "page.hist.wave": "waveform"
 }

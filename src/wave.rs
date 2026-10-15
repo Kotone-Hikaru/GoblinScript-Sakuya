@@ -76,6 +76,130 @@ pub fn ease(name: &str, u: f64) -> f64 {
     }
 }
 
+/// A tiny arithmetic expression over a wave's params: numbers, param names,
+/// `+ - * /`, parentheses and a unary minus.
+///
+/// It exists so a SHAPE can stay DATA. A knob that moves a vertex -- the apex
+/// of a triangle, the corner radius of a rounded one -- is a RATIO of the
+/// legs, and writing that ratio as a number would freeze it at one setting:
+/// `"1-peak"` and `"round/2"` let `waves.json` say what it means, which is the
+/// file's own rule (a new knob is one entry, and no code moves). A bare name
+/// is still a bare name: `"rise"` resolves through this same table and
+/// evaluates to the number it always did, so every wave written before this
+/// parses to exactly the shape it had.
+fn eval_expr(src: &str, p: &Params) -> Option<f64> {
+    let mut e = Expr { s: src.as_bytes(), i: 0, p };
+    let v = e.sum()?;
+    e.ws();
+    if e.i == e.s.len() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+struct Expr<'a> {
+    s: &'a [u8],
+    i: usize,
+    p: &'a Params,
+}
+
+impl Expr<'_> {
+    fn ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn sum(&mut self) -> Option<f64> {
+        let mut v = self.prod()?;
+        loop {
+            self.ws();
+            match self.s.get(self.i).copied() {
+                Some(b'+') => {
+                    self.i += 1;
+                    v += self.prod()?;
+                }
+                Some(b'-') => {
+                    self.i += 1;
+                    v -= self.prod()?;
+                }
+                _ => return Some(v),
+            }
+        }
+    }
+    fn prod(&mut self) -> Option<f64> {
+        let mut v = self.unary()?;
+        loop {
+            self.ws();
+            match self.s.get(self.i).copied() {
+                Some(b'*') => {
+                    self.i += 1;
+                    v *= self.unary()?;
+                }
+                Some(b'/') => {
+                    self.i += 1;
+                    let d = self.unary()?;
+                    // a zero divisor is a malformed shape, not a zero leg: the
+                    // caller falls back rather than shipping a NaN width
+                    if d == 0.0 {
+                        return None;
+                    }
+                    v /= d;
+                }
+                _ => return Some(v),
+            }
+        }
+    }
+    fn unary(&mut self) -> Option<f64> {
+        self.ws();
+        match self.s.get(self.i).copied() {
+            Some(b'-') => {
+                self.i += 1;
+                Some(-self.unary()?)
+            }
+            Some(b'+') => {
+                self.i += 1;
+                self.unary()
+            }
+            _ => self.atom(),
+        }
+    }
+    fn atom(&mut self) -> Option<f64> {
+        self.ws();
+        let c = *self.s.get(self.i)?;
+        if c == b'(' {
+            self.i += 1;
+            let v = self.sum()?;
+            self.ws();
+            if self.s.get(self.i) != Some(&b')') {
+                return None;
+            }
+            self.i += 1;
+            return Some(v);
+        }
+        if c.is_ascii_digit() || c == b'.' {
+            let start = self.i;
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_digit() || self.s[self.i] == b'.')
+            {
+                self.i += 1;
+            }
+            return std::str::from_utf8(&self.s[start..self.i]).ok()?.parse().ok();
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = self.i;
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+            {
+                self.i += 1;
+            }
+            let name = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+            return self.p.get(name).and_then(Val::num);
+        }
+        None
+    }
+}
+
 /// One knob on a wave. The page builds the control from this alone, so adding
 /// a knob is one entry in `waves.json` and no front-end work at all.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -120,14 +244,14 @@ impl Segment {
     fn weight(&self, p: &Params) -> f64 {
         match &self.w {
             Val::Num(v) => *v,
-            Val::Str(k) => p.get(k).and_then(Val::num).unwrap_or(1.0),
+            Val::Str(k) => eval_expr(k, p).unwrap_or(1.0),
         }
         .max(0.0)
     }
     fn target(&self, p: &Params) -> f64 {
         let raw = match &self.to {
             Val::Num(v) => *v,
-            Val::Str(k) => p.get(k).and_then(Val::num).unwrap_or(0.0),
+            Val::Str(k) => eval_expr(k, p).unwrap_or(0.0),
         };
         raw / 100.0
     }
@@ -300,6 +424,173 @@ impl WaveSpec {
         };
         (a + (b - a) * v).clamp(0.0, 100.0)
     }
+}
+
+/// Vertical-deviation Douglas-Peucker over `(ms, level)` samples, the same
+/// rule `style::rdp` applies to a written action list -- so the vertices a
+/// drawing resolves to and the vertices RDP would keep of the same drawing
+/// agree about what "the same shape" means.
+fn rdp_points(pts: &[(f64, f64)], eps: f64) -> Vec<(f64, f64)> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let n = pts.len();
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b - a < 2 {
+            continue;
+        }
+        let (ta, pa) = pts[a];
+        let (tb, pb) = pts[b];
+        let dt = (tb - ta).max(1e-9);
+        let mut best = a + 1;
+        let mut bd = -1.0f64;
+        for (o, p) in pts[a + 1..b].iter().enumerate() {
+            let line = pa + (pb - pa) * (p.0 - ta) / dt;
+            let d = (p.1 - line).abs();
+            if d > bd {
+                bd = d;
+                best = a + 1 + o;
+            }
+        }
+        if bd > eps {
+            keep[best] = true;
+            stack.push((a, best));
+            stack.push((best, b));
+        }
+    }
+    pts.iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(p, _)| *p)
+        .collect()
+}
+
+/// How far a solved vertex may sit off the wave, position units. The panel's
+/// own accuracy need, not the device's: two units is under a fiftieth of the
+/// travel and under what a hand can place, while an eased wave still keeps its
+/// arc (a sine comes out around thirteen points a cycle; a straight leg two).
+pub const VERTEX_EPS: f64 = 2.0;
+
+/// The vertices of one hand-drawn piece, SOLVED from the wave rather than
+/// sampled on the row grid. Returns `(milliseconds into the span, level 0..100)`
+/// in ascending time; empty when the spec names a wave this build lacks.
+///
+/// Why this replaces the row scan. A row scan can only report the wave at row
+/// times, and at a cadence whose half-period is not a whole number of rows the
+/// top of every cycle falls BETWEEN two rows: the peak is then written at
+/// whatever the neighbouring rows hold (93 for a 0.5 s triangle on a 30 rows/s
+/// grid) and the piece never reaches the band it was given. The same scan hands
+/// the vertex picker a marginal that flips sign wherever integer rounding
+/// jitters, which it reads as extra reversals in the middle of the piece.
+///
+/// A solved piece has neither problem. Every leg boundary is a vertex at its
+/// exact time and its exact level -- a boundary is where one easing hands over
+/// to the next, so a peak lands on the ceiling exactly -- and inside a leg the
+/// curve is thinned to `eps` units, which keeps an eased arc and leaves a
+/// straight leg as its two endpoints.
+pub fn span_vertices(spec: &WaveSpec, span_ms: f64, eps: f64) -> Vec<(f64, f64)> {
+    let set = load();
+    let w = match set.get(&spec.id) {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+    let eff = w.resolve(&spec.params);
+    let period = if spec.period_s.is_finite() && spec.period_s >= 0.02 {
+        spec.period_s
+    } else {
+        1.0
+    };
+    let span_s = (span_ms / 1000.0).max(0.0);
+    if span_s <= 0.0 {
+        return Vec::new();
+    }
+    let weights: Vec<f64> = w.segments.iter().map(|s| s.weight(&eff)).collect();
+    let total: f64 = weights.iter().sum();
+    if !(total > 0.0) {
+        return Vec::new();
+    }
+    let mut shares: Vec<f64> = vec![0.0];
+    let mut acc = 0.0;
+    for x in &weights {
+        acc += x / total;
+        shares.push(acc);
+    }
+    // Where a boundary sits in a cycle, on the SPAN's clock. `mirror_time` is
+    // applied to `u` by the caller, so a boundary at share `b` is reached at
+    // `1 - b` of the cycle; the boundary set is the same one walked backwards.
+    let mut knots: Vec<f64> = Vec::new();
+    let cycles = (span_s / period).ceil() as usize + 1;
+    for k in 0..cycles {
+        for b in &shares {
+            let f = if spec.mirror_time {
+                (1.0 - b).rem_euclid(1.0)
+            } else {
+                *b
+            };
+            let t = k as f64 * period + f * period;
+            if t <= span_s + 1e-9 {
+                knots.push(t.clamp(0.0, span_s));
+            }
+        }
+    }
+    knots.push(0.0);
+    knots.push(span_s);
+    knots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    knots.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for i in 0..knots.len() {
+        let ta = knots[i];
+        // the boundary is exact and is never thinned away
+        out.push((ta, spec.level_at(w, ta, &eff)));
+        let tb = match knots.get(i + 1) {
+            Some(&tb) => tb,
+            None => continue,
+        };
+        if tb - ta <= 1e-9 {
+            continue;
+        }
+        // 240 Hz of sampling under the thinner: far finer than any leg an
+        // easing can draw, so the thinned result is the curve and not a
+        // property of the grid it was measured on
+        let n = (((tb - ta) * 240.0).ceil() as usize).max(8);
+        let leg: Vec<(f64, f64)> = (0..=n)
+            .map(|j| {
+                let t = ta + (tb - ta) * j as f64 / n as f64;
+                (t, spec.level_at(w, t, &eff))
+            })
+            .collect();
+        // skip(1): the leg's start is the boundary already emitted above
+        out.extend(rdp_points(&leg, eps).into_iter().skip(1));
+    }
+    // the walk above is on the wave's own clock, which is SECONDS; the caller
+    // places these on a span's millisecond clock, so hand them over in ms
+    for p in &mut out {
+        p.0 *= 1000.0;
+    }
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
+    out
+}
+
+/// One hand-drawn piece as the styler needs it: the span's clock, its recipe,
+/// and the two switches the panel offers beside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualSpan {
+    pub lo_ms: f64,
+    pub hi_ms: f64,
+    pub spec: WaveSpec,
+    /// Solve the piece at its own slopes and do not run the device's speed cap
+    /// over it. ON by default: choosing to draw a piece by hand is taking
+    /// responsibility for it, and the cap is what flattened a fast drawing's
+    /// peaks.
+    pub no_limit: bool,
+    /// Leave the shot cuts that fall inside the piece unmarked.
+    pub no_cuts: bool,
 }
 
 /// Overwrite rows `[lo, hi)` of a level track with `spec`'s wave, and hand
@@ -514,28 +805,239 @@ mod tests {
         }
     }
 
+    /// The arithmetic in `w`/`to`, which is what lets a knob move a vertex
+    /// without any code moving: `"1-peak"`, `"round/2"`, `"apex*(100-round)"`.
     #[test]
-    fn weights_are_shares_so_moving_one_moves_the_others() {
-        let set = load();
-        let w = set.get("single_peak").expect("single_peak is part of the set");
-        let p = w.defaults();
-        let peak_at = |p: &Params| {
-            let v = w.sample(p, 1000);
-            let mut best = 0;
-            for i in 1..v.len() {
-                if v[i] > v[best] {
-                    best = i;
+    fn a_leg_expresses_itself_arithmetically() {
+        let mut p = Params::new();
+        p.insert("peak".to_string(), Val::Num(0.2));
+        p.insert("round".to_string(), Val::Num(25.0));
+        // a bare name is still a bare name
+        assert_eq!(eval_expr("peak", &p), Some(0.2));
+        assert_eq!(eval_expr("round", &p), Some(25.0));
+        // the ratios shapes are actually written in
+        let close = |got: Option<f64>, want: f64| match got {
+            Some(v) => (v - want).abs() < 1e-9,
+            None => false,
+        };
+        assert!(close(eval_expr("1-peak", &p), 0.8), "{:?}", eval_expr("1-peak", &p));
+        assert!(close(eval_expr("1 - peak", &p), 0.8));
+        assert!(close(eval_expr("round/2", &p), 12.5));
+        assert!(close(eval_expr("peak*2", &p), 0.4));
+        assert!(close(eval_expr("(100-round)*peak*2", &p), 30.0));
+        assert!(close(eval_expr("round*(1-peak)*2", &p), 40.0));
+        // precedence and sign: `-peak*2` is (-peak)*2, and parens win
+        assert!(close(eval_expr("-peak*2", &p), -0.4));
+        assert!(close(eval_expr("-(peak*2)", &p), -0.4));
+        assert!(close(eval_expr("2*(3+4)", &p), 14.0));
+        assert!(close(eval_expr("2.5", &p), 2.5));
+        // a name nothing defines is not a number, and neither is a malformed
+        // shape: both fall back at the call site rather than shipping NaN
+        assert_eq!(eval_expr("nope", &p), None);
+        assert_eq!(eval_expr("peak*", &p), None);
+        assert_eq!(eval_expr("(peak", &p), None);
+        assert_eq!(eval_expr("peak 2", &p), None);
+        assert_eq!(eval_expr("1/0", &p), None);
+        assert_eq!(eval_expr("", &p), None);
+    }
+
+    #[test]
+    fn every_leg_in_the_baked_file_says_something_evaluable() {
+        // a typo in waves.json would otherwise degrade silently to a leg of
+        // weight 1 / target 0, which is a shape nobody asked for
+        for w in load().waves {
+            let p = w.defaults();
+            for (i, s) in w.segments.iter().enumerate() {
+                if let Val::Str(k) = &s.w {
+                    assert!(
+                        eval_expr(k, &p).is_some(),
+                        "{} segment {i} weight {k:?} does not evaluate",
+                        w.id
+                    );
+                }
+                if let Val::Str(k) = &s.to {
+                    assert!(
+                        eval_expr(k, &p).is_some(),
+                        "{} segment {i} target {k:?} does not evaluate",
+                        w.id
+                    );
                 }
             }
-            best as f64 / 1000.0
-        };
-        let before = peak_at(&p);
-        let mut stretched = p.clone();
-        stretched.insert("rise".to_string(), Val::Num(26.0)); // double the rise
-        let after = peak_at(&stretched);
+        }
+    }
+
+    fn spec(id: &str, period_s: f64, params: &[(&str, f64)]) -> WaveSpec {
+        let mut p = Params::new();
+        for (k, v) in params {
+            p.insert((*k).to_string(), Val::Num(*v));
+        }
+        WaveSpec {
+            id: id.to_string(),
+            lo: 0.0,
+            hi: 100.0,
+            period_s,
+            params: p,
+            mirror_time: false,
+            mirror_amp: false,
+        }
+    }
+
+    /// The bug this whole solver exists for: a triangle at a cadence whose
+    /// half-period is not a whole number of 30 Hz rows used to be written at
+    /// 93 because the peak fell BETWEEN two rows, and the row scan reported
+    /// whatever the neighbours held.
+    #[test]
+    fn a_solved_triangle_reaches_its_ceiling_and_floor_exactly() {
+        // 0.5 s a cycle on a 30 rows/s grid: a peak every 7.5 rows, so a row
+        // scan can never land on one
+        let v = span_vertices(&spec("triangle", 0.5, &[]), 10_300.0, VERTEX_EPS);
+        assert!(!v.is_empty(), "the triangle solved to nothing");
+        let top = v.iter().cloned().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        let bot = v.iter().cloned().map(|p| p.1).fold(f64::INFINITY, f64::min);
         assert!(
-            after > before + 0.05,
-            "doubling the rise weight should push the peak later ({before} -> {after})"
+            (top - 100.0).abs() < 1e-9,
+            "the peak must reach the band's ceiling, got {top}"
+        );
+        assert!(
+            (bot - 0.0).abs() < 1e-9,
+            "the floor must reach the band's floor, got {bot}"
+        );
+        // and the vertices land ON those times: a triangle turns at its floor
+        // and its peak, so a corner every half period, which at 0.5 s a cycle
+        // is 250 ms. The span's own end is the one point that is not a corner:
+        // the piece stops when the piece stops.
+        let last = v.len() - 1;
+        for (i, p) in v.iter().enumerate() {
+            if i == last {
+                continue;
+            }
+            let in_cycle = p.0 % 250.0;
+            assert!(
+                in_cycle < 1e-6 || (250.0 - in_cycle) < 1e-6,
+                "a vertex at {} is off the half-period grid",
+                p.0
+            );
+        }
+    }
+
+    /// "a triangle should only need three points": with the leg boundaries
+    /// exact and the legs straight, thinner and boundary agree and nothing
+    /// survives between them.
+    #[test]
+    fn a_straight_leg_keeps_only_its_endpoints() {
+        let v = span_vertices(&spec("triangle", 0.5, &[]), 2_000.0, VERTEX_EPS);
+        // four whole cycles, a floor and a peak each, plus the closing floor
+        assert_eq!(
+            v.len(),
+            9,
+            "a triangle must be its corners and nothing else, got {v:?}"
+        );
+        // and none of them is redundant: an interior point IS a turn, so it
+        // must sit well off the line joining its neighbours
+        for w in v.windows(3) {
+            let [(t0, p0), (t1, p1), (t2, p2)] = [w[0], w[1], w[2]];
+            let line = p0 + (p2 - p0) * (t1 - t0) / (t2 - t0);
+            assert!(
+                (p1 - line).abs() > VERTEX_EPS,
+                "a point at {t1} ms is within eps of the line: it should have been thinned away"
+            );
+            assert!(
+                (t2 - t1 - 250.0).abs() < 1e-6,
+                "a triangle's corners are half a period apart, got {}",
+                t2 - t1
+            );
+        }
+    }
+
+    #[test]
+    fn a_solved_curve_stays_within_eps_of_the_wave() {
+        // the arc a sine should keep: thinned, but never off by more than eps
+        for id in ["sine", "rounded_tri", "single_peak", "pulse"] {
+            let s = spec(id, 1.0, &[]);
+            let w = load().get(id).expect("wave").clone();
+            let eff = w.resolve(&s.params);
+            let v = span_vertices(&s, 3_000.0, VERTEX_EPS);
+            assert!(v.len() > 2, "{id} solved to {} points", v.len());
+            // walk the solved polyline and sample the truth against it
+            let mut worst: f64 = 0.0;
+            let mut k = 0;
+            for i in 0..=3000 {
+                let t = i as f64;
+                while k + 2 < v.len() && v[k + 1].0 < t {
+                    k += 1;
+                }
+                let (ta, pa) = v[k];
+                let (tb, pb) = v[(k + 1).min(v.len() - 1)];
+                let line = if tb > ta {
+                    pa + (pb - pa) * (t - ta) / (tb - ta)
+                } else {
+                    pa
+                };
+                worst = worst.max((line - s.level_at(&w, t / 1000.0, &eff)).abs());
+            }
+            assert!(
+                worst <= VERTEX_EPS + 1e-6,
+                "{id} strays {worst} units off the wave"
+            );
+        }
+    }
+
+    /// The apex knob moves the triangle's point, which is the whole of
+    /// requirement four for that wave.
+    #[test]
+    fn the_apex_knob_moves_the_triangles_point() {
+        // the returned clock is milliseconds into the span
+        let v = span_vertices(&spec("triangle", 1.0, &[("peak", 0.25)]), 1_000.0, VERTEX_EPS);
+        let peak = v
+            .iter()
+            .find(|p| (p.1 - 100.0).abs() < 1e-9)
+            .expect("the triangle has a peak");
+        assert!(
+            (peak.0 - 250.0).abs() < 1e-6,
+            "an apex of 0.25 belongs a quarter of the way in, got {}",
+            peak.0
+        );
+        // and the knob is a share of the cycle, so it holds at any cadence
+        let v = span_vertices(&spec("triangle", 2.0, &[("peak", 0.75)]), 2_000.0, VERTEX_EPS);
+        let peak = v
+            .iter()
+            .find(|p| (p.1 - 100.0).abs() < 1e-9)
+            .expect("the triangle has a peak");
+        assert!((peak.0 - 1_500.0).abs() < 1e-6, "got {}", peak.0);
+    }
+
+    /// `round` was a slider nothing read: the shape was two half-parabolas
+    /// whatever it said. Now it is the knee of a six-leg corner, and its two
+    /// ends are the two shapes the wave's own hint promises.
+    #[test]
+    fn the_round_slider_actually_changes_the_shape() {
+        let flat = span_vertices(&spec("rounded_tri", 1.0, &[("round", 0.0)]), 1_000.0, VERTEX_EPS);
+        let tri = span_vertices(&spec("triangle", 1.0, &[]), 1_000.0, VERTEX_EPS);
+        assert_eq!(
+            flat.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            tri.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            "a corner radius of zero IS the triangle, or the knob is a lie"
+        );
+        let soft = span_vertices(
+            &spec("rounded_tri", 1.0, &[("round", 25.0)]),
+            1_000.0,
+            VERTEX_EPS,
+        );
+        assert_ne!(
+            soft.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            tri.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            "the slider changed but the shape did not"
+        );
+        // the knee sits at half the radius, and the flat run in between is
+        // what keeps the wave's promise of an even middle
+        assert!(
+            soft.iter().any(|p| (p.1 - 12.5).abs() < 1e-9),
+            "a radius of 25% puts its knee at 12.5 units, got {:?}",
+            soft.iter().map(|p| p.1).collect::<Vec<_>>()
+        );
+        assert!(
+            soft.iter().any(|p| (p.1 - 87.5).abs() < 1e-9),
+            "and the far knee at 87.5"
         );
     }
 }
