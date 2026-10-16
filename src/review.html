@@ -315,6 +315,14 @@
   .heatleg { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; }
   .heatbar { width: 96px; height: 8px; border-radius: 0; border: 1px solid var(--edge);
              background: linear-gradient(90deg,#33531d,#7cb342,#cddc39,#ffb300,#ef5350); }
+  /* the live speed readout: monospace-ish fixed width so the numbers do not
+     jitter the row as they change every frame */
+  #spdcap { display: inline-flex; align-items: center; gap: 7px; }
+  #spdcap b { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 34px;
+              display: inline-block; text-align: right; color: var(--ink); }
+  /* over the device's own limit: the same red the heatmap ends on, so a
+     number turning red says the same thing its bar does */
+  #spdcap.over b { color: #ef5350; }
   /* the confidence band's own legend -- a cool slate, distinct from the warm
      speed heatmap so the two strip layers never read as the same scale */
   #confcap { display: inline-flex; align-items: center; gap: 7px; }
@@ -370,6 +378,18 @@
                 font: 11px var(--chrome); color: var(--ink-soft); }
   .segrow .cf.lo { color: var(--danger-soft); }
   .segnote { font-size: 11px; color: var(--ink-soft); opacity: .85; }
+  /* which models may compete for a shot. A model the reviewer does not trust
+     on this material is left out entirely, so the boxes are a plain list --
+     no ramp, no score, nothing to read into a tick. */
+  .confmodels { display: flex; align-items: flex-start; gap: 6px; margin: 2px 0; }
+  .confmodels .cmh { font: 10px var(--chrome); color: var(--ink-soft);
+                     text-transform: uppercase; letter-spacing: .4px; flex: 0 0 auto;
+                     padding-top: 1px; }
+  .confmodels .cml { display: flex; flex-wrap: wrap; gap: 2px 10px; min-width: 0; }
+  .cmlab { display: flex; align-items: center; gap: 4px; font-size: 11px;
+           color: var(--ink-soft); cursor: pointer; white-space: nowrap; }
+  .cmlab input { width: 11px; height: 11px; margin: 0; accent-color: var(--hi-bright); }
+  .cmlab .sw { width: 9px; height: 9px; flex: 0 0 auto; border: 1px solid var(--edge); }
   /* The manual-fill panel. It exists only while a hand-drawn piece is the
      selected one, and it is `hidden` rather than styled away so nothing about
      a model piece ever shows a wave control. */
@@ -608,16 +628,6 @@
           <div id="wpNote" class="wpnote"></div>
         </div>
       </div>
-      <div class="sec" id="shotSec">
-        <span class="sec-h" data-t="page.shots">shot cuts</span>
-        <span class="hint" data-t="page.shots.hint">the cuts the video was read with. adding or removing one re-runs the head pass (about half a minute) &mdash; it changes what the models were shown, so the script follows.</span>
-        <div class="drow">
-          <button type="button" id="shotReset" data-t-title="page.shots.reset.tip"><span
-                  data-t="page.shots.reset">reset to detected</span></button>
-        </div>
-        <div id="shotList" class="seglist"></div>
-        <div id="shotNote" class="segnote"></div>
-      </div>
       <div class="sec" id="confSec">
         <span class="sec-h" data-t="page.conf.suggest">conf suggestion</span>
         <span class="hint" data-t="page.conf.suggest.hint">a proposal, never an application: every model's confidence is sampled (one instant restyle each) and each shot keeps the model that scored highest. the switch is off until you ask for it, and your own pieces come back the moment the sampling ends.</span>
@@ -634,9 +644,34 @@
             <button type="button" id="confDrop"><span
                     data-t="page.conf.suggest.drop">discard</span></button>
           </div>
+          <!-- Which models may compete. A model can be over-confident about a
+               shot it reads badly, and that inflates its own mean -- so the
+               answer is not to calibrate the score, it is to leave the model
+               out. Unticking one is TOTAL: it is never sampled, so it can
+               neither win a shot nor cost one. The ticks live in
+               settings.json, not in this page. -->
+          <div class="confmodels">
+            <span class="cmh" data-t="page.conf.suggest.models">models in the vote</span>
+            <span class="cml" id="confModelList"></span>
+          </div>
+          <!-- Run it, and keep it, without being asked. Off by default: this is
+               the switch whose wrong default spends a wait and rewrites the
+               pieces before the reviewer has looked at anything. -->
+          <button type="button" id="confAutoToggle" class="tool"><b>»</b> <span
+                  data-t="page.conf.suggest.auto">run it on open</span></button>
           <div id="confSuggestList" class="seglist"></div>
           <div id="confSuggestNote" class="segnote"></div>
         </div>
+      </div>
+      <div class="sec" id="shotSec">
+        <span class="sec-h" data-t="page.shots">shot cuts</span>
+        <span class="hint" data-t="page.shots.hint">the cuts the video was read with. adding or removing one re-runs the head pass (about half a minute) &mdash; it changes what the models were shown, so the script follows.</span>
+        <div class="drow">
+          <button type="button" id="shotReset" data-t-title="page.shots.reset.tip"><span
+                  data-t="page.shots.reset">reset to detected</span></button>
+        </div>
+        <div id="shotList" class="seglist"></div>
+        <div id="shotNote" class="segnote"></div>
       </div>
     </aside>
     <main>
@@ -680,6 +715,16 @@
                   data-t="page.strip.edit">edit</span></button>
         </span>
         <span id="confcap" class="hidden"></span>
+        <!-- What the script is doing RIGHT HERE, against what the device is
+             asked to hold: the instantaneous rate and the second it sits in.
+             A script can look calm frame by frame and still be a wall of
+             sustained speed, which is the thing a max-speed knob is for. -->
+        <span id="spdcap" class="spdcap">
+          <span data-t="page.spd">speed</span>
+          <b id="spdnow">–</b>
+          <span data-t="page.spd.avg">1s avg</span>
+          <b id="spdavg">–</b>
+        </span>
         <span id="cmpcap" class="hidden">
           <label for="model"><span class="swatch" id="modelSw"></span> <span data-t="page.piece">this piece</span></label>
           <select id="model"></select>
@@ -1064,6 +1109,7 @@ async function fetchState() {
   syncIntensityLimits();
   applyTheme(state.theme);
   renderTabs();
+  invalidate();   // a new state is a new picture, and no gesture follows it
 }
 // The server names the slider's ceilings; take them once, before any control
 // is seeded, so the boxes and the clamp agree from the first frame. An older
@@ -1099,6 +1145,7 @@ async function fetchScript() {
     fillerSpans = fillerSpans.map(([a, b]) => [a - t0, b - t0]);
     artifactSpans = artifactSpans.map(([a, b]) => [a - t0, b - t0]);
   }
+  invalidate();   // a new track is a new picture, and no gesture follows it
 }
 // Confidence is fixed by the frozen trunk -- fetched once per clip, never on a
 // re-style. `conf: null` (no head in the bundle) hides the readout entirely.
@@ -1117,6 +1164,7 @@ async function fetchConf() {
     }
   } catch (e) { /* older bundle: leave confidence off */ }
   updateConfUI();
+  invalidate();   // the confidence band is drawn from this, and nothing prompts it
 }
 // The head is supervised on its WINDOW MEAN (its target is the per-window phase
 // correlation), so a ~1.5 s moving average is the quantity it actually models;
@@ -1413,6 +1461,11 @@ async function selectClip(i) {
   // the conf arrives after the pieces do, and every piece row carries a number
   // off it -- so the list is redrawn once it is here
   renderSegs();
+  // ...and then, if it is switched on, the suggestion runs on its own and is
+  // applied. AWAITED, so the page is not handed over half-decided: the sampling
+  // is one instant re-style per model, and the reviewer said they would rather
+  // wait it out than be shown a page whose pieces are about to change under it.
+  if (autoSuggest) await autoRunSuggestion(i);
 }
 
 // ---- models ------------------------------------------------------------------
@@ -1486,12 +1539,13 @@ function syncModelSel(ms) {
 function labelModelSel() { menuPiece = -2; menuModel = null; syncModelSel(vid.currentTime * 1000); }
 async function fetchCompare() {
   cmpActions = [];
-  if (pinOn[cur]) { cmpActions = pinned[cur].actions; return; }
+  if (pinOn[cur]) { cmpActions = pinned[cur].actions; invalidate(); return; }
   const c = state.clips[cur];
-  if (!c || !c.compare) return;
+  if (!c || !c.compare) { invalidate(); return; }
   const s = await (await fetch('/compare/' + cur)).json();
   // the same clock rebase as the clip's own script
   cmpActions = (s.actions || []).map(a => ({ ...a, at: a.at - (c.t0_ms || 0) }));
+  invalidate();   // the ghost handle is drawn from this line
 }
 function pinNow() {
   const c = state.clips[cur];
@@ -1827,6 +1881,11 @@ $('done').onclick = async () => {
 // judge at 1x. `,` / `.` step the ladder; the select mirrors it. playbackRate
 // resets when the <video> src swaps, so reapply on every load.
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
+// The page is for looking at, not for listening to -- the picture is what the
+// review is about. So the video opens quiet-ish every time rather than at
+// whatever the last session left behind: 33%, deliberately not remembered.
+const VOLUME = 0.33;
+vid.volume = VOLUME;
 let rate = 1;
 function applyRate() {
   vid.playbackRate = rate;
@@ -1914,6 +1973,10 @@ document.addEventListener('keydown', e => {
     case 's': case 'S': magnet = !magnet; labelMagnet(); break;
     // the strip's own switch: play is a transport, edit is the razor's bench
     case 'e': case 'E': setStripEdit(!stripEdit); break;
+    // Tab is the same switch, under the left hand. Nobody reaches for Tab to
+    // walk a form on a page like this one, so it buys a mode key instead --
+    // the cost is that Tab no longer moves focus anywhere on the page.
+    case 'Tab': setStripEdit(!stripEdit); break;
     // the crop overlay covers the picture it describes, so it wants a switch
     // right under the hand that is already stepping frames
     case 'c': case 'C':
@@ -1959,6 +2022,71 @@ function drawSim(ms) {
   $('simpos').textContent = Math.round(p);
 }
 
+// ---- the speed readout ------------------------------------------------------
+// Two numbers, because one of them is not enough to judge a script. The rate
+// RIGHT HERE is the slope of the piece the playhead sits inside -- that is what
+// a device feels at this instant, and what a max-speed cap is written against.
+// The 1s average is how much ground the script covers over the trailing second:
+// a script can look calm at every single instant and still be a wall of
+// sustained speed, which is the failure a per-point limit never catches. Red
+// means the pair is past the limit currently set in the recipe (0 = no limit).
+function speedAt(a, ms) {
+  if (!a.length) return null;
+  if (ms <= a[0].at || ms >= a[a.length - 1].at) return 0;
+  let lo = 0, hi = a.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (a[mid].at <= ms) lo = mid; else hi = mid; }
+  const p = a[lo], q = a[hi];
+  return (q.pos - p.pos) / Math.max(1, q.at - p.at) * 1000;   // pos per second
+}
+/** Index of the first action strictly after `t`, by binary search. */
+function firstAfter(a, t) {
+  let lo = 0, hi = a.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid].at <= t) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+/** Ground covered between ms-1000 and ms, following the piecewise line. */
+function pathIn(a, ms) {
+  if (!a.length) return 0;
+  const t0 = ms - 1000;
+  let prev = posIn(a, Math.max(t0, a[0].at)), total = 0;
+  for (let i = firstAfter(a, Math.max(t0, a[0].at)); i < a.length && a[i].at <= ms; i++) {
+    total += Math.abs(a[i].pos - prev);
+    prev = a[i].pos;
+  }
+  return total + Math.abs(posIn(a, ms) - prev);
+}
+// Where the device's limit is actually CUTTING the script: contiguous runs of
+// transitions that sit at (or a hair under) the cap. The cap truncates by
+// dropping depth, not by moving time, so a clipped run is exactly at speed --
+// which is how the encoder's own `clamp_run` writes it. Tolerance: an integer
+// step truncation can leave the measured rate a hair below the nominal cap.
+function limitedSpans(a, cap) {
+  const out = [];
+  if (!(cap > 0) || a.length < 2) return out;
+  let run = null;
+  for (let i = 0; i < a.length - 1; i++) {
+    const p = a[i], q = a[i + 1];
+    const dt = Math.max(1, q.at - p.at) / 1000;
+    const v = Math.abs(q.pos - p.pos) / dt;
+    if (v >= cap - 1) {
+      if (!run) run = [p.at, q.at];
+      else run[1] = q.at;
+    } else if (run) { out.push(run); run = null; }
+  }
+  if (run) out.push(run);
+  return out;
+}
+function drawSpeed(ms) {
+  const a = actions;
+  const box = $('spdcap');
+  if (!box) return;
+  const v = speedAt(a, ms), avg = pathIn(a, ms);
+  const cap = parseFloat($('mspeed').value) || 0;   // 0 = off
+  $('spdnow').textContent = v === null ? '–' : String(Math.round(v));
+  $('spdavg').textContent = avg === null ? '–' : String(Math.round(avg));
+  box.classList.toggle('over', cap > 0 && ((v !== null && Math.abs(v) > cap) || avg > cap));
+}
+
 // ---- full-clip scrub timeline -----------------------------------------------
 // The whole clip on one bar: the confidence band laid out across the entire
 // duration, click or drag anywhere to seek. Duration comes
@@ -1993,6 +2121,18 @@ function drawTimeline(ms) {
   const px = X(ms);
   tlctx.fillStyle = hexA(C.hi, .10);
   tlctx.fillRect(0, 0, px, h);
+  // where the limit is CUTTING: a dark red wash over the whole stretch, not a
+  // mark per point. Truncation drops depth and leaves no single smoking point,
+  // so the thing worth seeing is the RUN -- and a wash says "this passage is
+  // held down" without turning the bar into a field of red dots.
+  const limSpans = limitedSpans(actions, parseFloat($('mspeed').value) || 0);
+  if (limSpans.length) {
+    tlctx.fillStyle = 'rgba(128,0,0,.55)';
+    for (const [a, b] of limSpans) {
+      const x0 = X(Math.max(0, a)), x1 = X(Math.min(dur, b));
+      if (x1 > x0) tlctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+    }
+  }
   // minute (or 5-min) gridlines
   tlctx.strokeStyle = 'rgba(255,255,255,.06)';
   tlctx.beginPath();
@@ -2127,8 +2267,10 @@ timeline.addEventListener('pointerdown', e => {
     e.preventDefault();
     return;
   }
-  selSeg = segAt(ms);
-  renderSegs();
+  // The selection is NOT made here: a drag across the bar would re-render the
+  // whole drawer on every pointermove, and the drawer is the heaviest thing on
+  // the page. It is made once, on release (see pointerup) -- which is also when
+  // the hand has actually decided where it landed.
   tlDrag = true;
   tlSeek(e.clientX);
   e.preventDefault();
@@ -2164,7 +2306,13 @@ timeline.addEventListener('pointerup', e => {
     return;
   }
   if (dragEdge !== null) { commitSegs(); dragEdge = null; return; }
-  tlDrag = false;
+  if (tlDrag) {
+    // the seek drag ends here, so this is where its landing is spelled out:
+    // select the piece under the released pointer, once
+    tlDrag = false;
+    const i = segAt(tlMs(e.clientX));
+    if (i !== selSeg) { selSeg = i; renderSegs(); }
+  }
 });
 timeline.addEventListener('pointercancel', () => {
   razorDrag = null;
@@ -2430,7 +2578,7 @@ function sizeStrip() {
 // change to that box has to re-back them. The box moves for reasons a window
 // resize never reports -- the rail folding away, a clip list growing, the
 // vh-based heights settling -- so watch the elements themselves.
-const canvasBoxes = new ResizeObserver(() => { sizeStrip(); sizeTimeline(); paintBand(); });
+const canvasBoxes = new ResizeObserver(() => { sizeStrip(); sizeTimeline(); paintBand(); invalidate(); });
 canvasBoxes.observe(strip);
 canvasBoxes.observe(timeline);
 function drawStrip(ms) {
@@ -2564,6 +2712,11 @@ strip.addEventListener('click', e => {
   if (stripEdit) return;
   const frac = e.offsetX / strip.clientWidth - 0.5;
   vid.currentTime = Math.max(0, vid.currentTime + frac * WINDOW_MS / 1000);
+  // the landing picks the piece, the same way the timeline's release does: the
+  // two bars are the same gesture on the same clock, so they must not disagree
+  // about what is selected when you let go
+  const i = segAt(vid.currentTime * 1000);
+  if (i !== selSeg) { selSeg = i; renderSegs(); }
 });
 // the grab radius, in ms: a fixed number of PIXELS, so it stays the same size
 // under the hand however far the window is zoomed
@@ -2703,6 +2856,13 @@ strip.addEventListener('pointerup', e => {
     return;
   }
   if (d.kind === 'edge') { commitSegs(); return; }
+  if (d.kind === 'seek') {
+    // edit mode's bare drag moves the playhead; where it is RELEASED is the
+    // piece the hand meant, so that is when the drawer follows it -- not on
+    // every move, which would rebuild the drawer dozens of times per drag
+    const i = segAt(stripMs(e.clientX));
+    if (i !== selSeg) { selSeg = i; renderSegs(); }
+  }
 });
 strip.addEventListener('pointercancel', () => {
   if (stripDrag && stripDrag.kind === 'edge') commitSegs();
@@ -2723,16 +2883,53 @@ strip.addEventListener('pointerleave', () => {
 $('stripModePlay').onclick = () => setStripEdit(false);
 $('stripModeEdit').onclick = () => setStripEdit(true);
 
+// ---- the repaint gate -------------------------------------------------------
+// The frame loop used to repaint five canvases (two of them the full width of
+// the window) sixty times a second no matter what -- paused, idle, or with the
+// drawer open and nothing moving. The cost of a frame is proportional to the
+// AREA being painted, which is exactly what the reported symptom showed: the
+// integrated GPU sat at ~60% at the default window size and pegged at 100% the
+// moment the window was maximised, while merely minimising the page dropped it
+// to zero. That is a lot of electricity for a picture that is not changing.
+//
+// So: a frame is drawn when the playhead is MOVING, or when something a draw
+// reads has changed. While a clip plays both are true anyway and nothing is
+// skipped; the saving is the whole idle life of the page, which is most of it
+// (the reviewer pauses to look at a piece far more than they watch it run).
+//
+// `invalidate()` is what says "something moved". The events that can change the
+// picture are all caught at the document, because there are a great many little
+// writers on this page and every one of them is driven by a gesture -- a tap, a
+// drag, a wheel, a key. The asynchronous paths (a restyle landing, a track
+// arriving, a language change) call it themselves at the few places that
+// rebuild state instead of relying on a gesture to follow.
+let paintDirty = true;
+let paintMs = -1;
+function invalidate() { paintDirty = true; }
+for (const ev of ['pointerdown', 'pointerup', 'pointermove', 'wheel', 'keydown',
+                  'keyup', 'input', 'change', 'click', 'resize', 'scroll']) {
+  addEventListener(ev, invalidate, { capture: true, passive: true });
+}
+
 function tick() {
   const ms = vid.currentTime * 1000;
-  drawSim(ms);
-  drawTimeline(ms);
-  drawStrip(ms);
-  drawConfReadout(ms);
-  drawCrop(ms);
-  // the script menu is the current PIECE's, so it follows the playhead rather
-  // than the clip: this is what makes it agree with the band under the cursor
-  syncModelSel(ms);
+  // "Moving" is the video actually advancing: a paused <video> reports the same
+  // currentTime every frame, so this is false while the reviewer is looking at
+  // something and true while it runs.
+  const moving = !vid.paused && !vid.ended;
+  if (moving || paintDirty || ms !== paintMs) {
+    paintDirty = false;
+    paintMs = ms;
+    drawSim(ms);
+    drawTimeline(ms);
+    drawStrip(ms);
+    drawConfReadout(ms);
+    drawCrop(ms);
+    drawSpeed(ms);
+    // the script menu is the current PIECE's, so it follows the playhead rather
+    // than the clip: this is what makes it agree with the band under the cursor
+    syncModelSel(ms);
+  }
   requestAnimationFrame(tick);
 }
 
@@ -3827,15 +4024,114 @@ let suggestOn = false;
 let suggestSpans = null;   // the proposal: [{lo_ms, hi_ms, model, score}] or null
 let suggestBusy = false;
 let suggestMsg = null;     // an overriding note key (e.g. "only one model")
+// The models the reviewer unticked, by NAME. `null` means "never chosen", which
+// is not the same as "everything unticked": a fresh install takes part in full.
+// Held here as well as on disk so a repaint does not need a round-trip.
+let excludeModels = null;
+// Run the suggestion, and keep it, the moment a clip is up -- instead of
+// waiting for the button. OFF on a fresh install: with it on, opening a video
+// costs a sampling pass before the page is usable and rewrites the pieces
+// without a click, which is not something to discover switched on.
+let autoSuggest = false;
+// Set while the boot-time pass is running, so it is not started twice for the
+// same clip by a re-entry.
+let autoSuggestRan = null;
 
 function labelSuggest() {
   $('confSuggestToggle').classList.toggle('on', suggestOn);
   $('confSuggestBox').classList.toggle('hidden', !suggestOn);
+  labelAutoSuggest();
+}
+function labelAutoSuggest() {
+  const el = $('confAutoToggle');
+  if (el) el.classList.toggle('on', autoSuggest);
+}
+/** The models that get sampled, in the clip's own order. */
+function votingModels(c) {
+  const all = ((c && c.models) || []).map(m => m.name);
+  if (!excludeModels) return all;
+  return all.filter(m => !excludeModels.includes(m));
+}
+/** The checkboxes. Drawn from the clip's model list on every call, because a
+ *  clip can carry a different pack -- and a name in `excludeModels` that this
+ *  clip does not have is simply a box that is not drawn. */
+function renderConfModels() {
+  const host = $('confModelList');
+  const c = state && state.clips && state.clips[cur];
+  if (!host || !c) return;
+  const all = (c.models || []).map(m => m.name);
+  if (!all.length) return;
+  // Rebuilding on every repaint would take the box out from under a click, so
+  // the list is only thrown away when the model set itself changed -- this is
+  // called from `renderSuggest`, which runs on every commit.
+  const key = all.join('\u0000');
+  if (host.dataset.key === key) {
+    for (const box of host.querySelectorAll('input')) box.checked = !excludeModels || !excludeModels.includes(box.dataset.m);
+    return;
+  }
+  host.dataset.key = key;
+  host.innerHTML = '';
+  for (const name of all) {
+    const lab = document.createElement('label');
+    lab.className = 'cmlab';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !excludeModels || !excludeModels.includes(name);
+    cb.onchange = () => {
+      // Reading the current ticks rather than toggling a list in place: the
+      // box is the truth, exactly like the slider boxes are.
+      const off = all.filter(n => {
+        const box = host.querySelector('input[data-m="' + CSS.escape(n) + '"]');
+        return box && !box.checked;
+      });
+      excludeModels = off.length ? off : [];
+      saveConfPrefs();
+      // A stale proposal was scored against a different field of models.
+      if (suggestSpans) { suggestSpans = null; suggestMsg = null; renderSuggest(); }
+    };
+    cb.dataset.m = name;
+    const sw = document.createElement('span');
+    sw.className = 'sw';
+    sw.style.background = modelColor(name);
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = name;
+    lab.append(cb, sw, t);
+    host.append(lab);
+  }
+}
+/** The ticks live on the server, next to the throttle preset -- they are about
+ *  the person, not about this clip or this browser. */
+async function saveConfPrefs() {
+  try {
+    const r = await fetch('/conf_prefs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        exclude: excludeModels && excludeModels.length ? excludeModels : null,
+        auto: autoSuggest,
+      }),
+    });
+    const j = await r.json();
+    excludeModels = (j && j.exclude && j.exclude.length) ? j.exclude : null;
+    autoSuggest = !!(j && j.auto);
+  } catch (e) { /* an unsaved tick is not worth breaking the drawer over */ }
+  renderConfModels();
+}
+async function loadConfPrefs() {
+  try {
+    const j = await (await fetch('/conf_prefs')).json();
+    excludeModels = (j && j.exclude && j.exclude.length) ? j.exclude : null;
+    autoSuggest = !!(j && j.auto);
+  } catch (e) { excludeModels = null; autoSuggest = false; }
+  labelAutoSuggest();
+  renderConfModels();
 }
 function renderSuggest() {
   const list = $('confSuggestList');
   const note = $('confSuggestNote');
   if (!list || !note) return;
+  renderConfModels();
   list.innerHTML = '';
   $('confApply').disabled = !suggestSpans || !suggestSpans.length;
   if (suggestBusy) { note.textContent = T('page.conf.suggest.busy'); return; }
@@ -3903,7 +4199,12 @@ function scoreSpans(confs, c) {
 async function runSuggestion() {
   const c = state.clips[cur];
   if (!c || suggestBusy) return;
-  const models = (c.models || []).map(m => m.name);
+  // Only the ticked models are asked. An unticked one is never sampled, so it
+  // can neither take a shot nor spend a wait -- which is the whole point: a
+  // model that rates itself highly on a shot it reads badly used to be able to
+  // drag its own mean up and win. The fix is to leave it out, not to correct
+  // the score (there is no ground truth here to correct it against).
+  const models = votingModels(c);
   if (models.length < 2) {
     suggestMsg = 'page.conf.suggest.one';
     suggestSpans = null;
@@ -3946,10 +4247,45 @@ function applySuggestion() {
   commitSegs();
   renderSuggest();
 }
+/** Run the suggestion with nobody asking, and KEEP it.
+ *
+ *  Two things make this different from pressing the button: there is no human
+ *  to look at the proposal, so the answer is applied rather than shown; and it
+ *  runs while the page is still settling, so a failure must leave the pieces
+ *  exactly as the draft had them rather than half-applied.
+ *
+ *  Guarded by clip index so a re-entry (a re-style, a language change, a second
+ *  click) does not queue a second sampling pass over the same clip. */
+async function autoRunSuggestion(i) {
+  if (autoSuggestRan === i || suggestBusy) return;
+  const c = state && state.clips && state.clips[i];
+  if (cur !== i || !c) return;
+  autoSuggestRan = i;
+  // The sampling swaps every model's track through the server, and the drawer's
+  // switch says what is happening; the pass leaves the reviewer's own model and
+  // pieces behind it either way.
+  suggestOn = true;
+  labelSuggest();
+  await runSuggestion();
+  if (suggestSpans && suggestSpans.length) applySuggestion();
+  // `applySuggestion` only fires on a non-empty proposal, and a proposal that
+  // matched the script's own model is not one -- so the pieces are already
+  // right in that case and saying so is the honest report.
+}
+
 $('confSuggestToggle').onclick = () => { suggestOn = !suggestOn; labelSuggest(); };
 $('confSuggestBtn').onclick = runSuggestion;
 $('confApply').onclick = applySuggestion;
 $('confDrop').onclick = () => { suggestSpans = null; suggestMsg = null; renderSuggest(); };
+$('confAutoToggle').onclick = () => {
+  autoSuggest = !autoSuggest;
+  // A switch that is turned ON runs for the clip already on screen -- otherwise
+  // the user would have to reload to find out what they just asked for.
+  if (autoSuggest) autoSuggestRan = null;
+  labelAutoSuggest();
+  saveConfPrefs();
+  if (autoSuggest) autoRunSuggestion(cur);
+};
 
 // ---- drawing the bar ------------------------------------------------------
 function drawSpanBand(X, w, h) {
@@ -4048,6 +4384,7 @@ function drawSpanEdges(ctx, X, w, h, bandH) {
   await fetchLang();
   await fetchWaves();    // the wave list is data, and the panel needs it first
   await fetchState();
+  await loadConfPrefs();  // which models vote, and whether to run unasked
   buildPresetOptions();  // dropdown labels carry each preset's number
   sizeStrip();
   sizeTimeline();
