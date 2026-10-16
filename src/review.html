@@ -385,6 +385,34 @@
   .wpnum { width: 54px; font-size: 11px; }
   .wprow select { flex: 1 1 0; min-width: 0; font-size: 11px; }
   .wpsp { flex: 1 1 auto; }
+  /* The slider a number box opens: it spans the whole row rather than sitting
+     under one column of it, because what it moves is the row's own scale --
+     a band is TWO boxes on ONE scale, so both ends share this one line. */
+  .wpslide { display: flex; align-items: center; gap: 6px; margin-top: -3px; }
+  .wpslide[hidden] { display: none; }
+  .wpslide input[type=range] { flex: 1 1 0; min-width: 0; width: auto; }
+  /* One knob per line, so the slider a knob opens lands under THAT knob's own
+     row instead of under the panel as a whole. */
+  .wpparams { display: flex; flex-direction: column; gap: 4px; }
+  /* The band's two ends on ONE line. Two overlapping ranges is the whole
+     trick: each track ignores the pointer, so the only thing a hand can take
+     hold of is a thumb -- which is exactly what a pair of handles needs, and
+     the only way the two stay independently draggable. */
+  .wpdup { position: relative; flex: 1 1 0; min-width: 0; height: 18px; }
+  .wpdup input[type=range] {
+    position: absolute; left: 0; top: 0; width: 100%; height: 18px; margin: 0;
+    background: none; appearance: none; -webkit-appearance: none;
+    pointer-events: none;
+  }
+  .wpdup input[type=range]::-webkit-slider-runnable-track {
+    height: 4px; background: var(--panel-2); border: 1px solid var(--edge);
+  }
+  .wpdup input[type=range]::-webkit-slider-thumb {
+    appearance: none; -webkit-appearance: none; pointer-events: auto;
+    width: 9px; height: 16px; margin-top: -6px; border-radius: 0;
+    background: var(--hi-bright); border: 1px solid var(--edge);
+    cursor: ew-resize;
+  }
   .wpnote { font-size: 10px; color: var(--ink-soft); opacity: .8; }
   .wpnote.bad { color: var(--danger-soft); opacity: 1; }
   #wpThumb { width: 100%; height: 70px; border: 1px solid var(--edge);
@@ -567,7 +595,7 @@
                     type="checkbox"> <span data-t="page.wave.noCuts">ignore cuts</span></label>
           </div>
           <canvas id="wpThumb" width="520" height="140"></canvas>
-          <div id="wpParams" class="wprow"></div>
+          <div id="wpParams" class="wpparams"></div>
           <div id="wpNote" class="wpnote"></div>
         </div>
       </div>
@@ -2242,6 +2270,10 @@ let stripDrag = null;      // {kind:'seek'|'edge'|'razor'|'scrub', edge?, x0?, a
 // playhead passes this fraction, the whole bar slides so the playhead stays
 // pinned there and the piece being watched stays on screen.
 const STRIP_FOLLOW = 0.8;
+/** How far the middle-button drag moves the playhead per pixel of travel, as a
+ *  share of the bar's own window. 1.0 would be a literal 1:1 grab of the bar's
+ *  30 s; the drag may be tuned here without touching the gesture's shape. */
+const SCRUB_RATE = 0.5;
 /** The strip's window, in ms. Play mode derives it from the playhead every
  *  frame; edit mode owns it until asked to come back. */
 function stripRange(ms) {
@@ -2252,6 +2284,36 @@ function stripRange(ms) {
   return [ms - WINDOW_MS / 2, ms + WINDOW_MS / 2];
 }
 function stripSpan() { return Math.max(1, sv1 - sv0); }
+/** Centre the bar's window on `ms`.
+ *
+ *  Deliberately NOT clamped to the clip: play mode's own window already runs
+ *  past both ends, and a scrub that pinned the playhead to the middle is what
+ *  the author asked for. Clamping here would make the playhead drift off centre
+ *  exactly at the clip's ends, which is the one place the eye is on it. */
+function stripCentre(ms) {
+  const half = WINDOW_MS / 2;
+  sv0 = ms - half;
+  sv1 = ms + half;
+  svInit = true;
+}
+/** Park the playhead on `ms` and put it in the middle of the bar.
+ *
+ *  The scrub is the ONE gesture that may not ask [`stripMs`] where the pointer
+ *  is. `stripMs` reads the window, the window is derived from the playhead, and
+ *  the playhead is what the scrub is moving -- so every move would re-read a
+ *  window it had just pushed forward and add its own step again. That is the
+ *  runaway the drag used to have: holding the pointer still walked the playhead
+ *  forward by a third of a window per event, straight to the end of the clip.
+ *  Scrub time comes from TRAVEL instead (see `pointerdown`/`pointermove`), so
+ *  the bar's mapping never feeds back into it. */
+function scrubTo(ms) {
+  const dur = isFinite(vid.duration) ? vid.duration * 1000 : 1e9;
+  const t = Math.min(Math.max(0, ms), dur);
+  vid.pause();
+  vid.currentTime = t / 1000;
+  stripCentre(t);
+  drawStrip(t);
+}
 /** The time under a client X on the strip. */
 function stripMs(clientX) {
   const b = strip.getBoundingClientRect();
@@ -2526,9 +2588,16 @@ strip.addEventListener('pointerdown', e => {
     // browser does not consider active, which is exactly what a test harness
     // sending synthetic events looks like. A refused capture must not cost the
     // gesture its meaning.
-    stripDrag = { kind: 'scrub' };
+    //
+    // The scrub remembers the GRAB -- where the pointer started and what time
+    // that was -- and every later move is a delta from it. Reading the bar's
+    // own mapping each move is what made the old drag run away, so the grab is
+    // the one reading it gets.
+    const b = strip.getBoundingClientRect();
+    stripDrag = { kind: 'scrub', x0: e.clientX, at0: vid.currentTime * 1000,
+                  pxPerMs: Math.max(1e-6, b.width) / (WINDOW_MS * SCRUB_RATE) };
     try { strip.setPointerCapture(e.pointerId); } catch (err) { /* best effort */ }
-    seekMs(stripMs(e.clientX));
+    scrubTo(stripDrag.at0);
     e.preventDefault();
     return;
   }
@@ -2566,7 +2635,14 @@ strip.addEventListener('pointerdown', e => {
   e.preventDefault();
 });
 strip.addEventListener('pointermove', e => {
-  if (stripDrag && stripDrag.kind === 'scrub') { seekMs(stripMs(e.clientX)); return; }
+  if (stripDrag && stripDrag.kind === 'scrub') {
+    // travel, not position: the bar's window moves with the playhead, so the
+    // pointer's X cannot be turned back into a time without feeding the drag's
+    // own output into its input
+    const dt = (e.clientX - stripDrag.x0) / stripDrag.pxPerMs;
+    scrubTo(stripDrag.at0 + dt);
+    return;
+  }
   if (!stripEdit) return;
   if (stripDrag && stripDrag.kind === 'razor') {
     stripRazorX = stripX(stripMs(e.clientX));
@@ -2586,6 +2662,9 @@ strip.addEventListener('pointermove', e => {
 });
 strip.addEventListener('pointerup', e => {
   if (stripDrag && stripDrag.kind === 'scrub') {
+    // The scrub is a placing gesture, not a playback one: like every other way
+    // of moving the playhead on this bar it leaves the picture paused on the
+    // frame it was dropped at. Play mode resumes from the play button.
     stripDrag = null;
     try { strip.releasePointerCapture(e.pointerId); } catch (err) { /* already gone */ }
     return;
@@ -2708,9 +2787,9 @@ function partitionOf(c) {
     if (lo > t) out.push({ lo: t, hi: lo, model: c.model, gap: true });
     // the two exemptions travel with the piece the same way its recipe does.
     // Absent (every span written before they existed) reads as the defaults:
-    // limits ignored, cuts kept.
+    // limits ignored, cuts ignored.
     out.push({ lo, hi, model: e.model, gap: false, wave: e.wave || null,
-               noLimit: e.no_limit !== false, noCuts: e.no_cuts === true });
+               noLimit: e.no_limit !== false, noCuts: e.no_cuts !== false });
     t = hi;
   }
   if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
@@ -2730,7 +2809,7 @@ function spansPayload() {
                  // ...and so do its two switches, for the same reason: a
                  // model span has no drawing to exempt from anything
                  o.no_limit = s.noLimit !== false;
-                 o.no_cuts = s.noCuts === true;
+                 o.no_cuts = s.noCuts !== false;
                }
                return o;
              });
@@ -3137,9 +3216,10 @@ function renderWavePanel() {
   $('wpMirrorT').checked = !!w.mirror_time;
   $('wpMirrorA').checked = !!w.mirror_amp;
   // absent reads as the defaults the server also assumes: limits ignored
-  // (drawing by hand IS taking responsibility) and cuts kept
+  // (drawing by hand IS taking responsibility) and cuts ignored too -- a cut
+  // in the footage is a cut the author drew straight through
   $('wpNoLimit').checked = s.noLimit !== false;
-  $('wpNoCuts').checked = s.noCuts === true;
+  $('wpNoCuts').checked = s.noCuts !== false;
   renderWaveParams();
   drawWaveThumb();
 }
@@ -3151,8 +3231,12 @@ function renderWaveParams() {
   host.innerHTML = '';
   const s = manualSeg();
   const w = s && waveById(s.wave.id);
-  if (!s || !w || !(w.params || []).length) return;
+  if (!s || !w || !(w.params || []).length) { anchorSlide(); return; }
   for (const p of w.params) {
+    // one knob per row: a slider opens UNDER the box it belongs to, so the
+    // row is what the slider is anchored to, not the box
+    const srow = document.createElement('div');
+    srow.className = 'wprow';
     const lab = document.createElement('label');
     lab.textContent = T(p.label);
     lab.title = p.unit || '';
@@ -3168,6 +3252,7 @@ function renderWaveParams() {
       }
       ctl.style.flex = '0 0 auto';
       ctl.value = cur;
+      ctl.onclick = ev => ev.stopPropagation();
     } else {
       ctl = document.createElement('input');
       ctl.type = 'number';
@@ -3176,14 +3261,164 @@ function renderWaveParams() {
       if (p.max != null) ctl.max = p.max;
       ctl.step = (p.max != null && p.max <= 2) ? 0.01 : 1;
       ctl.value = cur;
+      ctl.dataset.wpKey = 'p:' + p.key;
+      // a knob the file declares gets a slider for free: the box already
+      // carries the range, so nothing here knows what the knob means
+      ctl.onclick = ev => { ev.stopPropagation(); openSlide('p:' + p.key); };
     }
     ctl.onchange = () => editWave(w2 => {
       if (!w2.params) w2.params = {};
       w2.params[p.key] = (p.kind === 'choice') ? ctl.value : Number(ctl.value);
     });
-    ctl.onclick = ev => ev.stopPropagation();
-    host.append(lab, ctl);
+    srow.append(lab, ctl);
+    host.append(srow);
   }
+  anchorSlide();
+}
+/** The slider a number box opens.
+ *
+ *  ONE element, shared: click a box and it moves under that box's own row, so
+ *  a panel of a dozen knobs never grows a dozen sliders, and only ever one is
+ *  open. A band is two boxes on one scale, so both of its boxes open the
+ *  two-handled one.
+ *
+ *  A drag writes straight into the piece and redraws the thumbnail -- that IS
+ *  the preview. Releasing is what takes the undo step and posts, because one
+ *  pull is one edit: `commitSegs` re-sends the whole span set and rebuilds the
+ *  panel, so doing that per `input` would fill the undo stack with forty steps
+ *  and hit the server forty times for a single drag. */
+let slideEl = null;      // built once, then moved to whichever row asked
+let slideKey = null;     // 'lo' | 'hi' | 'rate' | 'p:<param key>'
+let slideDirty = false;  // has this pull taken its undo step yet?
+function slideRowFor(key) {
+  const box = slideBox(key);
+  return box ? box.closest('.wprow') : null;
+}
+function slideBox(key) {
+  if (key === 'lo') return $('wpLo');
+  if (key === 'hi') return $('wpHi');
+  if (key === 'rate') return $('wpPeriod');
+  const host = $('wpParams');
+  return (host && key) ? host.querySelector('[data-wp-key="' + key + '"]') : null;
+}
+function slideClamp(v, lo, hi) {
+  return isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo;
+}
+function slideRow() {
+  if (slideEl) return slideEl;
+  const wrap = document.createElement('div');
+  wrap.className = 'wpslide';
+  wrap.hidden = true;
+  const sng = document.createElement('input');
+  sng.type = 'range';
+  sng.onpointerdown = () => { slideDirty = false; };
+  sng.oninput = () => slideLive(Number(sng.value));
+  sng.onchange = () => slideDone();
+  const pr = document.createElement('div');
+  pr.className = 'wpdup';
+  pr.hidden = true;
+  const hLo = document.createElement('input');
+  hLo.type = 'range';
+  const hHi = document.createElement('input');
+  hHi.type = 'range';
+  for (const kn of [hLo, hHi]) {
+    kn.min = 0; kn.max = 100; kn.step = 1;
+    // the pair share one line, so whichever hand took hold is the one on top
+    kn.onpointerdown = () => {
+      slideDirty = false;
+      kn.style.zIndex = '3';
+      (kn === hLo ? hHi : hLo).style.zIndex = '2';
+    };
+  }
+  hLo.oninput = () => slideBand('lo', Number(hLo.value));
+  hHi.oninput = () => slideBand('hi', Number(hHi.value));
+  hLo.onchange = () => slideDone();
+  hHi.onchange = () => slideDone();
+  pr.append(hLo, hHi);
+  wrap.append(sng, pr);
+  slideEl = wrap;
+  return wrap;
+}
+/** Seed the slider from the box it was opened on and move it under that box's
+ *  row. The range comes from the box's own min/max, so a knob the file
+ *  declares needs no front-end work here -- only the two the page invents
+ *  (a cadence, a band) say what their scale is. */
+function openSlide(key) {
+  const box = slideBox(key);
+  if (!box) return;
+  const wrap = slideRow();
+  const sng = wrap.children[0], pr = wrap.children[1];
+  const pair = (key === 'lo' || key === 'hi');
+  sng.hidden = pair;
+  pr.hidden = !pair;
+  let lo = Number(box.min), hi = Number(box.max), step = Number(box.step);
+  if (!isFinite(lo)) lo = 0;
+  if (!isFinite(hi)) hi = 100;
+  if (!isFinite(step) || step <= 0) step = 1;
+  // a cadence has no useful zero -- 0 folds to one second per cycle and the
+  // box would read 1, a value the hand never asked for
+  if (key === 'rate') { lo = 0.1; hi = 3; step = 0.01; }
+  sng.min = lo; sng.max = hi; sng.step = step;
+  sng.value = slideClamp(Number(box.value), lo, hi);
+  pr.children[0].value = slideClamp(Number($('wpLo').value), 0, 100);
+  pr.children[1].value = slideClamp(Number($('wpHi').value), 0, 100);
+  slideKey = key;
+  wrap.hidden = false;
+  const row = box.closest('.wprow');
+  if (row) row.after(wrap);
+}
+/** Put the open slider back under its own row: the knob rows are thrown away
+ *  and rebuilt on every commit, the slider is not one of them. */
+function anchorSlide() {
+  if (!slideEl || slideEl.hidden || !slideKey) return;
+  const row = slideRowFor(slideKey);
+  if (!row) { slideEl.hidden = true; return; }
+  row.after(slideEl);
+}
+/** Take the undo step once per pull, BEFORE the first write, so what is
+ *  remembered is the piece as it stood when the hand took hold. */
+function slideTouch() {
+  if (slideDirty) return true;
+  const s = manualSeg();
+  if (!s) return false;
+  pushSegUndo('page.hist.wave', s.lo);
+  slideDirty = true;
+  return true;
+}
+function slideLive(v) {
+  const s = manualSeg();
+  if (!s || !s.wave || !slideTouch()) return;
+  if (slideKey === 'lo' || slideKey === 'hi') { slideBand(slideKey, v); return; }
+  if (slideKey === 'rate') {
+    $('wpPeriod').value = v;
+    s.wave.period_s = secPerCycle(v);
+  } else {
+    if (!s.wave.params) s.wave.params = {};
+    s.wave.params[slideKey.slice(2)] = v;
+    const box = slideBox(slideKey);
+    if (box) box.value = v;
+  }
+  drawWaveThumb();
+}
+function slideBand(which, v) {
+  const s = manualSeg();
+  if (!s || !s.wave || !slideTouch()) return;
+  const pr = slideEl.children[1];
+  const hLo = pr.children[0], hHi = pr.children[1];
+  let lo = Number(hLo.value), hi = Number(hHi.value);
+  // the two ends may meet (a flat band) but never cross
+  if (which === 'lo') lo = Math.min(v, hi); else hi = Math.max(v, lo);
+  hLo.value = lo; hHi.value = hi;
+  $('wpLo').value = lo;
+  $('wpHi').value = hi;
+  s.wave.lo = lo;
+  s.wave.hi = hi;
+  drawWaveThumb();
+}
+function slideDone() {
+  if (!slideDirty) return;
+  slideDirty = false;
+  commitSegs();
 }
 /** The piece as it will actually be written: ONE cycle sampled by the SERVER,
  *  repeated across the span at its real cadence. So the page still owns no
@@ -3250,17 +3485,24 @@ async function drawWaveThumb() {
 }
 for (const [id, key] of [['wpLo', 'lo'], ['wpHi', 'hi']]) {
   const el = $(id);
-  if (el) el.onchange = () => editWave(w => {
+  if (!el) continue;
+  el.onchange = () => editWave(w => {
     const n = Number(el.value);
     if (isFinite(n)) w[key] = n;
   });
+  // both ends of the band open the same two-handled slider: they are one
+  // scale, so one line carries them
+  el.onclick = ev => { ev.stopPropagation(); openSlide(key); };
 }
 // cycles per SECOND in the box, seconds per cycle in the span: the stored unit
 // never moves, so every piece saved by an older page still reads correctly
-if ($('wpPeriod')) $('wpPeriod').onchange = () => editWave(w => {
-  const h = Number($('wpPeriod').value);
-  if (isFinite(h) && h > 0) w.period_s = secPerCycle(h);
-});
+if ($('wpPeriod')) {
+  $('wpPeriod').onchange = () => editWave(w => {
+    const h = Number($('wpPeriod').value);
+    if (isFinite(h) && h > 0) w.period_s = secPerCycle(h);
+  });
+  $('wpPeriod').onclick = ev => { ev.stopPropagation(); openSlide('rate'); };
+}
 if ($('wpId')) $('wpId').onchange = () => editWave(w => {
   w.id = $('wpId').value;
   // a different wave brings its own knobs; carrying the old ones over would
