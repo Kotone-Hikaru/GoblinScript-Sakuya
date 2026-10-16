@@ -8,6 +8,14 @@ as `video.funscript`, ready for any player that reads funscripts. Treat it as
 a solid first draft -- the goblin aims to nail the rhythm and the timing, and
 you can fine-tune anything else in your favorite editor.
 
+> **This is a fork of ofs69's GoblinScript.**
+> [Kotone-Hikaru/GoblinScript-Sakuya](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya)
+> builds on [ofs69/GoblinScript](https://github.com/ofs69/GoblinScript) -- a GPU
+> throttle, the spanning bench, hand-drawn wave pieces and a slider panel. The
+> app, its pages, the training pipeline and the models are **ofs69's work**;
+> everything that is not listed under [What this fork adds](#what-this-fork-adds)
+> is theirs. See [Credits](#credits).
+
 > **This repository is the inference client only.**
 >
 > It is the app that *runs* a trained model -- decode, perception, and the
@@ -36,6 +44,8 @@ goblinscript video.mp4 --model v0.4.0  draft with another of the models it carri
 goblinscript video.mp4 --models v0.5.1,v0.3.0
                                         both, from one look at the video:
                                         video.funscript and video.v0.3.0.funscript
+goblinscript video.mp4 --throttle gentle
+                                        keep the GPU usable; see the fork's notes below
 ```
 
 A release carries several models, each named for the release that first
@@ -116,6 +126,80 @@ reversal times stay where they were. A seed that moved is head-stage work:
 the call answers `409 redecoding` and the session reads `working` until the
 tracks are back.
 
+## What this fork adds
+
+Everything below is [Kotone-Hikaru](https://github.com/Kotone-Hikaru)'s work on top
+of upstream `5bf8d6f`, written for the review page and the GPU it runs on. The
+app, its pipeline and the models are unchanged where these do not touch them.
+
+### The spanning bench
+
+The review page grows a second layer under the timeline: **spans**. A razor
+cuts the draft into pieces and each piece names the model that writes it, so a
+scene that one model reads badly can be handed to another without re-drafting
+the rest. Pieces are edges you drag, and dragging an edge can snap to the
+nearest shot cut (**S**). The video's own cuts are editable too (**B**) --
+adding or removing one re-runs the head pass, because it changes what the
+models were shown. Nothing in the bench touches the draft file: it is the
+session's edit, like a knob.
+
+A **confidence suggestion** can propose a model per piece from each model's own
+confidence, sampled with one instant restyle each. It is a proposal and nothing
+else: it is off until asked for, and applying it is its own button.
+
+Every step is undoable (**Ctrl+Z** / **Ctrl+Shift+Z**), one step per edit, with
+the piece, cut, model or merge that it changed named in the tooltip.
+
+### Hand-drawn wave pieces
+
+A piece can be written from a waveform you draw instead of from the model. Six
+waves ship -- triangle, sine, rounded triangle, single peak, pulse and a
+one-way glide -- each with its own knobs (apex position, corner radius, rise
+and fall shares, charge, depth...). The panel's every number is also a slider
+you drag, and the two bounds are a single two-headed band you can also grab in
+the middle and slide whole, mirroring the one-hand slider.
+
+The waves live in `src/waves.json` as **data**, not code: a segment's duration
+and level are arithmetic expressions over the wave's own parameters, so adding
+or reshaping a knob is an edit to that file rather than a code change. The file
+is baked into the binary, but a `waves.json` sitting **beside the exe** is read
+in preference to it -- so a shape can be re-tuned by editing that copy and
+reloading the page, with no rebuild and no reinstall. A drawn piece
+is *solved* from its wave rather than scanned off the frame grid, so a triangle
+reaches exactly 0 and 100 instead of stopping a row short. Two switches per
+piece let it ignore the speed cap (**ignore limits**) and the video's shot cuts
+(**ignore cuts**) -- the latter on by default, since a cut in the footage is not
+a cut in your drawing.
+
+### A GPU throttle
+
+`--throttle` keeps the goblins off the whole GPU while they draft, so a machine
+stays usable during a long batch: a closed loop samples GPU load and naps
+between encoder windows for a duty-proportional fraction of the work it just
+did. It is guarded so it cannot hunt -- a deadband, an averaged load, per-step
+rise and fall limits, and a dwell before the loop may reverse -- and it fails
+open, disarming itself if the GPU cannot be read rather than blocking a draft.
+Three presets -- `gentle`, `balanced`, `aggressive` -- cycle with **P** in the
+picker and are remembered in `settings.json`; `--throttle custom` with
+`--throttle-*` flags tunes it by hand, and `--no-throttle` overrides a
+remembered choice. The boot screen always reports which state it is in, so
+"nothing is holding my GPU back" is answerable at a glance.
+[`THROTTLE_USAGE.md`](THROTTLE_USAGE.md) is the manual, with the measured
+baselines and the control loop explained (in Chinese).
+
+### Smaller changes
+
+* The **#strip** has two transports: *play*, where it follows the video and a
+  click jumps, and *edit*, where the wheel slides, Ctrl+wheel zooms, dragging a
+  boundary moves a cut and right-click picks the model (**E** switches).
+* The **crop page** can add, move and remove the starts of its shots -- a long
+  shot whose subject walks out of the rect is the case a detector cannot call
+  and a person can (Enter at the playhead, Delete, or drag on the bar). Every
+  edit is clamped to the frame grid and strictly between its neighbours, so the
+  page cannot make a plan the segmented decoder would refuse. Boundary 0 (the
+  clip's own start) can be added to, never moved or removed.
+* Every new string ships in both English and Chinese (110 new keys).
+
 ## What you need
 
 * **Windows 10 (64-bit) or 11**, or **Linux** on x86-64 with glibc 2.38 or
@@ -190,6 +274,28 @@ workflow refuses any other.
 
 `DEVELOPMENT.md` is the map: what each stage does, why it is shaped that way,
 and what is measured to keep it honest.
+
+## Credits
+
+**GoblinScript is [ofs69](https://github.com/ofs69)'s project.** The design, the
+perception, the styling engine, the review and crop pages, the model bundles,
+the `--serve` sidecar, the build and release machinery and the
+[GoblinTrainingGrounds](https://github.com/ofs69/GoblinTrainingGrounds) training
+pipeline that makes the packs are all ofs69's work. This fork adds what is
+listed above and nothing more; the upstream repository is the canonical project
+and its releases are the ones most people want. Please star and follow the
+original.
+
+The [Sakuya fork](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya) was made
+by [Kotone-Hikaru](https://github.com/Kotone-Hikaru), mostly as an experiment in
+letting a coding agent (DeepSeek Harness) work on a real, non-trivial Rust
+codebase end to end: reading the tree, proposing changes, writing tests, and
+building. The spanning bench, the wave engine and the throttle were built that
+way, reviewed and adjusted by hand along the way.
+
+License: MIT, as upstream -- see [`LICENSE`](LICENSE), which carries ofs69's
+original copyright. Third-party components are attributed in
+[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
 
 ## License
 
