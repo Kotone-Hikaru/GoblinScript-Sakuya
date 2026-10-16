@@ -1866,6 +1866,17 @@ function stepAction(dir) {
     if (pv) seekMs(pv.at);
   }
 }
+// A focused <video> toggles playback on Space all by itself -- the native media
+// controls listen at the target, before this page's document-level keys run.
+// So pressing Space over the picture toggled twice and looked like "plays for a
+// moment, then pauses", which is exactly what it did. Cancelling the key in the
+// capture phase stops the media element from ever seeing it; the switch below
+// then does the one toggle it was always meant to be. Clicking the picture is
+// what focuses #vid (tabIndex 0), so this is a normal way to hit the bug.
+document.addEventListener('keydown', e => {
+  const el = document.activeElement;
+  if (e.key === ' ' && el && el.tagName === 'VIDEO') e.preventDefault();
+}, true);
 document.addEventListener('keydown', e => {
   // never steal keys from a control the user is editing
   const tag = document.activeElement && document.activeElement.tagName;
