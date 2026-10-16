@@ -33,7 +33,7 @@
       "hint": "wave.triangle.h",
       "periodic": true,
       "params": [
-        { "key": "peak", "label": "wave.p.peak", "def": 0.5, "min": 0.05, "max": 0.95 }
+        { "key": "peak", "label": "wave.p.peak", "def": 0.5, "min": 0, "max": 1 }
       ],
       "segments": [
         { "w": "peak",     "to": 100, "ease": "linear" },
@@ -58,7 +58,7 @@
       "periodic": true,
       "params": [
         { "key": "round", "label": "wave.p.round", "def": 25,  "min": 0,    "max": 100, "unit": "%" },
-        { "key": "peak",  "label": "wave.p.peak",  "def": 0.5, "min": 0.05, "max": 0.95 }
+        { "key": "peak",  "label": "wave.p.peak",  "def": 0.5, "min": 0, "max": 1 }
       ],
       "segments": [
         { "w": "round*peak*2",         "to": "round/2",       "ease": "in" },

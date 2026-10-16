@@ -117,10 +117,12 @@ pub struct Span {
     /// wants -- the cap is what used to flatten a fast piece's peaks.
     #[serde(default = "yes")]
     pub no_limit: bool,
-    /// Manual only, and OFF when absent: leave the video's own shot cuts out of
-    /// this piece. Off, a cut inside the piece keeps the seam protection every
-    /// other piece gets.
-    #[serde(default)]
+    /// Manual only, and ON when absent: leave the video's own shot cuts out of
+    /// this piece. A cut inside a drawing is a cut in the *footage* -- the
+    /// author drew through it, so the seam protecting every other piece would
+    /// only chew the drawing up. A page built before this existed sends no
+    /// field, and ignoring the cuts is what a drawing wants.
+    #[serde(default = "yes")]
     pub no_cuts: bool,
 }
 
@@ -1384,9 +1386,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: false },
-                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false },
-                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false },
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true },
             ]
         );
         // an empty list is a real answer: back to one model over the whole clip
