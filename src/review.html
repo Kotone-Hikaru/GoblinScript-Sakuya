@@ -402,17 +402,32 @@
   .wpdup input[type=range] {
     position: absolute; left: 0; top: 0; width: 100%; height: 18px; margin: 0;
     background: none; appearance: none; -webkit-appearance: none;
-    pointer-events: none;
+    pointer-events: none; z-index: 2;
   }
   .wpdup input[type=range]::-webkit-slider-runnable-track {
     height: 4px; background: var(--panel-2); border: 1px solid var(--edge);
   }
   .wpdup input[type=range]::-webkit-slider-thumb {
     appearance: none; -webkit-appearance: none; pointer-events: auto;
-    width: 9px; height: 16px; margin-top: -6px; border-radius: 0;
-    background: var(--hi-bright); border: 1px solid var(--edge);
+    width: 13px; height: 13px; margin-top: -4.5px; border-radius: 50%;
+    background: var(--hi-bright); border: none;
     cursor: ew-resize;
   }
+  /* The stretch of the scale the band covers. It is drawn the way the
+     single-handle slider draws what it has taken -- solid up to the hand --
+     so the pair reads as one slider mirrored: dot, fill, dot. And because it
+     sits between the two hands it is the only thing in the middle that CAN
+     take hold of them, which is what makes dragging the whole band work. */
+  .wpfill {
+    position: absolute; top: 7px; height: 4px; left: 0; width: 0; z-index: 1;
+    background: var(--hi-bright); pointer-events: auto; cursor: grab;
+  }
+  /* a 4px line is a poor thing to aim at, and a band whose ends have met has no
+     middle at all -- this widens the hit area without drawing anything wider */
+  .wpfill::before {
+    content: ''; position: absolute; left: -5px; right: -5px; top: -7px; bottom: -7px;
+  }
+  .wpfill:active { cursor: grabbing; }
   .wpnote { font-size: 10px; color: var(--ink-soft); opacity: .8; }
   .wpnote.bad { color: var(--danger-soft); opacity: 1; }
   #wpThumb { width: 100%; height: 70px; border: 1px solid var(--edge);
@@ -2410,7 +2425,7 @@ function sizeStrip() {
 // change to that box has to re-back them. The box moves for reasons a window
 // resize never reports -- the rail folding away, a clip list growing, the
 // vh-based heights settling -- so watch the elements themselves.
-const canvasBoxes = new ResizeObserver(() => { sizeStrip(); sizeTimeline(); });
+const canvasBoxes = new ResizeObserver(() => { sizeStrip(); sizeTimeline(); paintBand(); });
 canvasBoxes.observe(strip);
 canvasBoxes.observe(timeline);
 function drawStrip(ms) {
@@ -3290,6 +3305,51 @@ function renderWaveParams() {
 let slideEl = null;      // built once, then moved to whichever row asked
 let slideKey = null;     // 'lo' | 'hi' | 'rate' | 'p:<param key>'
 let slideDirty = false;  // has this pull taken its undo step yet?
+let bandX0 = 0;          // where the hand took hold of the band's middle
+let bandLo0 = 0;         // the band as it stood at that moment
+let bandHi0 = 0;
+/** The band's two hands are round dots 13px across; Chromium runs a thumb's
+ *  CENTRE from half a thumb in to half a thumb from the end, so mapping a value
+ *  onto that line has to allow for the same inset. */
+const DUP_THUMB = 13;
+function bandX(v, w) {
+  const span = Math.max(1, w - DUP_THUMB);
+  return DUP_THUMB / 2 + (slideClamp(v, 0, 100) / 100) * span;
+}
+/** Paint the stretch the band covers, so the pair reads as one slider mirrored. */
+function paintBand() {
+  if (!slideEl || slideEl.hidden) return;
+  const pr = slideEl.children[1];
+  const fill = pr && pr.querySelector('.wpfill');
+  if (!fill) return;
+  const w = pr.getBoundingClientRect().width;
+  if (!w) return;
+  const a = bandX(Number(pr.children[0].value), w);
+  const b = bandX(Number(pr.children[1].value), w);
+  fill.style.left = a + 'px';
+  fill.style.width = Math.max(0, b - a) + 'px';
+}
+/** Write BOTH ends at once -- the whole-band pull moves the pair together.
+ *  Values are put back on the handles' own step: a hand moving a pixel at a
+ *  time would otherwise leave a band of 40.276, a number nobody can retype and
+ *  one the panel would quietly round behind its back. */
+function bandWrite(lo, hi) {
+  const s = manualSeg();
+  if (!s || !s.wave) return;
+  const pr = slideEl.children[1];
+  const step = Math.max(Number(pr.children[0].step) || 1, 1e-6);
+  const quant = v => Math.round(v / step) * step;
+  lo = slideClamp(quant(lo), 0, 100);
+  hi = slideClamp(quant(hi), 0, 100);
+  pr.children[0].value = lo;
+  pr.children[1].value = hi;
+  $('wpLo').value = lo;
+  $('wpHi').value = hi;
+  s.wave.lo = lo;
+  s.wave.hi = hi;
+  paintBand();
+  drawWaveThumb();
+}
 function slideRowFor(key) {
   const box = slideBox(key);
   return box ? box.closest('.wprow') : null;
@@ -3317,6 +3377,8 @@ function slideRow() {
   const pr = document.createElement('div');
   pr.className = 'wpdup';
   pr.hidden = true;
+  const fill = document.createElement('div');
+  fill.className = 'wpfill';
   const hLo = document.createElement('input');
   hLo.type = 'range';
   const hHi = document.createElement('input');
@@ -3334,7 +3396,41 @@ function slideRow() {
   hHi.oninput = () => slideBand('hi', Number(hHi.value));
   hLo.onchange = () => slideDone();
   hHi.onchange = () => slideDone();
-  pr.append(hLo, hHi);
+  // The middle is a plain div, so it can take the pointer the tracks refuse.
+  // A pull on it moves the whole band: what is remembered is where the hand
+  // went down and the pair as it stood, so the band travels with the hand and
+  // never snaps its nearest end under it.
+  fill.onpointerdown = e => {
+    slideDirty = false;
+    bandX0 = e.clientX;
+    bandLo0 = Number(hLo.value);
+    bandHi0 = Number(hHi.value);
+    // no z-index bump: the fill sits BELOW the two inputs, so raising it would
+    // leave it lying over the thumbs and they could never be taken again
+    try { fill.setPointerCapture(e.pointerId); } catch (err) { /* best effort */ }
+    e.preventDefault();
+  };
+  fill.onpointermove = e => {
+    const pr = fill.parentElement;
+    const span = Math.max(1, pr.getBoundingClientRect().width - DUP_THUMB);
+    const d = ((e.clientX - bandX0) / span) * 100;
+    // The band travels as ONE piece, so the pull is limited by whichever end
+    // would leave the scale first. Clamping the ends separately would let one
+    // arrive early and silently narrow the band -- the hand asked to move it,
+    // not reshape it.
+    const travel = Math.max(-bandLo0, Math.min(d, 100 - bandHi0));
+    if (!slideTouch()) return;
+    bandWrite(bandLo0 + travel, bandHi0 + travel);
+  };
+  fill.onpointerup = e => {
+    try { fill.releasePointerCapture(e.pointerId); } catch (err) { /* best effort */ }
+    slideDone();
+  };
+  pr.append(hLo, hHi, fill);
+  // the fill is drawn in pixels from a measured box, so it has to be repainted
+  // whenever that box changes -- and it moves for reasons a window resize never
+  // reports, exactly like the two canvases above
+  canvasBoxes.observe(pr);
   wrap.append(sng, pr);
   slideEl = wrap;
   return wrap;
@@ -3377,6 +3473,7 @@ function seedSlide() {
     const pr = slideEl.children[1];
     pr.children[0].value = slideClamp(Number($('wpLo').value), 0, 100);
     pr.children[1].value = slideClamp(Number($('wpHi').value), 0, 100);
+    paintBand();
     return;
   }
   const box = slideBox(slideKey);
@@ -3429,12 +3526,7 @@ function slideBand(which, v) {
   let lo = Number(hLo.value), hi = Number(hHi.value);
   // the two ends may meet (a flat band) but never cross
   if (which === 'lo') lo = Math.min(v, hi); else hi = Math.max(v, lo);
-  hLo.value = lo; hHi.value = hi;
-  $('wpLo').value = lo;
-  $('wpHi').value = hi;
-  s.wave.lo = lo;
-  s.wave.hi = hi;
-  drawWaveThumb();
+  bandWrite(lo, hi);
 }
 function slideDone() {
   if (!slideDirty) return;
