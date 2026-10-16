@@ -87,6 +87,26 @@ pub struct Settings {
     /// A string, like `throttle`, so a hand-edited value this build does not
     /// know degrades to the default rather than failing the whole file.
     pub dir_mode: Option<String>,
+    /// Models the reviewer took OUT of the confidence suggestion (the page's
+    /// checkboxes on the drawer). `None` = never chosen, which means every model
+    /// the bundle carries takes part -- a suggestion that silently ignored a
+    /// model would be a lie about what was compared.
+    ///
+    /// Names, not indices: a bundle's model order is not a stable identity
+    /// across packs, and a name this bundle no longer carries is simply not
+    /// there to exclude. Empty is NOT the same as `None` -- it means the
+    /// reviewer unchecked everything, which the page refuses to run with (a
+    /// suggestion needs something to compare), so the two never collapse.
+    pub exclude_models: Option<Vec<String>>,
+    /// Run the confidence suggestion as soon as a clip is up, and keep the
+    /// answer, rather than waiting to be asked for it.
+    ///
+    /// Off by default, and deliberately so: `false` is the only default that
+    /// cannot surprise the user. With it on, opening a video costs a full
+    /// sampling pass (one instant re-style per model) BEFORE the page is any
+    /// use, and it rewrites the pieces without a click -- so it is a thing the
+    /// reviewer turns on, never a thing they find already on.
+    pub auto_suggest: bool,
 }
 
 impl Default for Settings {
@@ -104,6 +124,8 @@ impl Default for Settings {
             crop_edit: true,
             throttle: None,
             dir_mode: None,
+            exclude_models: None,
+            auto_suggest: false,
         }
     }
 }
@@ -232,5 +254,42 @@ mod tests {
         let text = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(back.throttle.as_deref(), Some("aggressive"));
+    }
+
+    /// Which models take part in the confidence suggestion is a choice about
+    /// the material, and it is remembered for the same reason the throttle is:
+    /// a reviewer who has decided a model reads this kind of video badly should
+    /// not have to say so again in the next clip, the next launch, or the next
+    /// browser. A field dropped on save would silently restore every model to
+    /// the ballot.
+    #[test]
+    fn the_models_left_out_of_the_vote_are_remembered() {
+        let mut s = Settings::default();
+        assert_eq!(s.exclude_models, None, "a fresh install compares everything");
+        s.exclude_models = Some(vec!["v0.3.0".into(), "anime-v1".into()]);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(
+            back.exclude_models.as_deref(),
+            Some(&["v0.3.0".to_string(), "anime-v1".to_string()][..])
+        );
+    }
+
+    /// "Nothing excluded" and "everything excluded" are different states and
+    /// must not collapse into each other through the file: `null`/absent means
+    /// every model competes, `[]` means the reviewer unchecked them all. The
+    /// page treats the second as "nothing to compare" rather than as "compare
+    /// everything", which is the only reading that matches what was ticked.
+    #[test]
+    fn an_empty_vote_is_not_the_same_as_an_untouched_one() {
+        let none: Settings = serde_json::from_str(r#"{"exclude_models": null}"#).unwrap();
+        assert_eq!(none.exclude_models, None);
+        let empty: Settings = serde_json::from_str(r#"{"exclude_models": []}"#).unwrap();
+        assert_eq!(empty.exclude_models.as_deref(), Some(&[][..]));
+        let absent: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.exclude_models, None);
+        // and a hand-edited file that is not a list is a parse error rather
+        // than a silent "everything competes" -- the page turns a 400 into a
+        // visible note, which is how a typo gets noticed
+        assert!(serde_json::from_str::<Settings>(r#"{"exclude_models": 7}"#).is_err());
     }
 }

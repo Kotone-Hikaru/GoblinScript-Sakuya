@@ -569,6 +569,33 @@ fn handle(
                 }
             }
         }
+        // The confidence suggestion's two standing preferences: which models
+        // are allowed to compete, and whether the page should run the
+        // suggestion by itself the moment a clip is up. Both go through
+        // settings.json rather than page state, because both are about the
+        // person rather than about this clip -- they have to survive a reload,
+        // a different browser, and a cleared cache.
+        (Method::Get, "conf_prefs") => {
+            let s = crate::settings::Settings::load();
+            let _ = req.respond(json_response(&conf_prefs_json(&s)));
+        }
+        (Method::Post, "conf_prefs") => {
+            let mut body = String::new();
+            let _ = req.as_reader().read_to_string(&mut body);
+            match parse_conf_prefs(&body) {
+                Ok((excl, auto)) => {
+                    let mut s = crate::settings::Settings::load();
+                    s.exclude_models = excl;
+                    s.auto_suggest = auto;
+                    s.save();
+                    let _ = req.respond(json_response(&conf_prefs_json(&s)));
+                }
+                Err(e) => {
+                    let _ = req
+                        .respond(Response::from_string(format!("{e:#}")).with_status_code(400));
+                }
+            }
+        }
         (Method::Post, "params") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
@@ -711,6 +738,46 @@ fn filler_preset(p: style::FillerPreset) -> serde_json::Value {
         "filler_gap_s": gap, "filler_rate": rate, "filler_amp": amp,
         "filler_pattern": pat.label(),
     })
+}
+
+/// The page's two standing preferences about the confidence suggestion, in the
+/// shape it reads them: `exclude` is the list of models taken out of the vote
+/// (`null` for "none -- everything competes"), `auto` is whether the page runs
+/// the suggestion on its own when a clip comes up.
+pub(crate) fn conf_prefs_json(s: &crate::settings::Settings) -> serde_json::Value {
+    serde_json::json!({
+        "exclude": s.exclude_models,
+        "auto": s.auto_suggest,
+    })
+}
+
+/// The same two fields coming back from the page.
+///
+/// `exclude` may be absent, `null`, or a list of names; anything else is a
+/// mistake worth a 400 rather than a silent reset -- a typo that quietly
+/// un-excludes a model would put it back on the ballot without saying so.
+/// `auto` accepts a real boolean, or a JSON string/falsy of the kinds a page
+/// written by hand might send, and defaults to OFF: this is the switch whose
+/// wrong default costs the user a wait and an unasked-for edit.
+pub(crate) fn parse_conf_prefs(body: &str) -> Result<(Option<Vec<String>>, bool)> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
+    let excl = match v.get("exclude") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(a)) => Some(
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => anyhow::bail!("exclude must be a list or null"),
+    };
+    let auto = match v.get("auto") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => matches!(s.as_str(), "1" | "true" | "yes" | "on"),
+        Some(_) => anyhow::bail!("auto must be a boolean"),
+    };
+    Ok((excl, auto))
 }
 
 /// What the page needs to (re)draw everything but the tracks themselves. Style
