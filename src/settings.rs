@@ -292,4 +292,21 @@ mod tests {
         // visible note, which is how a typo gets noticed
         assert!(serde_json::from_str::<Settings>(r#"{"exclude_models": 7}"#).is_err());
     }
+
+    /// `auto_suggest` moves to the picker, and the page must not be able to
+    /// turn it off behind the picker's back by leaving the field out of a POST
+    /// -- so the field has to survive a round trip through the file on its own,
+    /// and a page that says nothing about it must leave it exactly as it was.
+    #[test]
+    fn the_auto_suggest_switch_is_the_files_to_keep() {
+        let mut s = Settings::default();
+        assert!(!s.auto_suggest, "a fresh install does not restyle unasked");
+        s.auto_suggest = true;
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.auto_suggest, "the switch did not survive being written");
+        // an absent field is the Default, which is the OFF above -- the state a
+        // file with no opinion is in, not a state a request put it in
+        let absent: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!absent.auto_suggest);
+    }
 }

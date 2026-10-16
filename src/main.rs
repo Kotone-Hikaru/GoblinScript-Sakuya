@@ -3699,6 +3699,9 @@ fn real_main() -> Result<()> {
                 // were armed above, but the picker still shows and re-saves
                 // what it would use)
                 throttle_name.clone(),
+                // the auto-suggest switch, as the picker last left it: the page
+                // reads it out of the settings file, so the picker only decides
+                settings.auto_suggest,
                 start_dir.clone(),
                 std::mem::take(&mut report),
                 cli.dl_dir.clone(),
@@ -3741,6 +3744,12 @@ fn real_main() -> Result<()> {
                         }
                     }
                     settings.throttle = p.throttle.clone();
+                    // The confidence switch, on the same terms as the throttle:
+                    // a standing preference, remembered and handed to the page
+                    // through the settings file. Unlike the throttle there is
+                    // nothing to arm here -- the suggestion runs in the browser,
+                    // which reads this on its next load.
+                    settings.auto_suggest = p.auto_suggest;
                     settings.remember_presentation();
                     settings.save();
                     // the picker's users have no flags to re-run with -- the

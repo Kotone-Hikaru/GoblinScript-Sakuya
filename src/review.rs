@@ -586,7 +586,10 @@ fn handle(
                 Ok((excl, auto)) => {
                     let mut s = crate::settings::Settings::load();
                     s.exclude_models = excl;
-                    s.auto_suggest = auto;
+                    // absent = the page is only speaking about exclusions
+                    if let Some(a) = auto {
+                        s.auto_suggest = a;
+                    }
                     s.save();
                     let _ = req.respond(json_response(&conf_prefs_json(&s)));
                 }
@@ -756,10 +759,12 @@ pub(crate) fn conf_prefs_json(s: &crate::settings::Settings) -> serde_json::Valu
 /// `exclude` may be absent, `null`, or a list of names; anything else is a
 /// mistake worth a 400 rather than a silent reset -- a typo that quietly
 /// un-excludes a model would put it back on the ballot without saying so.
-/// `auto` accepts a real boolean, or a JSON string/falsy of the kinds a page
-/// written by hand might send, and defaults to OFF: this is the switch whose
-/// wrong default costs the user a wait and an unasked-for edit.
-pub(crate) fn parse_conf_prefs(body: &str) -> Result<(Option<Vec<String>>, bool)> {
+/// `auto` accepts a real boolean, or a string of the kinds a page written by
+/// hand might send, and `None` means "not mine to say": the review page READS
+/// the auto-suggest preference but no longer has a switch for it (it lives in
+/// the picker now), so a page that leaves the field out must not be read as
+/// turning it off behind the picker's back.
+pub(crate) fn parse_conf_prefs(body: &str) -> Result<(Option<Vec<String>>, Option<bool>)> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
     let excl = match v.get("exclude") {
@@ -772,9 +777,11 @@ pub(crate) fn parse_conf_prefs(body: &str) -> Result<(Option<Vec<String>>, bool)
         Some(_) => anyhow::bail!("exclude must be a list or null"),
     };
     let auto = match v.get("auto") {
-        None | Some(serde_json::Value::Null) => false,
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::String(s)) => matches!(s.as_str(), "1" | "true" | "yes" | "on"),
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::String(s)) => {
+            Some(matches!(s.as_str(), "1" | "true" | "yes" | "on"))
+        }
         Some(_) => anyhow::bail!("auto must be a boolean"),
     };
     Ok((excl, auto))
@@ -1298,10 +1305,43 @@ pub(crate) fn open_browser(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, Choice, Work};
+    use super::{parse_conf_prefs, parse_range, Choice, Work};
     use crate::style;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// The review page's exclusions may be posted without the auto-suggest
+    /// switch -- it moved to the picker, and the page has no switch for it --
+    /// so leaving the field out has to mean "no opinion", NOT "off".
+    ///
+    /// Reading an absent `auto` as `false` turns every exclusion tick into a
+    /// silent switch-off of a preference the reviewer set in another window,
+    /// which is exactly the kind of failure nobody would trace back here.
+    #[test]
+    fn a_page_that_says_nothing_about_auto_suggest_leaves_it_alone() {
+        let (excl, auto) = parse_conf_prefs(r#"{"exclude":["anime-v1"]}"#).unwrap();
+        assert_eq!(excl.as_deref(), Some(&["anime-v1".to_string()][..]));
+        assert_eq!(auto, None, "an absent switch must not read as OFF");
+        // `null` is the same statement in JSON's own spelling
+        let (_, auto) = parse_conf_prefs(r#"{"exclude":null,"auto":null}"#).unwrap();
+        assert_eq!(auto, None);
+        // and where the page DOES speak, it is believed
+        let (_, auto) = parse_conf_prefs(r#"{"exclude":null,"auto":true}"#).unwrap();
+        assert_eq!(auto, Some(true));
+        let (_, auto) = parse_conf_prefs(r#"{"exclude":null,"auto":"on"}"#).unwrap();
+        assert_eq!(auto, Some(true), "a hand-posted string still reads");
+    }
+
+    /// The other half of the same contract: an `exclude` that is neither a
+    /// list nor `null` is a 400 rather than a shrug. Quietly reading a typo as
+    /// "nothing excluded" puts every model back on the ballot, and the
+    /// suggestion the reviewer gets is then one they had already ruled out.
+    #[test]
+    fn a_broken_exclusion_list_is_refused_rather_than_ignored() {
+        assert!(parse_conf_prefs(r#"{"exclude":7}"#).is_err());
+        assert!(parse_conf_prefs(r#"{"exclude":"anime-v1"}"#).is_err());
+        assert!(parse_conf_prefs("not json at all").is_err());
+    }
 
     /// The queue's two promises, both of which a long video is the reason for.
     ///
