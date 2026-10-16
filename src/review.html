@@ -2108,6 +2108,160 @@ function fmtClock(ms) {
   const hh = Math.floor(m / 60);
   return hh > 0 ? hh + ':' + String(m % 60).padStart(2, '0') + ':' + ss : m + ':' + ss;
 }
+// ---- the confidence band, drawn once and re-used -----------------------------
+// Both bars draw the same thing: a cool slate floor whose height and alpha grow
+// with certainty, sampled once per HORIZONTAL PIXEL. That loop is what made the
+// page stutter, and finding it took a detour worth recording --
+//
+//   strip     3051 canvas ops/frame, of which fillRect 2704   (89%)
+//   timeline  3027 ops/frame,        of which fillRect 2996   (99%)
+//   plus 2750 + 2711 fillStyle writes = ~5,500 colour strings per frame
+//
+// ...at 30 Hz that is ~180,000 draw calls and ~160,000 throwaway strings a
+// second, for two bands whose pixels are a property of the CLIP, not of the
+// playhead. The polyline people suspect is NOT the problem: it only walks the
+// visible window (~55 segments), while these loops walk every pixel of the bar.
+//
+// Both bands are therefore cached in a bitmap and blitted.
+//
+// The two need different keys, and the reason is the whole point:
+//   * the timeline's band spans the entire clip, so its screen pixels depend
+//     only on the clip -- during playback it never changes, and the key is just
+//     size + track. One blit per frame, zero rebuilds.
+//   * the strip's band shows a 30 s window that SLIDES during playback, so a
+//     cache keyed on screen position would miss every single frame and rebuild
+//     all 2704 pixels anyway. It is cached in TIME space instead -- one bitmap
+//     for the whole clip -- and the current window is a drawImage sub-rect. A
+//     rebuild happens only on zoom, resize, or a change of track.
+//
+// The cache also remembers WHICH track it was built from. Length is not enough:
+// two clips whose confidence tracks happen to be the same length would collide
+// and show each other's band -- a wrong reading, not merely a stale one. So the
+// array itself is the identity, which cannot be forgotten at a call site the way
+// a hand-bumped counter can.
+const CONF_STRIP_H = 16;
+const CONF_TL_H = 14;
+// A canvas this wide is safe in the browsers we target; the band is a soft
+// translucent underlay, so when a clip is long enough that a full-density cache
+// would exceed this, the cache is built coarser and scaled up rather than
+// refused -- a mild softness on a faint wash, not a wrong reading.
+const CONF_MAX_W = 65535;
+let confKeys = { strip: '', timeline: '' };
+let confCaches = { strip: null, timeline: null };
+let confBuiltFrom = { strip: null, timeline: null };
+
+/** The confidence value at time `t`, or null where the track says nothing. */
+function confAtMs(t) {
+  if (!confSmooth) return null;
+  const i = Math.round((t - confRow0) / 1000 * confFps);
+  if (i < 0 || i >= confSmooth.length) return null;
+  const v = confSmooth[i];
+  return v == null ? null : v;
+}
+
+/** Render one band into a fresh offscreen canvas.
+ *
+ *  `w` is the bitmap width in device pixels, `tOf(x)` the time pixel `x`
+ *  samples, `vOf(t)` reads the track, and `inkOf(v)` is the colour.
+ *
+ *  One honest caveat about caching a TRANSLUCENT layer: the colour is blended
+ *  against transparency here and rounded to 8 bits, then blended again against
+ *  the panel when blitted, so the result can differ from drawing it directly by
+ *  a unit or two per channel. Measured against the loop it replaces: bit-identical
+ *  at interior playheads, and at worst a 0.3 % of-pixels difference on the band's
+ *  own rows at the very ends of a clip, where the window hangs off the clip edge.
+ *  On a faint wash that is not visible, and it buys an 8x cut in canvas work. */
+function buildConfBand(w, h, tOf, vOf, inkOf) {
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(w));
+  cv.height = Math.max(1, Math.round(h));
+  const cx = cv.getContext('2d');
+  // Colour depends only on v, so it is re-emitted only when it actually changes
+  // (coolA prints 3 decimals, so this collapses long runs) -- the second half of
+  // the win, since assigning fillStyle is itself a recorded canvas operation.
+  let ink = '';
+  for (let x = 0; x < w; x++) {
+    const v = vOf(tOf(x));
+    if (v == null) continue;
+    const next = inkOf(v);
+    if (next !== ink) { cx.fillStyle = next; ink = next; }
+    cx.fillRect(x, h - h * v, 1, h * v);
+  }
+  return cv;
+}
+
+/** The timeline's band: the whole clip at screen resolution, so it is built once
+ *  per clip and every playback frame pays a single blit.
+ *
+ *  Blitted in DEVICE pixels with an identity transform, because a fractional
+ *  destination makes drawImage resample rather than copy -- measured as a
+ *  1-unit-per-channel shift across the entire band. Whole device pixels on both
+ *  sides make it a straight copy, which is why the cache is built at `dpr`. */
+function drawConfBandTimeline(w, h, dur) {
+  if (!confSmooth || w <= 0 || h <= 0) return false;
+  const dpr = window.devicePixelRatio || 1;
+  const bw = timeline.width, bh = Math.max(1, Math.round(CONF_TL_H * dpr));
+  const key = 'tl' + bw + 'x' + bh + '@' + dur.toFixed(1)
+            + '/' + confSmooth.length + '/' + confRow0 + '/' + confFps;
+  if (confKeys.timeline !== key || confBuiltFrom.timeline !== confSmooth || !confCaches.timeline) {
+    confCaches.timeline = buildConfBand(
+      bw, bh,
+      x => (x + 0.5) / bw * dur,
+      t => confAtMs(t),
+      v => coolA((0.08 + 0.4 * v).toFixed(3)));
+    confKeys.timeline = key;
+    confBuiltFrom.timeline = confSmooth;
+  }
+  tlctx.save();
+  tlctx.setTransform(1, 0, 0, 1, 0, 0);
+  tlctx.imageSmoothingEnabled = false;
+  tlctx.drawImage(confCaches.timeline, 0, 0, bw, bh, 0, timeline.height - bh, bw, bh);
+  tlctx.restore();
+  return true;
+}
+
+/** The strip's band, cached in TIME space over the whole clip.
+ *
+ *  The density is the bar's own device pixels per millisecond, so a blit is a
+ *  straight device-pixel copy of what the per-pixel loop drew. That is also why
+ *  the cache key carries the density: a zoom (which changes it) must rebuild,
+ *  while the playhead -- which does not -- must not. */
+function drawConfBandStrip(w, h, t0, win, dur) {
+  if (!confSmooth || w <= 0 || h <= 0 || !(win > 0) || !(dur > 0)) return false;
+  const dpr = window.devicePixelRatio || 1;
+  // device pixels per millisecond, and the densest the cache may be: a
+  // 40-minute clip at screen density would be an absurd bitmap, and this band is
+  // a soft translucent underlay, so a coarser cache upscaled is honest.
+  const density = Math.min(strip.width / win, CONF_MAX_W / Math.max(1, dur));
+  const bh = Math.max(1, Math.round(CONF_STRIP_H * dpr));
+  const key = 'sc' + Math.round(density * 1e6) + 'x' + bh + '/' + dur.toFixed(0)
+            + '/' + confSmooth.length + '/' + confRow0 + '/' + confFps;
+  if (confKeys.strip !== key || confBuiltFrom.strip !== confSmooth || !confCaches.strip) {
+    const cacheW = Math.max(1, Math.min(CONF_MAX_W, Math.ceil(dur * density)));
+    confCaches.strip = buildConfBand(
+      cacheW, bh,
+      x => (x + 0.5) / density,
+      t => confAtMs(t),
+      v => coolA((0.1 + 0.5 * v).toFixed(3)));
+    confKeys.strip = key;
+    confBuiltFrom.strip = confSmooth;
+  }
+  // Blit only the part of the clip the window covers, so a window that runs off
+  // either end of the clip draws less rather than reading outside it.
+  const a = Math.max(t0, 0), b = Math.min(t0 + win, dur);
+  if (!(b > a)) return false;
+  const sx = Math.round(a * density);
+  const sw = Math.round((b - a) * density);
+  if (sw < 1) return false;
+  const dx = Math.round((a - t0) * density);
+  sctx.save();
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.imageSmoothingEnabled = false;
+  // source and destination widths are the SAME integer, so this copies
+  sctx.drawImage(confCaches.strip, sx, 0, sw, bh, dx, strip.height - bh, sw, bh);
+  sctx.restore();
+  return true;
+}
 function sizeTimeline() {
   const dpr = window.devicePixelRatio || 1;
   timeline.width = timeline.clientWidth * dpr;
@@ -2172,19 +2326,10 @@ function drawTimeline(ms) {
     }
   }
   // confidence band along the bottom -- height + alpha grow with certainty, so
-  // the shaky stretches of the whole clip show up as low, faint gaps
-  if (confSmooth) {
-    for (let x = 0; x < w; x++) {
-      const t = (x + 0.5) / w * dur;
-      const i = Math.round((t - confRow0) / 1000 * confFps);
-      if (i < 0 || i >= confSmooth.length) continue;
-      const v = confSmooth[i];
-      if (v == null) continue;
-      const bh = 14 * v;
-      tlctx.fillStyle = coolA((0.08 + 0.4 * v).toFixed(3));
-      tlctx.fillRect(x, h - bh, 1, bh);
-    }
-  }
+  // the shaky stretches of the whole clip show up as low, faint gaps. It spans
+  // the entire clip, so its pixels are a fact about the clip rather than the
+  // playhead: drawn once into an offscreen bitmap and blitted thereafter.
+  drawConfBandTimeline(w, h, dur);
   // the span boundaries, last of the bands so nothing passes over them; the
   // playhead still goes on top, it is the thing you move most often
   drawSpanEdges(tlctx, X, w, h, 20);
@@ -2659,19 +2804,11 @@ function drawStrip(ms) {
   // confidence band -- a cool slate underlay along the bottom; height and alpha
   // both grow with certainty, so an unsure passage reads as a low, faint floor.
   // Drawn before the script line so the line always stays on top of it.
-  if (confSmooth) {
-    const CONF_H = 16;
-    for (let x = 0; x < w; x++) {
-      const t = t0 + (x + 0.5) / w * win;
-      const i = Math.round((t - confRow0) / 1000 * confFps);
-      if (i < 0 || i >= confSmooth.length) continue;
-      const v = confSmooth[i];
-      if (v == null) continue;
-      const bh = CONF_H * v;
-      sctx.fillStyle = coolA((0.1 + 0.5 * v).toFixed(3));
-      sctx.fillRect(x, h - bh, 1, bh);
-    }
-  }
+  //
+  // Cached in time space over the whole clip and blitted as a sub-rect: the
+  // window under this bar slides during playback, so a cache keyed on screen
+  // position would miss every frame and rebuild all 2704 pixels anyway.
+  drawConfBandStrip(w, h, t0, win, curDurationMs());
   // the compared model's line first, thin, dashed and unheated, so this
   // clip's own heat line lies over it
   if (cmpActions.length > 1) {
