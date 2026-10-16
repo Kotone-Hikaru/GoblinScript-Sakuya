@@ -3359,21 +3359,42 @@ function openSlide(key) {
   // box would read 1, a value the hand never asked for
   if (key === 'rate') { lo = 0.1; hi = 3; step = 0.01; }
   sng.min = lo; sng.max = hi; sng.step = step;
-  sng.value = slideClamp(Number(box.value), lo, hi);
-  pr.children[0].value = slideClamp(Number($('wpLo').value), 0, 100);
-  pr.children[1].value = slideClamp(Number($('wpHi').value), 0, 100);
   slideKey = key;
   wrap.hidden = false;
   const row = box.closest('.wprow');
   if (row) row.after(wrap);
+  seedSlide();
+}
+/** Read the open slider's value back OUT of the boxes it stands for. The boxes
+ *  are the truth: a value can arrive there by typing as well as by dragging, and
+ *  every commit throws the knob rows away and builds them from the piece again.
+ *  So this runs both when the slider opens and whenever it is re-anchored --
+ *  otherwise a typed number leaves the thumb behind, and a band reads the value
+ *  it had when the slider was first opened rather than the one on screen. */
+function seedSlide() {
+  if (!slideEl || slideEl.hidden || !slideKey) return;
+  if (slideKey === 'lo' || slideKey === 'hi') {
+    const pr = slideEl.children[1];
+    pr.children[0].value = slideClamp(Number($('wpLo').value), 0, 100);
+    pr.children[1].value = slideClamp(Number($('wpHi').value), 0, 100);
+    return;
+  }
+  const box = slideBox(slideKey);
+  if (!box) return;
+  const sng = slideEl.children[0];
+  sng.value = slideClamp(Number(box.value), Number(sng.min), Number(sng.max));
 }
 /** Put the open slider back under its own row: the knob rows are thrown away
- *  and rebuilt on every commit, the slider is not one of them. */
+ *  and rebuilt on every commit, the slider is not one of them. Re-seeding here
+ *  is what keeps it honest through a commit it did not perform itself --
+ *  a typed number, an undo, a wave swap -- but never mid-pull, where the box is
+ *  following the thumb and not the other way round. */
 function anchorSlide() {
   if (!slideEl || slideEl.hidden || !slideKey) return;
   const row = slideRowFor(slideKey);
   if (!row) { slideEl.hidden = true; return; }
   row.after(slideEl);
+  if (!slideDirty) seedSlide();
 }
 /** Take the undo step once per pull, BEFORE the first write, so what is
  *  remembered is the piece as it stood when the hand took hold. */
