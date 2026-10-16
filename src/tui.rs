@@ -2336,12 +2336,21 @@ fn onoff(t: &Theme, label: &str, key: &str, on: bool) -> Vec<Span<'static>> {
 /// whose P key cycles off -> gentle -> balanced -> aggressive -> off. The value
 /// is drawn as the preset's own word, so the guide says which one is armed
 /// rather than merely that something is.
+///
+/// The word is TRANSLATED, but the preset's NAME is not: `throttle.preset.<name>`
+/// exists so a Chinese user reads 均衡 instead of balanced, and a catalog that
+/// has not translated one falls back to the identifier itself -- which is still
+/// readable, and is also exactly what `--throttle` and `settings.json` use, so
+/// the footer and the flag never disagree about which state is armed.
 fn onoff_named(t: &Theme, label: &str, key: &str, value: Option<&str>, off_word: &str) -> Vec<Span<'static>> {
     vec![
         Span::styled(format!(" {key} "), Style::new().fg(Color::Black).bg(rat(t.chrome_bg))),
         Span::raw(format!(" {label}: ")),
         match value {
-            Some(v) => Span::styled(v.to_string(), Style::new().fg(rat(t.accent)).add_modifier(Modifier::BOLD)),
+            Some(v) => {
+                let word = crate::lang::try_t(&format!("throttle.preset.{v}")).unwrap_or(v);
+                Span::styled(word.to_string(), Style::new().fg(rat(t.accent)).add_modifier(Modifier::BOLD))
+            }
             None => Span::styled(off_word.to_string(), Style::new().fg(rat(t.muted))),
         },
     ]
