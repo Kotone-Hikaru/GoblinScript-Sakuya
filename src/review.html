@@ -3106,16 +3106,22 @@ for (const ev of ['pointerdown', 'pointerup', 'pointermove', 'wheel', 'keydown',
 // The page's own redraw budget, in milliseconds between frames.
 //
 // requestAnimationFrame runs at the DISPLAY's refresh rate, and every frame
-// here repaints five canvases that span the window -- so the cost of running a
-// video scales with the monitor's refresh rate as much as with its area. On the
-// 165 Hz, 3440x1440 screen this was built against, playing anything pinned the
-// GPU at 100%. Nothing on this page is animation-grade: a playhead crosses a
-// full-width bar at a few pixels per second, and the reviewer is reading the
-// curve rather than watching motion, so 30 Hz is not a compromise anyone can
-// see. A GESTURE is a different matter and is never held back -- it says so
-// through `paintDirty`, and being late to a drag is the one lag that would be
-// felt.
-const PAINT_MIN_MS = 1000 / 30;
+// here repaints the two canvases that span the window -- so the cost of running
+// a video scales with the monitor's refresh rate as much as with its area. On
+// the 165 Hz, 3440x1440 screen this was built against, playing anything pinned
+// the GPU at 100%.
+//
+// This budget was 30 Hz while the frames were expensive. The two confidence
+// bands were drawing one fillRect PER HORIZONTAL PIXEL per frame (~5,700 canvas
+// ops a frame between them), and once those were cached as bitmaps the same
+// page paints for roughly a ninth of the work -- so the budget is raised to
+// 60 Hz rather than left at a ceiling that was only there to hide the cost.
+// 165 is deliberately NOT the target: this is a stepping, reading page, and the
+// remaining per-frame work is real.
+//
+// A GESTURE is a different matter and is never held back -- it says so through
+// `paintDirty`, and being late to a drag is the one lag that would be felt.
+const PAINT_MIN_MS = 1000 / 60;
 let lastPaint = 0;
 
 function tick(ts) {
