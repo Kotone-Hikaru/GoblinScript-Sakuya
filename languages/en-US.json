@@ -272,7 +272,6 @@
   "page.conf.suggest.agree": "every shot prefers the script's own model",
   "page.conf.suggest.one": "only one model to choose from",
   "page.conf.suggest.models": "models in the vote",
-  "page.conf.suggest.auto": "run it on open",
   "page.crop.whole": "whole frame",
   "page.crop.reading": "×{zoom} · {n} of {total} shots · esc {esc}%",
   "cpage.title": "crop",

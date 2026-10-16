@@ -320,9 +320,8 @@
   #spdcap { display: inline-flex; align-items: center; gap: 7px; }
   #spdcap b { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 34px;
               display: inline-block; text-align: right; color: var(--ink); }
-  /* over the device's own limit: the same red the heatmap ends on, so a
-     number turning red says the same thing its bar does */
-  #spdcap.over b { color: #ef5350; }
+  /* The numbers carry the same colour scale as the heat bar beside them, so
+     they are painted inline by drawSpeed -- not by a class here. */
   /* the confidence band's own legend -- a cool slate, distinct from the warm
      speed heatmap so the two strip layers never read as the same scale */
   #confcap { display: inline-flex; align-items: center; gap: 7px; }
@@ -654,11 +653,11 @@
             <span class="cmh" data-t="page.conf.suggest.models">models in the vote</span>
             <span class="cml" id="confModelList"></span>
           </div>
-          <!-- Run it, and keep it, without being asked. Off by default: this is
-               the switch whose wrong default spends a wait and rewrites the
-               pieces before the reviewer has looked at anything. -->
-          <button type="button" id="confAutoToggle" class="tool"><b>»</b> <span
-                  data-t="page.conf.suggest.auto">run it on open</span></button>
+          <!-- "Run it on open" is NOT here on purpose: it is a standing
+               preference about how a batch is worked, so it lives in the
+               picker with the other switches and is remembered in
+               settings.json. A page could forget it with the cache; the file
+               cannot. This page only READS it (see loadConfPrefs). -->
           <div id="confSuggestList" class="seglist"></div>
           <div id="confSuggestNote" class="segnote"></div>
         </div>
@@ -1883,8 +1882,9 @@ $('done').onclick = async () => {
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
 // The page is for looking at, not for listening to -- the picture is what the
 // review is about. So the video opens quiet-ish every time rather than at
-// whatever the last session left behind: 33%, deliberately not remembered.
-const VOLUME = 0.33;
+// whatever the last session left behind: 15%, deliberately not remembered.
+// (It was 33% first; 33% is still loud enough to talk over the work.)
+const VOLUME = 0.15;
 vid.volume = VOLUME;
 let rate = 1;
 function applyRate() {
@@ -2082,9 +2082,14 @@ function drawSpeed(ms) {
   if (!box) return;
   const v = speedAt(a, ms), avg = pathIn(a, ms);
   const cap = parseFloat($('mspeed').value) || 0;   // 0 = off
-  $('spdnow').textContent = v === null ? '–' : String(Math.round(v));
-  $('spdavg').textContent = avg === null ? '–' : String(Math.round(avg));
-  box.classList.toggle('over', cap > 0 && ((v !== null && Math.abs(v) > cap) || avg > cap));
+  const nNow = $('spdnow'), nAvg = $('spdavg');
+  nNow.textContent = v === null ? '–' : String(Math.round(v));
+  nAvg.textContent = avg === null ? '–' : String(Math.round(avg));
+  // Both numbers wear the ramp. `pathIn` is a distance, not a signed speed, so
+  // it is always non-negative; `v` can be negative on a descending leg and its
+  // colour follows magnitude -- a fast drop is as hot as a fast rise.
+  nNow.style.color = v === null ? '' : speedInk(v, cap);
+  nAvg.style.color = avg === null ? '' : speedInk(avg, cap);
 }
 
 // ---- full-clip scrub timeline -----------------------------------------------
@@ -2121,18 +2126,10 @@ function drawTimeline(ms) {
   const px = X(ms);
   tlctx.fillStyle = hexA(C.hi, .10);
   tlctx.fillRect(0, 0, px, h);
-  // where the limit is CUTTING: a dark red wash over the whole stretch, not a
-  // mark per point. Truncation drops depth and leaves no single smoking point,
-  // so the thing worth seeing is the RUN -- and a wash says "this passage is
-  // held down" without turning the bar into a field of red dots.
-  const limSpans = limitedSpans(actions, parseFloat($('mspeed').value) || 0);
-  if (limSpans.length) {
-    tlctx.fillStyle = 'rgba(128,0,0,.55)';
-    for (const [a, b] of limSpans) {
-      const x0 = X(Math.max(0, a)), x1 = X(Math.min(dur, b));
-      if (x1 > x0) tlctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
-    }
-  }
+  // where the limit is CUTTING is marked on the strip below, not here: the
+  // strip is the script's own bar and already colours itself by speed, so a
+  // red wash there sits on the same axis it accuses. On this timeline a red
+  // band reads as a property of the CLIP, which is not what it means.
   // minute (or 5-min) gridlines
   tlctx.strokeStyle = 'rgba(255,255,255,.06)';
   tlctx.beginPath();
@@ -2530,6 +2527,29 @@ function stripFollow(ms) {
   sv1 += step;
   clampView();
 }
+/** Bring an EDIT-mode window to a seek that came from outside the page.
+ *
+ *  The native transport bar moves the ELEMENT's time; it knows nothing about
+ *  this bar's window, and in edit mode the window is the page's own stored
+ *  pair rather than a value derived from the playhead. So a press on the
+ *  native bar used to leave `sv0..sv1` where it was: the video jumped, the
+ *  playhead was then drawn at X(ms) far outside that window, and the bar
+ *  looked exactly like it had ignored the press.
+ *
+ *  `stripFollow` does not cover this: it deliberately stops for a paused bar
+ *  (a still frame should not drift) and only ever slides past 80%. A seek is
+ *  not drift -- it is the author saying "look here" -- and it can land
+ *  anywhere, including before the window. So when the playhead falls outside
+ *  the window, re-centre on it, which is where play mode keeps it anyway.
+ *
+ *  Skipped while a drag of the author's own is live: a seek drag maps pointer
+ *  X through `stripMs`, which reads this window, so moving the window from
+ *  under it mid-drag would feed the drag its own output. */
+vid.addEventListener('seeked', () => {
+  if (!stripEdit || stripDrag) return;
+  const ms = vid.currentTime * 1000;
+  if (ms < sv0 || ms > sv1) stripCentre(ms);
+});
 function setStripEdit(on) {
   stripEdit = on;
   if (on) svInit = false;   // open on wherever the playhead is
@@ -2568,6 +2588,25 @@ function heat(speed) {
   }
   return HEAT[HEAT.length - 1][1];
 }
+// The speed readout's ink. Same idea as the strip's heatmap -- the number's
+// colour says the same thing its bar does -- but it must NOT run all the way to
+// red down here: red is reserved for one meaning, "this is past the limit", so
+// the ramp stops at amber and crossing the cap snaps to red.
+//
+// With the limiter off (cap 0) there is nothing to cross, so the ramp is
+// measured against the default 600 -- the readout still tells you a speed is
+// fast, it just never accuses you of breaking a rule you did not set.
+const SPD_RAMP = [0.5, 1];   // green -> amber, over the last 40% of the scale
+const SPD_BASE = 600;        // the scale when the cap is off
+const SPD_RED = '#ff3b30';
+function speedInk(v, cap) {
+  const on = cap > 0;
+  const scale = on ? cap : SPD_BASE;
+  const t = Math.max(0, Math.min(1, Math.abs(v) / Math.max(1, scale)));
+  if (on && Math.abs(v) > cap) return SPD_RED;
+  const f = (t - SPD_RAMP[0]) / (SPD_RAMP[1] - SPD_RAMP[0]);
+  return f <= 0 ? '#7cb342' : lerpHex('#7cb342', '#ffb300', Math.min(1, f));
+}
 function sizeStrip() {
   const dpr = window.devicePixelRatio || 1;
   strip.width = strip.clientWidth * dpr;
@@ -2603,6 +2642,20 @@ function drawStrip(ms) {
     sctx.moveTo(X(t), 0); sctx.lineTo(X(t), h);
   }
   sctx.stroke();
+  // Where the limit is CUTTING: a dark red wash over the stretch, not a mark
+  // per point. Truncation drops depth and leaves no single smoking point, so
+  // the thing worth seeing is the RUN. It lives HERE, on the script's own bar,
+  // because this is the bar that already colours itself by speed -- the red is
+  // the same axis the heat is, just past the end of it. Both modes: the wash is
+  // about the script, not about which hand is on the bar.
+  const limSpans = limitedSpans(actions, parseFloat($('mspeed').value) || 0);
+  if (limSpans.length) {
+    sctx.fillStyle = 'rgba(128,0,0,.55)';
+    for (const [a, b] of limSpans) {
+      const x0 = Math.max(0, X(a)), x1 = Math.min(w, X(b));
+      if (x1 > x0) sctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+    }
+  }
   // confidence band -- a cool slate underlay along the bottom; height and alpha
   // both grow with certainty, so an unsure passage reads as a low, faint floor.
   // Drawn before the script line so the line always stays on top of it.
@@ -2676,7 +2729,9 @@ function drawStrip(ms) {
   }
   // same boundaries as the timeline, on this bar's own clock. Above the
   // playhead so a selected edge is never hidden by it, below the blade.
-  if (stripEdit) drawSpanEdges(sctx, X, w, h, 24);
+  // Both modes: the cuts are a fact about the script, and in play mode they are
+  // how you see a piece end while the bar is still moving under the playhead.
+  drawSpanEdges(sctx, X, w, h, 24);
   // the blade's preview, over everything, so the cut lands where it is drawn
   if (stripEdit && tool === 'razor' && stripRazorX != null) {
     sctx.save();
@@ -2911,15 +2966,37 @@ for (const ev of ['pointerdown', 'pointerup', 'pointermove', 'wheel', 'keydown',
   addEventListener(ev, invalidate, { capture: true, passive: true });
 }
 
-function tick() {
+// The page's own redraw budget, in milliseconds between frames.
+//
+// requestAnimationFrame runs at the DISPLAY's refresh rate, and every frame
+// here repaints five canvases that span the window -- so the cost of running a
+// video scales with the monitor's refresh rate as much as with its area. On the
+// 165 Hz, 3440x1440 screen this was built against, playing anything pinned the
+// GPU at 100%. Nothing on this page is animation-grade: a playhead crosses a
+// full-width bar at a few pixels per second, and the reviewer is reading the
+// curve rather than watching motion, so 30 Hz is not a compromise anyone can
+// see. A GESTURE is a different matter and is never held back -- it says so
+// through `paintDirty`, and being late to a drag is the one lag that would be
+// felt.
+const PAINT_MIN_MS = 1000 / 30;
+let lastPaint = 0;
+
+function tick(ts) {
+  const now = Number(ts) || performance.now();
   const ms = vid.currentTime * 1000;
   // "Moving" is the video actually advancing: a paused <video> reports the same
   // currentTime every frame, so this is false while the reviewer is looking at
   // something and true while it runs.
   const moving = !vid.paused && !vid.ended;
-  if (moving || paintDirty || ms !== paintMs) {
+  // Something asked for this frame (a gesture, or the playhead standing still
+  // somewhere it has not been drawn yet), or the video is running and the
+  // budget has come round again.
+  const wanted = paintDirty || (!moving && ms !== paintMs);
+  const due = moving && now - lastPaint >= PAINT_MIN_MS;
+  if (wanted || due) {
     paintDirty = false;
     paintMs = ms;
+    lastPaint = now;
     drawSim(ms);
     drawTimeline(ms);
     drawStrip(ms);
@@ -4031,7 +4108,8 @@ let excludeModels = null;
 // Run the suggestion, and keep it, the moment a clip is up -- instead of
 // waiting for the button. OFF on a fresh install: with it on, opening a video
 // costs a sampling pass before the page is usable and rewrites the pieces
-// without a click, which is not something to discover switched on.
+// without a click, which is not something to discover switched on. READ from
+// settings.json (the picker's O key writes it); this page has no switch for it.
 let autoSuggest = false;
 // Set while the boot-time pass is running, so it is not started twice for the
 // same clip by a re-entry.
@@ -4040,11 +4118,6 @@ let autoSuggestRan = null;
 function labelSuggest() {
   $('confSuggestToggle').classList.toggle('on', suggestOn);
   $('confSuggestBox').classList.toggle('hidden', !suggestOn);
-  labelAutoSuggest();
-}
-function labelAutoSuggest() {
-  const el = $('confAutoToggle');
-  if (el) el.classList.toggle('on', autoSuggest);
 }
 /** The models that get sampled, in the clip's own order. */
 function votingModels(c) {
@@ -4101,7 +4174,9 @@ function renderConfModels() {
   }
 }
 /** The ticks live on the server, next to the throttle preset -- they are about
- *  the person, not about this clip or this browser. */
+ *  the person, not about this clip or this browser. This page only writes the
+ *  EXCLUSIONS: the auto-run switch moved to the picker (its O key), and sending
+ *  it from here would quietly undo whatever the picker was told. */
 async function saveConfPrefs() {
   try {
     const r = await fetch('/conf_prefs', {
@@ -4109,12 +4184,10 @@ async function saveConfPrefs() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         exclude: excludeModels && excludeModels.length ? excludeModels : null,
-        auto: autoSuggest,
       }),
     });
     const j = await r.json();
     excludeModels = (j && j.exclude && j.exclude.length) ? j.exclude : null;
-    autoSuggest = !!(j && j.auto);
   } catch (e) { /* an unsaved tick is not worth breaking the drawer over */ }
   renderConfModels();
 }
@@ -4124,7 +4197,6 @@ async function loadConfPrefs() {
     excludeModels = (j && j.exclude && j.exclude.length) ? j.exclude : null;
     autoSuggest = !!(j && j.auto);
   } catch (e) { excludeModels = null; autoSuggest = false; }
-  labelAutoSuggest();
   renderConfModels();
 }
 function renderSuggest() {
@@ -4277,15 +4349,6 @@ $('confSuggestToggle').onclick = () => { suggestOn = !suggestOn; labelSuggest();
 $('confSuggestBtn').onclick = runSuggestion;
 $('confApply').onclick = applySuggestion;
 $('confDrop').onclick = () => { suggestSpans = null; suggestMsg = null; renderSuggest(); };
-$('confAutoToggle').onclick = () => {
-  autoSuggest = !autoSuggest;
-  // A switch that is turned ON runs for the clip already on screen -- otherwise
-  // the user would have to reload to find out what they just asked for.
-  if (autoSuggest) autoSuggestRan = null;
-  labelAutoSuggest();
-  saveConfPrefs();
-  if (autoSuggest) autoRunSuggestion(cur);
-};
 
 // ---- drawing the bar ------------------------------------------------------
 function drawSpanBand(X, w, h) {
