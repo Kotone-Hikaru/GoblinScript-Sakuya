@@ -1490,9 +1490,17 @@ fn gpu_profile_dir() -> PathBuf {
         .join("gpu-browser")
 }
 
-/// The browser to launch, in the order we would rather have it. Edge is the
-/// fallback because it is always present on Windows and would otherwise mask a
-/// real Chrome.
+/// The browser to launch, in the order we would rather have it.
+///
+/// Edge BEFORE Chrome, and not out of preference. `--force_high_performance_gpu`
+/// is only a hint: a per-executable entry under
+/// `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` outranks it, and that
+/// entry is exactly what someone does to Chrome on a hybrid machine when they
+/// watch video on the iGPU and want the battery quiet. Measured here: the same
+/// flag reported `AMD Radeon(TM) Graphics` on Chrome (its entry says
+/// `GpuPreference=1`, power saving) and `NVIDIA GeForce RTX 3080 Ti` on Edge
+/// (no entry). A browser we do not have to fight is worth more than a brand --
+/// and the page cannot tell the difference, it is the same engine.
 fn find_chromium() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
     let mut push = |base: Option<std::ffi::OsString>, rest: &[&str]| {
@@ -1505,6 +1513,14 @@ fn find_chromium() -> Option<PathBuf> {
         }
     };
     push(
+        std::env::var_os("ProgramFiles(x86)"),
+        &["Microsoft", "Edge", "Application", "msedge.exe"],
+    );
+    push(
+        std::env::var_os("ProgramFiles"),
+        &["Microsoft", "Edge", "Application", "msedge.exe"],
+    );
+    push(
         std::env::var_os("ProgramFiles"),
         &["Google", "Chrome", "Application", "chrome.exe"],
     );
@@ -1515,14 +1531,6 @@ fn find_chromium() -> Option<PathBuf> {
     push(
         std::env::var_os("LOCALAPPDATA"),
         &["Google", "Chrome", "Application", "chrome.exe"],
-    );
-    push(
-        std::env::var_os("ProgramFiles(x86)"),
-        &["Microsoft", "Edge", "Application", "msedge.exe"],
-    );
-    push(
-        std::env::var_os("ProgramFiles"),
-        &["Microsoft", "Edge", "Application", "msedge.exe"],
     );
     cands.into_iter().find(|p| p.is_file())
 }
