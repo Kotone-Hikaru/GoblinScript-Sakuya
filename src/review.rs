@@ -858,6 +858,30 @@ fn handle(
                 }
             }
         }
+        (Method::Get, "ui_prefs") => {
+            let s = crate::settings::Settings::load();
+            let _ = req.respond(json_response(&ui_prefs_json(&s)));
+        }
+        (Method::Post, "ui_prefs") => {
+            let mut body = String::new();
+            let _ = req.as_reader().read_to_string(&mut body);
+            match parse_ui_prefs(&body) {
+                Ok(w) => {
+                    let mut s = crate::settings::Settings::load();
+                    // Silence leaves the file alone, like `conf_prefs`'s `auto`:
+                    // a page that says nothing about the width must not reset it.
+                    if let Some(w) = w {
+                        s.rail_width = Some(w);
+                    }
+                    s.save();
+                    let _ = req.respond(json_response(&ui_prefs_json(&s)));
+                }
+                Err(e) => {
+                    let _ = req
+                        .respond(Response::from_string(format!("{e:#}")).with_status_code(400));
+                }
+            }
+        }
         (Method::Post, "params") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
@@ -1106,6 +1130,46 @@ pub(crate) fn parse_conf_prefs(body: &str) -> Result<ConfPrefs> {
         Some(_) => anyhow::bail!("weights must be an object of model name to number"),
     };
     Ok(ConfPrefs { exclude, auto, weights })
+}
+
+/// The page's own layout preferences, in the shape it reads them.
+///
+/// `width` is the flank column's width in CSS pixels, `null` for "never
+/// dragged -- use the stylesheet's own clamp". Separate from `conf_prefs`
+/// because they answer different questions: that one is about how the
+/// confidence vote should be counted, this one is about how much room the
+/// workbench gets. Mixing them would mean a drag on the panel edge rewrites the
+/// record of which models the reviewer trusts.
+pub(crate) fn ui_prefs_json(s: &crate::settings::Settings) -> serde_json::Value {
+    serde_json::json!({ "width": s.rail_width })
+}
+
+/// The same coming back from the page: `None` = said nothing about the width.
+///
+/// A number outside the range the page's own splitter can produce is refused
+/// rather than clamped. The page clamps while dragging, so a number out here
+/// did not come from a drag -- most likely a hand-edited settings file, and
+/// telling the reader so beats silently giving them a different layout from the
+/// one they wrote.
+pub(crate) fn parse_ui_prefs(body: &str) -> Result<Option<u16>> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
+    let w = match v.get("width") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(x) => x,
+            None => anyhow::bail!("width must be a whole number of pixels"),
+        },
+        Some(_) => anyhow::bail!("width must be a number or null"),
+    };
+    let (lo, hi) = (
+        crate::settings::RAIL_MIN_W as u64,
+        crate::settings::RAIL_MAX_W as u64,
+    );
+    if !(lo..=hi).contains(&w) {
+        anyhow::bail!("width must be within {lo}..{hi}, got {w}");
+    }
+    Ok(Some(w as u16))
 }
 
 /// What the page needs to (re)draw everything but the tracks themselves. Style
@@ -1739,7 +1803,8 @@ fn open_browser_gpu(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_review, hold_review, parse_conf_prefs, parse_range, staged_page_is_newer, Choice, Work,
+        bind_review, hold_review, parse_conf_prefs, parse_range, parse_ui_prefs,
+        staged_page_is_newer, Choice, Work,
     };
     use crate::style;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2031,6 +2096,42 @@ mod tests {
             None,
             "an absent field is not an instruction"
         );
+    }
+
+    /// The bench width is a drag the reviewer made, so it is worth exactly
+    /// nothing if the server quietly refuses it or quietly changes it: either
+    /// way the column comes back a different width from the one they left, and
+    /// the drag reads as broken.
+    ///
+    /// Silence is a separate statement from `null`: a page that says nothing
+    /// about the width must not reset a width set in another window, which is
+    /// why the return is an `Option`.
+    #[test]
+    fn a_bench_width_comes_back_as_it_was_sent_or_not_at_all() {
+        assert_eq!(parse_ui_prefs(r#"{"width":412}"#).unwrap(), Some(412));
+        assert_eq!(parse_ui_prefs(r#"{"width":null}"#).unwrap(), None);
+        assert_eq!(parse_ui_prefs("{}").unwrap(), None);
+        // both ends of the page's own range are legal
+        assert_eq!(
+            parse_ui_prefs(r#"{"width":220}"#).unwrap(),
+            Some(crate::settings::RAIL_MIN_W)
+        );
+        assert_eq!(
+            parse_ui_prefs(r#"{"width":520}"#).unwrap(),
+            Some(crate::settings::RAIL_MAX_W)
+        );
+        // ...and anything outside it did not come from a drag, so it is a 400
+        // rather than a silent clamp to a layout nobody chose
+        for bad in [
+            r#"{"width":100}"#,
+            r#"{"width":521}"#,
+            r#"{"width":-5}"#,
+            r#"{"width":"400"}"#,
+            r#"{"width":400.5}"#,
+            "not json at all",
+        ] {
+            assert!(parse_ui_prefs(bad).is_err(), "must refuse {bad}");
+        }
     }
 
     /// The queue's two promises, both of which a long video is the reason for.

@@ -138,6 +138,22 @@ pub struct Settings {
     /// thing the user turns on, never a thing they find already on. A user who
     /// never touches it is never given a second browser.
     pub gpu_browser: bool,
+    /// How wide the spanning bench (the left drawer, and the right workbench
+    /// rail) was left, in CSS pixels.
+    ///
+    /// `None` = never dragged = the layout's own `clamp(272px, 23vw, 348px)`,
+    /// which is the width that reads well on any screen. A number here is the
+    /// page's own report of a drag, so it is honoured only within
+    /// [`RAIL_MIN_W`]..=[`RAIL_MAX_W`]: the page clamps while dragging, but a
+    /// hand-edited settings file must not be able to open a column wider than
+    /// the window and leave no stage.
+    ///
+    /// ONE number for both flanks. The two columns sit on opposite sides of the
+    /// same stage, so a review that widened the bench to read the piece list
+    /// wants the knobs beside it just as wide -- and a single value is also
+    /// what makes "drag either edge, the whole bench follows" true rather than
+    /// a surprise.
+    pub rail_width: Option<u16>,
 }
 
 impl Default for Settings {
@@ -160,9 +176,19 @@ impl Default for Settings {
             review_port: None,
             conf_weights: None,
             gpu_browser: false,
+            rail_width: None,
         }
     }
 }
+
+/// The narrowest a flank column may be dragged: below this the piece rows' own
+/// number boxes stop fitting on one line.
+pub const RAIL_MIN_W: u16 = 220;
+
+/// The widest a flank column may be dragged. Wide enough for the fine-tuning
+/// rows to sit on one line, narrow enough that a 1440-wide stage never loses
+/// more than about a third of itself to one column.
+pub const RAIL_MAX_W: u16 = 520;
 
 /// `settings.json` beside the exe (where the cache lives too).
 fn path() -> Option<PathBuf> {
@@ -373,5 +399,26 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// The bench width is a layout preference the reviewer sets by dragging an
+    /// edge, and it is worth exactly nothing if it does not come back on the
+    /// next page load -- the drag is the whole feature. Absent means "never
+    /// dragged", which is the stylesheet's `clamp()`, NOT a zero-width column.
+    #[test]
+    fn the_bench_width_is_the_files_to_keep() {
+        let mut s = Settings::default();
+        assert_eq!(s.rail_width, None, "a fresh install has never been dragged");
+        s.rail_width = Some(412);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.rail_width, Some(412), "the width did not survive being written");
+        // a file with no opinion reads as the stylesheet's own width
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().rail_width, None);
+        // a width outside the range the page's splitter can produce did not come
+        // from a drag; it is refused by `parse_ui_prefs` rather than stored, and
+        // the two constants are what that check is written against
+        assert!(RAIL_MIN_W < RAIL_MAX_W);
+        assert_eq!(RAIL_MIN_W, 220);
+        assert_eq!(RAIL_MAX_W, 520);
     }
 }
