@@ -1937,12 +1937,46 @@ $('done').onclick = async () => {
   }
   disarmDone();
   try { await fetch('/done', { method: 'POST' }); } catch (e) { /* server already gone */ }
-  const closed = document.createElement('div');
-  closed.id = 'closed';
-  closed.append(T('page.closed'), document.createElement('br'), T('page.closed.tab'));
-  document.body.innerHTML = '';
-  document.body.append(closed);
+  waitNext();
 };
+
+// Done ends the BATCH, not the window. The page stays up and asks where the
+// next batch begins, so a run finishes on a tab that is still useful instead
+// of a dead one -- and starting the next batch turns this page rather than
+// opening a second window beside it. Closing the tab is still allowed: the
+// next stage notices the silence and opens its own.
+function waitNext() {
+  const note = document.createElement('div');
+  note.id = 'closed';
+  note.append(T('page.closed'), document.createElement('br'), T('page.next'));
+  document.body.innerHTML = '';
+  document.body.append(note);
+  (async () => {
+    let misses = 0;
+    for (;;) {
+      await new Promise(r => setTimeout(r, 400));
+      let next = null;
+      try {
+        next = (await (await fetch('/api/next', { cache: 'no-store' })).json()).next;
+        misses = 0;
+      } catch (e) {
+        // the server was taken down under us: nothing more will come
+        if (++misses >= 6) {
+          note.textContent = '';
+          note.append(T('page.closed'), document.createElement('br'), T('page.gone'));
+          return;
+        }
+        continue;
+      }
+      if (next) {
+        // tell the finishing server we are leaving, so it stops listening
+        try { fetch('/api/left', { method: 'POST', body: '{}', keepalive: true }); } catch (e) {}
+        location.replace(next);
+        return;
+      }
+    }
+  })();
+}
 
 // ---- playback speed --------------------------------------------------------
 // Slow-mo is the review workhorse: reversal timing against motion is hard to

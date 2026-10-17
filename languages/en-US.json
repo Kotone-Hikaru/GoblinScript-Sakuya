@@ -319,6 +319,8 @@
   "page.done.confirm": "click again to finish",
   "page.closed": "Review closed — the goblins are done; the scripts are final.",
   "page.closed.tab": "You can close this tab.",
+  "page.next": "When the next batch starts, this window will move to it by itself -- leave it open.",
+  "page.gone": "The connection to the run is gone. Check the terminal.",
   "page.group.script": "script",
   "page.group.script.hint": "what gets written, and device limits",
   "page.group.strokes": "strokes",

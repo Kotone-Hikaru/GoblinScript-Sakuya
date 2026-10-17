@@ -319,6 +319,8 @@
   "page.done.confirm": "再点一次以完成",
   "page.closed": "校对已结束 —— 哥布林收工了；脚本已定稿。",
   "page.closed.tab": "可以关闭此标签页了。",
+  "page.next": "下一批开始时，这个窗口会自己跳过去——留着它就行。",
+  "page.gone": "和后台的连接已经断开。请回终端看结果。",
   "page.group.script": "脚本",
   "page.group.script.hint": "写入什么，以及设备限制",
   "page.group.strokes": "冲程",

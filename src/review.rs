@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tiny_http::{Header, Method, Response, StatusCode};
@@ -267,8 +268,14 @@ pub fn review(
             want = None;
         }
     }
-    let server = bind_review(want)
-        .map_err(|e| anyhow::anyhow!("could not start the review server: {e}"))?;
+    let server = Arc::new(
+        bind_review(want)
+            .map_err(|e| anyhow::anyhow!("could not start the review server: {e}"))?,
+    );
+    // Whether a window ever showed up. A run nobody is watching has nothing to
+    // hand on, and parking a page that does not exist would let the next batch
+    // skip opening one.
+    let seen = Arc::new(AtomicBool::new(false));
     let port = server
         .server_addr()
         .to_ip()
@@ -303,13 +310,76 @@ pub fn review(
             let apply = &apply;
             scope.spawn(move || work.style_until_done(apply))
         };
-        let r = serve(&server, clips, params, choices, &defaults, presets, &work);
+        let r = serve(
+            &server, clips, params, choices, &defaults, presets, &work, &seen,
+        );
         // Whatever ended the review -- Done, a console key, an error -- the
         // styler is told before we leave, or the scope waits on it forever.
         work.finish();
         let _ = styler.join();
         r
-    })
+    })?;
+
+    // The review is over; the window need not be. A batch usually ends here,
+    // and the next one starts a minute or a day later -- opening a second
+    // window onto what is already one window turns the taskbar into a
+    // history of every run. So leave the finished page parked: it asks
+    // `/api/next`, the next batch hands it the crop page's address, and this
+    // same tab turns the page. A run nobody watched leaves nothing behind.
+    if seen.load(Ordering::SeqCst) {
+        crate::pagewin::park();
+        let held = Arc::clone(&server);
+        std::thread::spawn(move || hold_review(held));
+    }
+    Ok(())
+}
+
+/// Keep a finished review answering until the next batch claims its window.
+///
+/// Only the hand-off routes are served: the script, the video and the knobs
+/// are gone with the run that owned them, and a page that has just been told
+/// the batch is over has no business asking for them. Everything else gets a
+/// plain 404, which is the truth rather than a stale picture of the last run.
+fn hold_review(server: Arc<tiny_http::Server>) {
+    let deadline = std::time::Instant::now() + crate::pagewin::PATIENCE;
+    while std::time::Instant::now() < deadline && crate::pagewin::parked() {
+        let req = match server.recv_timeout(Duration::from_millis(200)) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(_) => return,
+        };
+        let url = req.url().to_string();
+        let path = url.split('?').next().unwrap_or("/").to_string();
+        match path.as_str() {
+            // The page is still there and asking what comes next.
+            "/api/next" => {
+                let _ = req.respond(json_response(&serde_json::json!({
+                    "next": crate::pagewin::ask(),
+                })));
+            }
+            // ...and now it is navigating away: this window belongs to the
+            // next stage, and this thread has answered its last question.
+            "/api/left" => {
+                crate::pagewin::left();
+                let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
+                return;
+            }
+            // The idle poll the page runs anyway. Answered so a parked page
+            // does not churn through fetch failures while it waits.
+            "/ping" => {
+                let _ = req.respond(Response::from_string(boot_id()));
+            }
+            // Still one of ours on this address, so the next review takes a
+            // fresh one instead of failing to bind and silently landing on a
+            // random port with nothing said about it.
+            "/whoami" => {
+                let _ = req.respond(Response::from_string(WHOAMI));
+            }
+            _ => {
+                let _ = req.respond(Response::from_string("gone").with_status_code(404));
+            }
+        }
+    }
 }
 
 /// The request loop. Answers immediately, always: the only work it does itself
@@ -326,6 +396,7 @@ fn serve(
     defaults: &[style::Params],
     presets: Presets,
     work: &Work,
+    seen: &AtomicBool,
 ) -> Result<()> {
     // No console (piped output, a service context): the page's Done button is
     // the only finish, which is exactly right there.
@@ -354,7 +425,7 @@ fn serve(
             Some(r) => r,
             None => continue,
         };
-        if handle(req, clips, params, choices, defaults, presets, work) == Flow::Finish {
+        if handle(req, clips, params, choices, defaults, presets, work, seen) == Flow::Finish {
             return Ok(());
         }
     }
@@ -564,6 +635,7 @@ fn handle(
     defaults: &[style::Params],
     presets: Presets,
     work: &Work,
+    seen: &AtomicBool,
 ) -> Flow {
     let url = req.url().to_string();
     // Strip the query BEFORE splitting: without this a route whose name would
@@ -573,6 +645,7 @@ fn handle(
     let mut parts = path.trim_matches('/').split('/');
     match (req.method().clone(), parts.next().unwrap_or("")) {
         (Method::Get, "") => {
+            seen.store(true, Ordering::SeqCst);
             let _ = req.respond(
                 Response::from_string(page_html())
                     .with_header(header("Content-Type", "text/html; charset=utf-8")),
@@ -1564,10 +1637,207 @@ fn open_browser_gpu(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_conf_prefs, parse_range, Choice, Work};
+    use super::{bind_review, hold_review, parse_conf_prefs, parse_range, Choice, Work};
     use crate::style;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// One request to a loopback server: the status line, then the body when
+    /// the server declared one. Big answers come back chunked (the page is
+    /// 240 KB), and the status line alone is all a test needs from those.
+    fn knock(port: u16, method: &str, path: &str) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+            return String::new();
+        };
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        if s.write_all(req.as_bytes()).is_err() {
+            return String::new();
+        }
+        let mut r = BufReader::new(s);
+        let mut status = String::new();
+        if r.read_line(&mut status).is_err() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        let mut chunked = false;
+        loop {
+            let mut l = String::new();
+            match r.read_line(&mut l) {
+                Ok(0) | Err(_) => return status,
+                Ok(_) => {}
+            }
+            let low = l.to_ascii_lowercase();
+            if let Some(n) = low.strip_prefix("content-length:") {
+                len = n.trim().parse().unwrap_or(0);
+            }
+            if low.starts_with("transfer-encoding:") && low.contains("chunked") {
+                chunked = true;
+            }
+            if l.trim().is_empty() {
+                break;
+            }
+        }
+        if chunked {
+            return status;
+        }
+        let mut body = vec![0u8; len];
+        match r.read_exact(&mut body) {
+            Ok(()) => format!("{status}{}", String::from_utf8_lossy(&body)),
+            Err(_) => status,
+        }
+    }
+
+    /// Done ends the BATCH, not the window. A finished review parks its page
+    /// and goes on answering `/api/next`, so the next batch turns this tab
+    /// instead of opening a second window beside it -- the taskbar otherwise
+    /// becomes a history of every run of the day.
+    ///
+    /// The parked thread is what makes the hand-off possible at all: without
+    /// it there is nobody to tell the page where to go, and the page sits on a
+    /// run that has already ended.
+    #[test]
+    fn a_finished_review_hands_its_window_to_the_next_batch() {
+        let _guard = crate::cancel::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::pagewin::left();
+        let server = Arc::new(bind_review(None).expect("a review server on a free port"));
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("a TCP address")
+            .port();
+        crate::pagewin::park();
+        let held = Arc::clone(&server);
+        let sitter = std::thread::spawn(move || hold_review(held));
+
+        // the page is up and asking; there is nothing to go to yet
+        assert!(
+            knock(port, "GET", "/api/next").contains(r#""next":null"#),
+            "a parked page with no next stage is told to wait, not to leave"
+        );
+        // the next batch claims the window
+        assert!(crate::pagewin::hand_off("http://127.0.0.1:9/"));
+        assert!(
+            knock(port, "GET", "/api/next").contains("127.0.0.1:9"),
+            "the address the next stage bound is what the page is handed"
+        );
+        // ...and the page says it is leaving, which is what stops the thread
+        assert!(knock(port, "POST", "/api/left").contains("200 OK"));
+        sitter.join().expect("the parked thread lets go");
+        assert!(
+            !crate::pagewin::parked(),
+            "a page that left is not still waiting for someone"
+        );
+        crate::pagewin::left();
+    }
+
+    /// The same promise, through the real entry point: `review()` itself must
+    /// leave the window parked when it ends. It is one line at the end of the
+    /// function, which is exactly the kind of line a later edit deletes without
+    /// noticing -- and the loss is silent, showing up as "the next batch opened
+    /// another window" a day later.
+    #[test]
+    fn a_review_that_ends_leaves_its_window_parked() {
+        use super::{review, Clip, Presets, Restyled};
+
+        let _guard = crate::cancel::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::pagewin::left();
+
+        let dir = std::env::temp_dir().join(format!("gs-review-park-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let script = dir.join("a.funscript");
+        std::fs::write(&script, r#"{"actions":[{"at":0,"pos":50}],"version":"1.0"}"#)
+            .expect("a script to serve");
+
+        let clips = vec![Clip {
+            name: "a".to_string(),
+            script: script.clone(),
+            video: dir.join("a.mp4"),
+            fallback: None,
+            is_original: true,
+            duration_ms: 1000.0,
+            row_hz: 30.0,
+            row0_ms: 0.0,
+            t0_ms: 0.0,
+            crop: None,
+            model: "trunk".to_string(),
+            models: Vec::new(),
+            compare: dir.join("compare.funscript"),
+            cuts_ms: Vec::new(),
+        }];
+        let mut params = vec![style::Params::default()];
+        let mut choices = vec![Choice {
+            model: "trunk".to_string(),
+            compare: None,
+            spans: Vec::new(),
+            cuts_ms: None,
+        }];
+        let presets = Presets {
+            dwell_ramp: 1.0,
+            still_eps: 0.01,
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let run = std::thread::spawn(move || {
+            review(
+                &clips,
+                &mut params,
+                &mut choices,
+                presets,
+                // no browser here: the test drives the page itself
+                false,
+                &|url| {
+                    let _ = tx.send(url.to_string());
+                },
+                |_, _, _| {
+                    Ok(Restyled {
+                        actions: 1,
+                        conf: Vec::new(),
+                    })
+                },
+            )
+        });
+
+        let url = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the review announces its address");
+        let port: u16 = url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("a port in the announced address");
+
+        // a window shows up: it loads the page (which is what sets `seen`)
+        let page = knock(port, "GET", "/");
+        assert!(
+            page.contains("200 OK"),
+            "the review page is served from the address it announced: {page:?}"
+        );
+        // ...and the batch ends
+        assert!(knock(port, "POST", "/done").contains("200 OK"));
+        run.join().expect("the review thread ends").expect("cleanly");
+
+        assert!(
+            crate::pagewin::parked(),
+            "a review that ended must leave its window waiting for the next batch"
+        );
+        // and that window is steerable, which is the whole point of parking it
+        assert!(crate::pagewin::hand_off("http://127.0.0.1:9/"));
+        assert_eq!(
+            crate::pagewin::ask().as_deref(),
+            Some("http://127.0.0.1:9/"),
+            "the next batch's address reaches the window the review left behind"
+        );
+        crate::pagewin::left();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The review page's exclusions may be posted without the auto-suggest
     /// switch -- it moved to the picker, and the page has no switch for it --
