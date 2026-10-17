@@ -248,19 +248,26 @@ pub fn review(
     // back-to-back sessions where "one is already up" is the normal state.
     let mut settings = crate::settings::Settings::load();
     let force = std::env::var_os("GOBLIN_REVIEW_FORCE").is_some();
+    // A review of ours already answering on the remembered port is NOT a reason
+    // to end this one. It used to be, and in a session started from the picker
+    // that meant the user never saw a page at all: the notice explaining why was
+    // printed and then wiped by the TUI drawing itself back, so the batch simply
+    // returned to the picker -- indistinguishable from a review that was skipped.
+    // A leftover server from an earlier run is enough to cause it, and leftovers
+    // are exactly what a long-lived port attracts. Losing the address costs one
+    // reload; losing the review costs the batch.
+    let mut want = settings.review_port;
     if let Some(p) = settings.review_port {
         if !force && already_serving(p) {
-            let url = format!("http://127.0.0.1:{p}/");
             println!(
-                "\n  {} {}  {}",
+                "\n  {} {}",
                 crate::t!("console.review.label"),
-                console::style(&url).cyan().bold(),
-                console::style(crate::t!("console.review.already")).dim()
+                console::style(crate::t!("console.review.already", port = p)).dim()
             );
-            return Ok(());
+            want = None;
         }
     }
-    let server = bind_review(settings.review_port)
+    let server = bind_review(want)
         .map_err(|e| anyhow::anyhow!("could not start the review server: {e}"))?;
     let port = server
         .server_addr()

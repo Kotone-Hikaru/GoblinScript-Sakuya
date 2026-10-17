@@ -78,7 +78,7 @@
   "console.review.label": "review:",
   "console.review.hint": "(opened in your browser -- press Done there, or Enter here, to finish)",
   "console.review.manual": "(not opened for you -- open the address above)",
-  "console.review.already": "(a review is already up here -- use it; this run opens nothing new)",
+  "console.review.already": "({port} still has an older review up -- this run takes a new address)",
   "console.review.fallback": "browser review unavailable ({err}); using the terminal screen",
   "picker.den": "goblin den: ",
   "picker.drives": "drives",
