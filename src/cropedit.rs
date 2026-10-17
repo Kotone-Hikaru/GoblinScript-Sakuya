@@ -37,11 +37,11 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::{Method, Response};
 
 use crate::autocrop::{Plan, Rect, IDENTITY};
-use crate::review::{header, json_response, open_browser, serve_file_threaded, video_ctype};
+use crate::review::{header, json_response, serve_file_threaded, video_ctype};
 
 /// What the page edits and what the caller gets back.
 struct Session {
@@ -62,6 +62,10 @@ struct Session {
     /// shape of the source -- the shape the encoder's square squash expects.
     aspect: f64,
     done: bool,
+    /// The page itself was asked for at least once. A run nobody is watching
+    /// (`--no-browser`, no one at the address) has no window to steer, so it
+    /// must not leave a finished server parked behind it.
+    seen: bool,
 }
 
 impl Session {
@@ -136,8 +140,14 @@ pub fn edit(
     open: bool,
     page: &dyn Fn(&str),
 ) -> Result<Option<Plan>> {
-    let server = tiny_http::Server::http("127.0.0.1:0")
-        .map_err(|e| anyhow::anyhow!("could not start the crop page: {e}"))?;
+    // `Arc`, because a finished page outlives this call: it is parked in the
+    // browser window until the next stage gives it somewhere to go (see
+    // `pagewin`). The socket closes when the last holder lets go, which is
+    // what ends that wait.
+    let server = Arc::new(
+        tiny_http::Server::http("127.0.0.1:0")
+            .map_err(|e| anyhow::anyhow!("could not start the crop page: {e}"))?,
+    );
     let port = server
         .server_addr()
         .to_ip()
@@ -158,12 +168,15 @@ pub fn edit(
         dur_ms,
         aspect,
         done: false,
+        seen: false,
     }));
 
     page(&url);
-    if open {
-        open_browser(&url);
-    }
+    // The window may already be up: the previous video's crop page is parked
+    // in it waiting for exactly this address, and a batch should turn a page
+    // rather than open a window per video. `deliver` hands it over when there
+    // is one to hand over, and opens a browser when there is not.
+    crate::pagewin::deliver(&url, open);
 
     // No console reading here: the draft's own display already owns the
     // keyboard (Ctrl-C included), so this stage waits on the page and on the
@@ -176,9 +189,46 @@ pub fn edit(
         };
         handle(req, &state, &path)?;
         if state.lock().unwrap().done {
-            return Ok(finish(&state, plan));
+            let out = finish(&state, plan);
+            // This PAGE is finished; the WINDOW is not. Park it so the next
+            // stage navigates it -- a crop page per video and a review at the
+            // end should be one window turning pages, not a window opening,
+            // closing and opening again. Only when someone actually opened the
+            // page: a run with no window has nothing to hand over.
+            if state.lock().unwrap().seen {
+                crate::pagewin::park();
+                let held = Arc::clone(&server);
+                let state = Arc::clone(&state);
+                let path = path.clone();
+                std::thread::spawn(move || hold(held, state, path));
+            }
+            return Ok(out);
         }
     }
+}
+
+/// Keep a finished page answering until the window leaves for the next stage.
+///
+/// It serves the same routes: the picture is still on screen and a scrub after
+/// Done is harmless. The one question that still matters is `/api/next`.
+fn hold(server: Arc<tiny_http::Server>, state: Arc<Mutex<Session>>, video: PathBuf) {
+    let deadline = Instant::now() + crate::pagewin::PATIENCE;
+    while Instant::now() < deadline && crate::pagewin::parked() {
+        let req = match server.recv_timeout(Duration::from_millis(200)) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(_) => return,
+        };
+        let leaving = req.url().starts_with("/api/left");
+        if handle(req, &state, &video).is_err() || leaving {
+            return;
+        }
+    }
+    // Out of patience without being told the page left: the socket is about to
+    // close under a page that is still asking, so say so rather than leave a
+    // next address here that nobody will read. `/api/left` is the page's own
+    // word and clears the slot itself, so this only fires on a timeout -- and
+    // by then the slot, if any, is not ours to keep.
 }
 
 /// The edited plan, or `None` when nothing was actually moved. `src` is the
@@ -233,10 +283,23 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
     let path = url.split('?').next().unwrap_or("/").to_string();
     match (req.method().clone(), path.as_str()) {
         (Method::Get, "/") | (Method::Get, "/index.html") => {
+            state.lock().unwrap().seen = true;
             let _ = req.respond(
                 Response::from_string(include_str!("cropedit.html"))
                     .with_header(header("Content-Type", "text/html; charset=utf-8")),
             );
+        }
+        // The page has done its job and asks where the run goes next; the next
+        // stage leaves the address here. `null` means "not yet, keep asking".
+        (Method::Get, "/api/next") => {
+            let _ = req.respond(json_response(&serde_json::json!({
+                "next": crate::pagewin::ask(),
+            })));
+        }
+        // The page is navigating away: the window now belongs to that stage.
+        (Method::Post, "/api/left") => {
+            crate::pagewin::left();
+            let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
         }
         (Method::Get, "/api/state") => {
             let v = state.lock().unwrap().json();
@@ -454,6 +517,7 @@ mod tests {
             dur_ms: 60_000.0,
             aspect: 16.0 / 9.0,
             done: false,
+            seen: false,
         }));
         (plan, page)
     }

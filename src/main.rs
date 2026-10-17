@@ -19,6 +19,7 @@ mod encode;
 mod errlog;
 mod exposure;
 mod mascot;
+mod pagewin;
 mod prefetch;
 mod ffmpeg;
 mod heads;

@@ -289,9 +289,10 @@ pub fn review(
     }
 
     page(&url);
-    if open {
-        open_browser(&url);
-    }
+    // The crop page for the last video is probably still up in the one window
+    // this run opened, waiting for exactly this address. Send it here instead
+    // of opening a second window; if nobody is waiting, open one.
+    crate::pagewin::deliver(&url, open);
 
     let work = Arc::new(Work::new(first));
     // A scope, so the styler can borrow the draft's tracks rather than own a

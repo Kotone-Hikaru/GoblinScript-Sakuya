@@ -439,8 +439,38 @@ $('all').onclick = () => post({ i: -1, rect: segs[cur].rect });
 $('done').onclick = async () => {
   await fetch('/api/done', { method: 'POST', body: '{}' });
   $('done').disabled = true;
-  $('hint').textContent = T('cpage.bye');
+  $('hint').textContent = T('cpage.wait');
+  follow();
 };
+
+// This PAGE is finished; the window is not. The run continues -- the next
+// video's crop page, or the review at the end -- and it will be served at a
+// new address. Asking for it and leaving keeps the person in one window
+// instead of watching one open, close and open again.
+//
+// A stage can take minutes (a draft, a latent pass), so silence is normal and
+// only a server that has actually gone is an ending.
+async function follow() {
+  let misses = 0;
+  for (;;) {
+    await new Promise(r => setTimeout(r, 400));
+    let next = null;
+    try {
+      next = (await (await fetch('/api/next', { cache: 'no-store' })).json()).next;
+      misses = 0;
+    } catch (e) {
+      // the server was taken down under us: nothing more will come
+      if (++misses >= 6) { $('hint').textContent = T('cpage.gone'); return; }
+      continue;
+    }
+    if (next) {
+      // tell the finishing page's server we are leaving, so it stops listening
+      try { fetch('/api/left', { method: 'POST', body: '{}', keepalive: true }); } catch (e) {}
+      location.replace(next);
+      return;
+    }
+  }
+}
 
 // ---- transport -----------------------------------------------------------
 // A rect can only be judged against the action moving under it, so the bar is
