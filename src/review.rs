@@ -580,15 +580,65 @@ impl Work {
 /// source tree would mean a SHIPPED exe quietly serving a page from a checkout
 /// it happens to sit next to -- and there the page and the binary are free to
 /// disagree, which is the one thing this must never allow.
+///
+/// And the loose file has to be NEWER than the exe. A page left in that folder
+/// by an older run is not a staged page, it is a fossil -- and it out-voted the
+/// binary once already: a review finished on a screen whose text no longer
+/// existed anywhere in the code, so the parked window never asked where to go
+/// next and every batch after it opened a window of its own. A fossil is
+/// ignored, loudly, once.
 fn page_html() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Ok(s) = std::fs::read_to_string(dir.join("review.html")) {
-                return s;
-            }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+    {
+        let loose = dir.join("review.html");
+        match std::fs::read_to_string(&loose) {
+            Ok(s) if staged_page_is_newer(&loose, &dir.join(exe_name())) => return s,
+            Ok(_) => warn_stale_page(&loose),
+            Err(_) => {}
         }
     }
     include_str!("review.html").to_string()
+}
+
+/// The exe's own file name, so the comparison below names the right file even
+/// when the binary was renamed (a dev copy is `gs-dev.exe`).
+fn exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "goblinscript.exe".to_string())
+}
+
+/// Is the loose page worth trusting? Only if it was staged after the binary
+/// that would serve it. Unknown timestamps mean "not staged" -- the embedded
+/// copy is always the safe answer.
+fn staged_page_is_newer(page: &std::path::Path, exe: &std::path::Path) -> bool {
+    let stamp = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    match (stamp(page), stamp(exe)) {
+        (Some(page), Some(exe)) => page > exe,
+        _ => false,
+    }
+}
+
+/// Say it once. Silent ignoring would leave a dev staring at an unchanged page
+/// wondering why their edit did nothing.
+fn warn_stale_page(page: &std::path::Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    println!(
+        "\n  {} {}",
+        crate::t!("console.review.label"),
+        console::style(crate::t!(
+            "console.review.stale",
+            file = page.display().to_string()
+        ))
+        .dim()
+    );
 }
 
 /// Percent-decoding, for the two query strings this server reads. Values are
@@ -648,7 +698,11 @@ fn handle(
             seen.store(true, Ordering::SeqCst);
             let _ = req.respond(
                 Response::from_string(page_html())
-                    .with_header(header("Content-Type", "text/html; charset=utf-8")),
+                    .with_header(header("Content-Type", "text/html; charset=utf-8"))
+                    // The address is remembered across runs (`review_port`), so
+                    // the same URL outlives the page: a stored copy would hand
+                    // this run the last run's program.
+                    .with_header(header("Cache-Control", "no-store")),
             );
         }
         // The single-instance check's own endpoint: a fixed word, so a process
@@ -1432,6 +1486,7 @@ pub(crate) fn header(field: &str, value: &str) -> Header {
 pub(crate) fn json_response(v: &serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_data(v.to_string().into_bytes())
         .with_header(header("Content-Type", "application/json"))
+        .with_header(header("Cache-Control", "no-store"))
 }
 
 /// By this point the path is one of ours: an MP4-family original, a WebM-codec
@@ -1637,7 +1692,9 @@ fn open_browser_gpu(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_review, hold_review, parse_conf_prefs, parse_range, Choice, Work};
+    use super::{
+        bind_review, hold_review, parse_conf_prefs, parse_range, staged_page_is_newer, Choice, Work,
+    };
     use crate::style;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2392,5 +2449,38 @@ mod tests {
              the temporal dead zone and the page never finishes booting:\n  {}",
             bad.join("\n  ")
         );
+    }
+
+    /// A page left beside the exe by an OLDER run must never be served: it is
+    /// the difference between a page that knows where the window goes next and
+    /// one that sits there finished, which is a window opened per batch.
+    #[test]
+    fn a_page_left_beside_the_exe_by_an_older_run_is_not_served() {
+        let dir = std::env::temp_dir().join(format!("gs-staged-page-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("review.html");
+        let exe = dir.join("goblinscript.exe");
+
+        // the fossil: written first, exe built afterwards
+        std::fs::write(&page, "old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&exe, "bin").unwrap();
+        assert!(
+            !staged_page_is_newer(&page, &exe),
+            "an older page is a leftover, not a staged one"
+        );
+
+        // staged on purpose: written after the build
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&page, "new").unwrap();
+        assert!(
+            staged_page_is_newer(&page, &exe),
+            "a page staged after the build is the one to serve"
+        );
+
+        // no page at all is not an error, it just is not staged
+        assert!(!staged_page_is_newer(&dir.join("absent.html"), &exe));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

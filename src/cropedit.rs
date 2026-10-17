@@ -285,8 +285,11 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
         (Method::Get, "/") | (Method::Get, "/index.html") => {
             state.lock().unwrap().seen = true;
             let _ = req.respond(
+                // No caching: this page is the program, and a stored copy would
+                // outlive the version that wrote it.
                 Response::from_string(include_str!("cropedit.html"))
-                    .with_header(header("Content-Type", "text/html; charset=utf-8")),
+                    .with_header(header("Content-Type", "text/html; charset=utf-8"))
+                    .with_header(header("Cache-Control", "no-store")),
             );
         }
         // The page has done its job and asks where the run goes next; the next

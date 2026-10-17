@@ -79,6 +79,7 @@
   "console.review.hint": "（已在浏览器中打开 —— 在页面上按 Done，或在这里按回车，即可结束）",
   "console.review.manual": "（未自动打开 —— 请手动打开上面的地址）",
   "console.review.already": "（{port} 上还有个没关掉的校阅页 —— 这次另开一个新地址）",
+  "console.review.stale": "（{file} 比程序旧，当成上次留下的旧页面忽略了 —— 要临时换页面的话，把文件重写到比 exe 新）",
   "console.review.fallback": "浏览器校阅不可用（{err}）；改用终端界面",
   "picker.den": "哥布林巢穴：",
   "picker.drives": "驱动器",
