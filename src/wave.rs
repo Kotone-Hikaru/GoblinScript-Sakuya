@@ -649,6 +649,61 @@ pub struct WaveSet {
     pub version: u32,
     #[serde(default)]
     pub waves: Vec<Wave>,
+    /// One-click fills for the strip's context menu. Data in here for the same
+    /// reason the waves are: a new preset is an entry, not a code path.
+    #[serde(default)]
+    pub fills: Vec<Fill>,
+}
+
+/// A one-click fill: the whole recipe for a manual piece, so a stretch of
+/// script becomes it in a single gesture.
+///
+/// `cell` is the menu grid position, written "row-column" ("1-1" is the top
+/// left, "3-3" the bottom right). The page lays its cells out by that rule, so
+/// an unused cell stays a deliberate hole instead of shifting everything up.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Fill {
+    pub cell: String,
+    /// i18n key for the menu label.
+    pub label: String,
+    /// The wave this preset draws with.
+    pub wave: String,
+    /// Absolute band in position units (0..100) -- the same numbers the
+    /// panel's two boxes carry.
+    pub lo: f64,
+    pub hi: f64,
+    /// Cycles per second, because that is how a preset is described out loud.
+    /// Converted to the span's own seconds-per-cycle in `spec`.
+    pub rate: f64,
+    /// Knob overrides, merged over the wave's own defaults.
+    #[serde(default)]
+    pub params: Params,
+}
+
+impl Fill {
+    /// The span this preset writes into a piece: the named wave, this preset's
+    /// band and cadence, and BOTH exemptions on -- a fill is drawn rather than
+    /// decoded, so neither the speed ceiling nor the shot cuts should be
+    /// allowed to redraw it.
+    pub fn spec(&self, set: &WaveSet) -> Option<WaveSpec> {
+        let w = set.get(&self.wave)?;
+        let mut p = Params::new();
+        for s in &w.params {
+            p.insert(s.key.clone(), s.default.clone());
+        }
+        for (k, v) in &self.params {
+            p.insert(k.clone(), v.clone());
+        }
+        Some(WaveSpec {
+            id: self.wave.clone(),
+            lo: self.lo,
+            hi: self.hi,
+            period_s: if self.rate > 0.0 { 1.0 / self.rate } else { 1.0 },
+            params: p,
+            mirror_time: false,
+            mirror_amp: false,
+        })
+    }
 }
 
 impl WaveSet {
@@ -677,6 +732,22 @@ pub fn load() -> WaveSet {
 /// The whole set, for the page to build its picker and controls from.
 pub fn value() -> serde_json::Value {
     serde_json::to_value(load()).unwrap_or_else(|_| serde_json::json!({ "waves": [] }))
+}
+
+/// The fill presets, ready for the page: the grid cell, the label key, and the
+/// finished wave spec to drop into a piece. Assembled here so the page never
+/// keeps a second copy of what "a sine at 7 a second" means.
+pub fn fills_json() -> serde_json::Value {
+    let set = load();
+    let items: Vec<serde_json::Value> = set
+        .fills
+        .iter()
+        .filter_map(|f| {
+            let spec = f.spec(&set)?;
+            Some(serde_json::json!({ "cell": f.cell, "label": f.label, "wave": spec }))
+        })
+        .collect();
+    serde_json::json!(items)
 }
 
 #[cfg(test)]

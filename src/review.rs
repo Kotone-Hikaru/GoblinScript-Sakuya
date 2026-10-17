@@ -124,10 +124,29 @@ pub struct Span {
     /// field, and ignoring the cuts is what a drawing wants.
     #[serde(default = "yes")]
     pub no_cuts: bool,
+    /// This piece's own intensity, 0-5, where 1 is the model's own output.
+    ///
+    /// Scaling is about the piece's OWN mean rather than mid-range, so a factor
+    /// above 1 cannot push a low-lying waveform toward the floor -- which is
+    /// what "stronger made it smaller" was. It applies to ordinary spans: a
+    /// hand-drawn piece has amplitude knobs of its own and is left out of it.
+    /// Absent means 1, so a page built before this existed and every stored
+    /// session read as "unchanged".
+    #[serde(default = "one")]
+    pub scale: f64,
 }
+
+/// The biggest piece intensity the panel offers. Refused above this rather than
+/// clamped silently, because the number came from the page and a page sending
+/// nonsense should hear about it.
+pub const MAX_PIECE_SCALE: f64 = 5.0;
 
 fn yes() -> bool {
     true
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 /// The manifest's "normal" values for the two preset axes. The page shows each
@@ -154,6 +173,58 @@ const RANGE_CHUNK: u64 = 8 << 20;
 /// its action count. `page` hears the URL once the page is up -- the console
 /// prints it, an API session reports it -- and `open` also launches the
 /// default browser here.
+/// The word `/whoami` answers with -- the marker `already_serving` looks for.
+const WHOAMI: &str = "goblinscript-review";
+
+/// Can we have `port`? If not, a free one. The remembered address is a hint
+/// that may have expired, not a demand, so a port taken by something else costs
+/// the user a new URL and nothing more.
+fn bind_review(want: Option<u16>) -> Result<tiny_http::Server> {
+    if let Some(p) = want {
+        if let Ok(s) = tiny_http::Server::http(("127.0.0.1", p)) {
+            return Ok(s);
+        }
+    }
+    tiny_http::Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Is one of OUR review servers already answering on `port`?
+///
+/// A bare connect would say yes to anything holding the port, so the question
+/// goes to the one endpoint only we serve: `/whoami` answers with a fixed word.
+/// Anything else on the port -- another program, or a review from a build that
+/// predates `/whoami` -- reads as "not ours", and we take a fresh port rather
+/// than hand this session to a stranger.
+fn already_serving(port: u16) -> bool {
+    use std::io::Write;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(900)));
+    let ask = format!("GET /whoami HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if s.write_all(ask.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    let Ok(n) = s.read(&mut buf) else { return false };
+    String::from_utf8_lossy(&buf[..n]).contains(WHOAMI)
+}
+
+/// Identifies THIS server run. The page keeps the first value it sees and
+/// reloads when it changes, which is how a tab left open on the remembered port
+/// walks itself into the next session instead of sitting on a stale page.
+pub(crate) fn boot_id() -> &'static str {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{ns:x}")
+    })
+}
+
 pub fn review(
     clips: &[Clip],
     params: &mut [style::Params],
@@ -163,13 +234,43 @@ pub fn review(
     page: &dyn Fn(&str),
     apply: impl Fn(usize, &style::Params, &Choice) -> Result<Restyled> + Send + Sync,
 ) -> Result<()> {
-    let server = tiny_http::Server::http("127.0.0.1:0")
+    // ---- one review at a time, at a remembered address ---------------------
+    //
+    // The address is remembered so a browser tab left open on it is not
+    // stranded: the next run is served from the same URL, and the page's own
+    // poll sees a new `boot` id and reloads itself into the new session. A port
+    // something else now holds is a stale hint rather than a fight -- take a
+    // free one and write that back. And when one of OUR reviews is already
+    // answering, say so and leave it alone: two of them share a cache
+    // directory, which is the one outcome worth refusing.
+    //
+    // `GOBLIN_REVIEW_FORCE` skips that last check, for a developer running
+    // back-to-back sessions where "one is already up" is the normal state.
+    let mut settings = crate::settings::Settings::load();
+    let force = std::env::var_os("GOBLIN_REVIEW_FORCE").is_some();
+    if let Some(p) = settings.review_port {
+        if !force && already_serving(p) {
+            let url = format!("http://127.0.0.1:{p}/");
+            println!(
+                "\n  {} {}  {}",
+                crate::t!("console.review.label"),
+                console::style(&url).cyan().bold(),
+                console::style(crate::t!("console.review.already")).dim()
+            );
+            return Ok(());
+        }
+    }
+    let server = bind_review(settings.review_port)
         .map_err(|e| anyhow::anyhow!("could not start the review server: {e}"))?;
     let port = server
         .server_addr()
         .to_ip()
         .context("review server has no TCP address")?
         .port();
+    if settings.review_port != Some(port) {
+        settings.review_port = Some(port);
+        settings.save();
+    }
     let url = format!("http://127.0.0.1:{port}/");
 
     // the draft's own params, snapshot before any re-style, so the page's
@@ -469,6 +570,18 @@ fn handle(
                     .with_header(header("Content-Type", "text/html; charset=utf-8")),
             );
         }
+        // The single-instance check's own endpoint: a fixed word, so a process
+        // starting up can tell "one of ours is already here" from "something
+        // else happens to hold the port". Nothing else reads it.
+        (Method::Get, "whoami") => {
+            let _ = req.respond(Response::from_string(WHOAMI));
+        }
+        // Just the id of the run answering, for the page's idle poll. Kept
+        // separate from `/state` on purpose: this is asked every few seconds
+        // and has to stay a few bytes.
+        (Method::Get, "ping") => {
+            let _ = req.respond(Response::from_string(boot_id()));
+        }
         (Method::Get, "state") => {
             let _ = req.respond(json_response(&state_json(
                 clips, params, choices, defaults, presets, work,
@@ -583,12 +696,15 @@ fn handle(
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             match parse_conf_prefs(&body) {
-                Ok((excl, auto)) => {
+                Ok(p) => {
                     let mut s = crate::settings::Settings::load();
-                    s.exclude_models = excl;
+                    s.exclude_models = p.exclude;
                     // absent = the page is only speaking about exclusions
-                    if let Some(a) = auto {
+                    if let Some(a) = p.auto {
                         s.auto_suggest = a;
+                    }
+                    if let Some(g) = p.gamma {
+                        s.conf_gamma = Some(g);
                     }
                     s.save();
                     let _ = req.respond(json_response(&conf_prefs_json(&s)));
@@ -751,6 +867,8 @@ pub(crate) fn conf_prefs_json(s: &crate::settings::Settings) -> serde_json::Valu
     serde_json::json!({
         "exclude": s.exclude_models,
         "auto": s.auto_suggest,
+        // absent means "never chosen", which the page reads as an exponent of 1
+        "gamma": s.conf_gamma,
     })
 }
 
@@ -764,10 +882,22 @@ pub(crate) fn conf_prefs_json(s: &crate::settings::Settings) -> serde_json::Valu
 /// the auto-suggest preference but no longer has a switch for it (it lives in
 /// the picker now), so a page that leaves the field out must not be read as
 /// turning it off behind the picker's back.
-pub(crate) fn parse_conf_prefs(body: &str) -> Result<(Option<Vec<String>>, Option<bool>)> {
+/// What the page may say about the suggestion's standing preferences.
+///
+/// Every field is an `Option` because "I am not speaking about this one" has to
+/// be distinguishable from "set it to the default": the page owns some of these
+/// and another surface owns others, and a view that stays silent must never
+/// overwrite the one that spoke.
+pub(crate) struct ConfPrefs {
+    pub exclude: Option<Vec<String>>,
+    pub auto: Option<bool>,
+    pub gamma: Option<f64>,
+}
+
+pub(crate) fn parse_conf_prefs(body: &str) -> Result<ConfPrefs> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
-    let excl = match v.get("exclude") {
+    let exclude = match v.get("exclude") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Array(a)) => Some(
             a.iter()
@@ -784,7 +914,17 @@ pub(crate) fn parse_conf_prefs(body: &str) -> Result<(Option<Vec<String>>, Optio
         }
         Some(_) => anyhow::bail!("auto must be a boolean"),
     };
-    Ok((excl, auto))
+    // The page's own trim on how loudly a model's confidence reads. Bounded to
+    // the range the control offers: a value outside it is a bug somewhere, and
+    // saying so beats clamping to a number nobody typed.
+    let gamma = match v.get("gamma") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(x) => match x.as_f64() {
+            Some(g) if (0.25..=2.0).contains(&g) => Some(g),
+            _ => anyhow::bail!("gamma must be a number between 0.25 and 2"),
+        },
+    };
+    Ok(ConfPrefs { exclude, auto, gamma })
 }
 
 /// What the page needs to (re)draw everything but the tracks themselves. Style
@@ -799,6 +939,12 @@ fn state_json(
 ) -> serde_json::Value {
     let actions = work.actions();
     serde_json::json!({
+        // which server run this is: the page keeps the first one it sees and
+        // reloads itself when it changes, so a tab left on the remembered port
+        // follows the next session instead of going stale
+        "boot": boot_id(),
+        // the strip menu's one-click fills, wave specs already built
+        "fills": crate::wave::fills_json(),
         "presets": presets_json(presets),
         // the active palette, as the custom properties the page overrides its
         // stylesheet with -- so the browser surface wears the same scheme as the
@@ -932,6 +1078,14 @@ fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
         if s.hi_ms <= s.lo_ms {
             continue;
         }
+        // A NaN from the page would poison the mean it is scaled about, and a
+        // piece at 1.0 is the model's own output -- both ends of the range the
+        // panel offers are real settings, so only the nonsensical ones are
+        // pulled back in.
+        if !s.scale.is_finite() {
+            s.scale = 1.0;
+        }
+        s.scale = s.scale.clamp(0.0, MAX_PIECE_SCALE);
         out.push(s);
     }
     out.sort_by(|a, b| {
@@ -1295,12 +1449,101 @@ fn parse_range(value: &str, len: u64) -> Option<(u64, u64)> {
 }
 
 /// Best effort -- the URL is printed either way.
+/// Open the review page in the machine's browser.
+///
+/// When the user has asked for the GPU browser (a standing preference in
+/// settings.json), our own window is tried first and the system default is the
+/// fallback -- so a machine with no browser we recognise still gets a page
+/// rather than silence.
 pub(crate) fn open_browser(url: &str) {
+    if crate::settings::Settings::load().gpu_browser && open_browser_gpu(url) {
+        return;
+    }
     #[cfg(windows)]
     let r = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
     #[cfg(not(windows))]
     let r = std::process::Command::new("xdg-open").arg(url).spawn();
     let _ = r;
+}
+
+/// The private profile the GPU window lives in.
+///
+/// NOT optional, and that is the whole trick: an already-running Chrome hands
+/// the request to the running process and drops the command line on the floor,
+/// so `--force_high_performance_gpu` would do nothing and the user would
+/// conclude the switch is broken. A directory nothing else uses means the
+/// browser we start is really ours. It sits beside the exe, so removing the
+/// feature is removing one folder.
+fn gpu_profile_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gpu-browser")
+}
+
+/// The browser to launch, in the order we would rather have it. Edge is the
+/// fallback because it is always present on Windows and would otherwise mask a
+/// real Chrome.
+fn find_chromium() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    let mut push = |base: Option<std::ffi::OsString>, rest: &[&str]| {
+        if let Some(b) = base {
+            let mut p = PathBuf::from(b);
+            for r in rest {
+                p.push(r);
+            }
+            cands.push(p);
+        }
+    };
+    push(
+        std::env::var_os("ProgramFiles"),
+        &["Google", "Chrome", "Application", "chrome.exe"],
+    );
+    push(
+        std::env::var_os("ProgramFiles(x86)"),
+        &["Google", "Chrome", "Application", "chrome.exe"],
+    );
+    push(
+        std::env::var_os("LOCALAPPDATA"),
+        &["Google", "Chrome", "Application", "chrome.exe"],
+    );
+    push(
+        std::env::var_os("ProgramFiles(x86)"),
+        &["Microsoft", "Edge", "Application", "msedge.exe"],
+    );
+    push(
+        std::env::var_os("ProgramFiles"),
+        &["Microsoft", "Edge", "Application", "msedge.exe"],
+    );
+    cands.into_iter().find(|p| p.is_file())
+}
+
+/// Start a browser WE own, aimed at the discrete GPU, in app mode (no address
+/// bar, no tabs) so it reads as one of our windows rather than another browser.
+/// Returns false when there is no browser we know how to launch.
+fn open_browser_gpu(url: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+        false
+    }
+    #[cfg(windows)]
+    {
+        let Some(exe) = find_chromium() else {
+            return false;
+        };
+        let profile = gpu_profile_dir();
+        let _ = std::fs::create_dir_all(&profile);
+        std::process::Command::new(exe)
+            .arg("--force_high_performance_gpu")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg(format!("--app={url}"))
+            .spawn()
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -1319,17 +1562,18 @@ mod tests {
     /// which is exactly the kind of failure nobody would trace back here.
     #[test]
     fn a_page_that_says_nothing_about_auto_suggest_leaves_it_alone() {
-        let (excl, auto) = parse_conf_prefs(r#"{"exclude":["anime-v1"]}"#).unwrap();
-        assert_eq!(excl.as_deref(), Some(&["anime-v1".to_string()][..]));
-        assert_eq!(auto, None, "an absent switch must not read as OFF");
+        let p = parse_conf_prefs(r#"{"exclude":["anime-v1"]}"#).unwrap();
+        assert_eq!(p.exclude.as_deref(), Some(&["anime-v1".to_string()][..]));
+        assert_eq!(p.auto, None, "an absent switch must not read as OFF");
+        assert_eq!(p.gamma, None, "nor may an absent exponent");
         // `null` is the same statement in JSON's own spelling
-        let (_, auto) = parse_conf_prefs(r#"{"exclude":null,"auto":null}"#).unwrap();
-        assert_eq!(auto, None);
+        let p = parse_conf_prefs(r#"{"exclude":null,"auto":null}"#).unwrap();
+        assert_eq!(p.auto, None);
         // and where the page DOES speak, it is believed
-        let (_, auto) = parse_conf_prefs(r#"{"exclude":null,"auto":true}"#).unwrap();
-        assert_eq!(auto, Some(true));
-        let (_, auto) = parse_conf_prefs(r#"{"exclude":null,"auto":"on"}"#).unwrap();
-        assert_eq!(auto, Some(true), "a hand-posted string still reads");
+        let p = parse_conf_prefs(r#"{"exclude":null,"auto":true}"#).unwrap();
+        assert_eq!(p.auto, Some(true));
+        let p = parse_conf_prefs(r#"{"exclude":null,"auto":"on"}"#).unwrap();
+        assert_eq!(p.auto, Some(true), "a hand-posted string still reads");
     }
 
     /// The other half of the same contract: an `exclude` that is neither a
@@ -1341,6 +1585,22 @@ mod tests {
         assert!(parse_conf_prefs(r#"{"exclude":7}"#).is_err());
         assert!(parse_conf_prefs(r#"{"exclude":"anime-v1"}"#).is_err());
         assert!(parse_conf_prefs("not json at all").is_err());
+    }
+
+    /// The confidence exponent is bounded to the range the control offers, and
+    /// a value outside it is refused rather than silently clamped: a number
+    /// that came back different from the one that was sent leaves the slider
+    /// and the file disagreeing with nobody the wiser.
+    #[test]
+    fn the_confidence_exponent_is_bounded_and_refused_when_out_of_range() {
+        assert_eq!(parse_conf_prefs(r#"{"gamma":0.5}"#).unwrap().gamma, Some(0.5));
+        assert_eq!(parse_conf_prefs(r#"{"gamma":2}"#).unwrap().gamma, Some(2.0));
+        assert!(parse_conf_prefs(r#"{"gamma":0.1}"#).is_err(), "below the floor");
+        assert!(parse_conf_prefs(r#"{"gamma":4}"#).is_err(), "above the ceiling");
+        assert!(
+            parse_conf_prefs(r#"{"gamma":"2"}"#).is_err(),
+            "a number, not a string"
+        );
     }
 
     /// The queue's two promises, both of which a long video is the reason for.
@@ -1472,7 +1732,7 @@ mod tests {
         let base = Choice {
             model: "a".into(),
             compare: None,
-            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false }],
+            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false, scale: 1.0 }],
             cuts_ms: None,
         };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
@@ -1493,9 +1753,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true },
-                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true },
-                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true },
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0 },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0 },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0 },
             ]
         );
         // an empty list is a real answer: back to one model over the whole clip

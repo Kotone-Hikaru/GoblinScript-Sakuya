@@ -107,6 +107,33 @@ pub struct Settings {
     /// use, and it rewrites the pieces without a click -- so it is a thing the
     /// reviewer turns on, never a thing they find already on.
     pub auto_suggest: bool,
+    /// The port the review server answered on last time.
+    ///
+    /// Remembered so the SAME address serves the next run: a browser tab left
+    /// open on it reloads itself into the new session (the page polls and
+    /// compares `boot`) instead of stranding the user on a dead URL. `None`
+    /// means never chosen -- take a free port and write it back.
+    ///
+    /// A hint, never a demand: a port something else has taken by the time the
+    /// review starts is replaced with a fresh one rather than fought over.
+    pub review_port: Option<u16>,
+    /// The exponent the review's per-piece confidence reading is raised to.
+    ///
+    /// A manual trim on how loudly a model's own self-assessment speaks, for a
+    /// reviewer who wants to discount one without removing it from the vote
+    /// outright (`exclude_models` does that). `None` = never chosen = 1, the
+    /// plain mean. The page applies it to the MEAN it shows, never to the
+    /// per-row band: distorting the drawn track would dress invented data up as
+    /// a measurement.
+    pub conf_gamma: Option<f64>,
+    /// Launch our own browser on the review page, aimed at the discrete GPU.
+    ///
+    /// OFF by default. The flag only helps a machine whose browser would
+    /// otherwise land on the integrated chip, and it is paid for with a
+    /// separate browser profile (see `review::open_browser`) -- so it is a
+    /// thing the user turns on, never a thing they find already on. A user who
+    /// never touches it is never given a second browser.
+    pub gpu_browser: bool,
 }
 
 impl Default for Settings {
@@ -126,6 +153,9 @@ impl Default for Settings {
             dir_mode: None,
             exclude_models: None,
             auto_suggest: false,
+            review_port: None,
+            conf_gamma: None,
+            gpu_browser: false,
         }
     }
 }

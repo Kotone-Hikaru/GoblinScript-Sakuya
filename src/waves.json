@@ -26,6 +26,12 @@
     "Params carry the UI contract: def/min/max/unit drive the auto-built",
     "controls, so adding a knob to a wave is one entry in this file."
   ],
+  "fills": [
+    { "cell": "1-1", "label": "fill.fill", "wave": "sine", "lo": 5, "hi": 55, "rate": 0.5 },
+    { "cell": "3-1", "label": "fill.low",  "wave": "sine", "lo": 0, "hi": 25, "rate": 7 },
+    { "cell": "3-2", "label": "fill.mid",  "wave": "sine", "lo": 0, "hi": 38, "rate": 7 },
+    { "cell": "3-3", "label": "fill.high", "wave": "sine", "lo": 0, "hi": 50, "rate": 7 }
+  ],
   "waves": [
     {
       "id": "triangle",

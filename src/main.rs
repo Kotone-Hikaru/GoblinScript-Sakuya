@@ -603,6 +603,14 @@ struct Cli {
     #[arg(long, hide = true)]
     no_browser: bool,
 
+    /// Open the review page in our own browser window, aimed at the discrete
+    /// GPU. Off unless asked for, and remembered once asked: it costs a private
+    /// browser profile (a window carrying none of your bookmarks or logins),
+    /// and only helps a machine whose browser would otherwise land on the
+    /// integrated chip.
+    #[arg(long)]
+    gpu_browser: bool,
+
     /// DEVELOPMENT: run the VR prep step on the named videos and exit, without
     /// loading the model. Aiming needs no GPU, so this is the way to drive the
     /// prep endpoints (and to check a detection) without occupying one.
@@ -1747,6 +1755,25 @@ fn mixed_tracks(
                 no_cuts: sp.no_cuts,
             });
         }
+    }
+    // Each ordinary piece's own intensity, about its own mean. Applied to the
+    // raw spliced level, so a knob dragged to 2 and back to 1 restores the
+    // model's own output instead of compounding, and so the extrema / RDP /
+    // seam / speed stages downstream still get the last word. Hand-drawn
+    // pieces are left out on purpose: their band is what the user typed, not a
+    // model's guess to be nudged.
+    let pieces: Vec<style::PieceScale> = choice
+        .spans
+        .iter()
+        .filter(|sp| sp.model != review::MANUAL && (sp.scale - 1.0).abs() > 1e-9)
+        .map(|sp| style::PieceScale {
+            lo_ms: sp.lo_ms,
+            hi_ms: sp.hi_ms,
+            k: sp.scale,
+        })
+        .collect();
+    if !pieces.is_empty() {
+        style::scale_pieces(&mut mixed.level, &d.times, &pieces);
     }
     let conf = mixed.conf.clone();
     Ok((mixed, cap_x, cap_f0, conf, manual_ms))
@@ -3536,6 +3563,12 @@ fn real_main() -> Result<()> {
     theme::set(cli.theme.or(settings.theme).unwrap_or(theme::Palette::Phosphor));
     sound::set_muted(cli.mute || settings.muted);
     sound::set_volume(cli.volume.or(settings.volume).unwrap_or(sound::Volume::Normal));
+    // The flag is one-way ON, like `--music`: someone who wants it OFF says so
+    // in the picker's W, which is the only place a double-clicked exe's user
+    // can reach it at all. Written back out below with the other choices.
+    if cli.gpu_browser {
+        settings.gpu_browser = true;
+    }
     // Decided here, started later (after the boot sequence): the music only
     // plays where somebody is listening, so never on a piped run and never when
     // the whole audio layer is muted.
@@ -3702,6 +3735,8 @@ fn real_main() -> Result<()> {
                 // the auto-suggest switch, as the picker last left it: the page
                 // reads it out of the settings file, so the picker only decides
                 settings.auto_suggest,
+                // and the GPU browser, on the same terms
+                settings.gpu_browser,
                 start_dir.clone(),
                 std::mem::take(&mut report),
                 cli.dl_dir.clone(),
@@ -3750,6 +3785,9 @@ fn real_main() -> Result<()> {
                     // nothing to arm here -- the suggestion runs in the browser,
                     // which reads this on its next load.
                     settings.auto_suggest = p.auto_suggest;
+                    // The GPU browser window, on the same terms again: a
+                    // standing preference, acted on the next time a page opens.
+                    settings.gpu_browser = p.gpu_browser;
                     settings.remember_presentation();
                     settings.save();
                     // the picker's users have no flags to re-run with -- the
@@ -3946,13 +3984,22 @@ fn real_main() -> Result<()> {
             // a Mutex rather than a RefCell: the styler runs on its own
             // thread, so the closure has to be Send
             let outs_cell = std::sync::Mutex::new(&mut outs);
-            let page = |url: &str| {
+            // The hint is a claim about what just happened, so it is chosen by
+            // what will actually happen: `--no-browser` prints the address
+            // without pretending a window appeared.
+            let opened = !cli.no_browser;
+            let page = move |url: &str| {
                 println!(
-                    "\n  {} {}  {}",
+                    "\n  {} {}",
                     t!("console.review.label"),
-                    style(url).cyan().bold(),
-                    style(t!("console.review.hint")).dim()
+                    style(url).cyan().bold()
                 );
+                let hint = if opened {
+                    t!("console.review.hint")
+                } else {
+                    t!("console.review.manual")
+                };
+                println!("  {}", style(hint).dim());
             };
             if let Err(e) = review::review(
                 &clips,
@@ -3999,6 +4046,9 @@ fn real_main() -> Result<()> {
             }
             // remember the accepted style and model, so the next launch starts
             // from them
+            // re-read first: the review writes the port it settled on while it
+            // runs, and saving this older copy on top would erase it
+            settings = settings::Settings::load();
             settings.last_params = Some(params);
             settings.model = Some(b.manifest.pack.clone());
             settings.save();
@@ -4745,6 +4795,7 @@ mod retrack_tests {
                 wave: None,
                 no_limit: true,
                 no_cuts: false,
+                scale: 1.0,
             }],
             cuts_ms: Some(cuts1.clone()),
         };

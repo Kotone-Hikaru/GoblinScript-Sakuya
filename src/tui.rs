@@ -47,6 +47,11 @@ pub struct Pick {
     /// on the review page (O). Carried out on start for the same reason as the
     /// throttle: the page reads it, the picker only decides it.
     pub auto_suggest: bool,
+    /// Open the review page in our own browser window, aimed at the discrete
+    /// GPU (W). Carried out on start like the switches above: the browser is
+    /// launched by the caller, which also owns the settings file the choice is
+    /// remembered in.
+    pub gpu_browser: bool,
 }
 
 /// What the batch that just ran left behind, for the picker to hand back.
@@ -187,6 +192,10 @@ struct App {
     /// about how the person works, so it lives with the other ones rather than
     /// on a page that a cleared cache or another browser would forget.
     auto_suggest: bool,
+    /// Open our own browser window, aimed at the discrete GPU (W). A
+    /// preference rather than a demand: it is remembered when a batch starts,
+    /// and a machine whose user never touches it never sees a second browser.
+    gpu_browser: bool,
     /// Feedback from the batch that just ran (drafted/skipped/failed) -- shown
     /// so an instant, all-skipped start is not silent.
     status: Option<String>,
@@ -252,6 +261,7 @@ impl App {
         crop_edit: bool,
         throttle: Option<String>,
         auto_suggest: bool,
+        gpu_browser: bool,
         start: Option<PathBuf>,
         report: Report,
         dl_dir: Option<PathBuf>,
@@ -270,6 +280,7 @@ impl App {
             crop_edit,
             throttle,
             auto_suggest,
+            gpu_browser,
             status: report.status,
             errors: !report.failures.is_empty(),
             err_off: 0,
@@ -305,7 +316,7 @@ impl App {
     /// this keeps those call sites about what they are actually testing.
     #[cfg(test)]
     fn plain(force: bool, autocrop: bool, crop_edit: bool, start: Option<PathBuf>, report: Report) -> Self {
-        Self::new(force, autocrop, crop_edit, None, false, start, report, None, Vec::new())
+        Self::new(force, autocrop, crop_edit, None, false, false, start, report, None, Vec::new())
     }
 
     /// Re-read the folder from disk, then rebuild the view. The ONLY entry
@@ -2754,6 +2765,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         &t!("common.off"),
     ));
     opts.push(onoff(&t, t!("picker.toggle.autosuggest"), "O", app.auto_suggest));
+    opts.push(onoff(&t, t!("picker.toggle.gpubrowser"), "W", app.gpu_browser));
     let opt_rows = pack_lines(opts, "   ", area.width, FOOT_MAX_ROWS);
 
     // The link key is advertised only when yt-dlp is installed: an offer the app
@@ -2787,6 +2799,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("K", t!("picker.act.cropedit")),
             ("P", t!("picker.act.throttle")),
             ("O", t!("picker.act.autosuggest")),
+            ("W", t!("picker.act.gpubrowser")),
         ];
         if crate::dl::available() {
             v.push(("L", t!("picker.act.pastelink")));
@@ -3219,6 +3232,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Option<Pick>> {
                 crop_edit: app.crop_edit,
                 throttle: app.throttle.clone(),
                 auto_suggest: app.auto_suggest,
+                gpu_browser: app.gpu_browser,
                 dir: app.cur.clone(),
                 // only the marks that are in this batch: a mark left on a
                 // video the user did not start is not an instruction
@@ -3262,6 +3276,14 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Option<Pick>> {
         // restyle per model at open, and rewrites the segmentation unasked.
         KeyCode::Char('o') | KeyCode::Char('O') => {
             app.auto_suggest = !app.auto_suggest;
+            crate::sound::play_click();
+        }
+        // Our own browser window, aimed at the discrete GPU. Here rather than
+        // on a page because it is a standing preference about the MACHINE, and
+        // because this is the only way to reach it from a double-clicked exe --
+        // whose user has no command line to pass `--gpu-browser` on.
+        KeyCode::Char('w') | KeyCode::Char('W') => {
+            app.gpu_browser = !app.gpu_browser;
             crate::sound::play_click();
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -3348,13 +3370,14 @@ pub fn pick(
     crop_edit: bool,
     throttle: Option<String>,
     auto_suggest: bool,
+    gpu_browser: bool,
     start: Option<PathBuf>,
     report: Report,
     dl_dir: Option<PathBuf>,
     dl_args: Vec<String>,
 ) -> Result<Option<Pick>> {
     let mut term = ratatui::init();
-    let mut app = App::new(force, autocrop, crop_edit, throttle, auto_suggest, start, report, dl_dir, dl_args);
+    let mut app = App::new(force, autocrop, crop_edit, throttle, auto_suggest, gpu_browser, start, report, dl_dir, dl_args);
     let r = run(&mut term, &mut app);
     // The pools outlive the screen otherwise, and the batch about to run wants
     // the disk (and, for a probe, the process table) to itself.

@@ -1290,6 +1290,83 @@ pub fn shape_actions(actions: &mut [Action], p: &Params, manual: &[crate::wave::
     }
 }
 
+/// One piece's own intensity: the rows it covers and the factor to scale them
+/// by, about their own mean.
+///
+/// Milliseconds on the clip's clock, like every other piece boundary here, so
+/// the caller never has to know about rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PieceScale {
+    pub lo_ms: f64,
+    pub hi_ms: f64,
+    pub k: f64,
+}
+
+/// Apply per-piece intensity to the level rows each piece covers.
+///
+/// About the piece's OWN mean, not mid-range. A waveform living at 20-40 gets
+/// pushed toward the floor by a factor above 1 the mid-range way, which reads
+/// as "stronger made it smaller" -- the user's own report, and the reason this
+/// is a mean rather than 50.
+///
+/// The mean is taken from the rows the draft just produced and the scale is
+/// applied to THOSE, never to an earlier scaled copy: that is what makes
+/// dragging a knob to 2 and back to 1 restore the model's own output exactly,
+/// instead of compounding.
+///
+/// Runs on the level array, upstream of the extrema/RDP/seam/speed stages, so a
+/// piece scaled up is still held to the device's limits afterwards.
+pub fn scale_pieces(level: &mut [f64], times: &[f64], pieces: &[PieceScale]) {
+    for pc in pieces {
+        if (pc.k - 1.0).abs() < 1e-9 {
+            continue;
+        }
+        let (a, b) = match (rows_from(times, pc.lo_ms), rows_from(times, pc.hi_ms)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue,
+        };
+        if b <= a || b > level.len() {
+            continue;
+        }
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for v in &level[a..b] {
+            if v.is_finite() {
+                sum += *v;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let m = sum / n as f64;
+        for v in &mut level[a..b] {
+            if v.is_finite() {
+                *v = (m + (*v - m) * pc.k).clamp(0.0, 100.0);
+            }
+        }
+    }
+}
+
+/// Index of the first row at or after `ms` in a sorted clock, or `None` when
+/// there is no clock to ask.
+fn rows_from(times: &[f64], ms: f64) -> Option<usize> {
+    if times.is_empty() {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = times.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if times[mid] < ms {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
+
 /// Replace every action inside a hand-drawn piece with the piece SOLVED from
 /// its wave.
 ///
