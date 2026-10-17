@@ -279,7 +279,7 @@
   "page.conf.suggest.agree": "每一段都更偏好脚本自己的模型",
   "page.conf.suggest.one": "只有一个模型可选",
   "page.conf.suggest.models": "参与比较的模型",
-  "page.conf.gamma": "置信度指数",
+  "page.conf.weight.tip": "这个模型的置信度在投票里说话有多响（1.00 = 它说什么就算什么）",
   "page.crop.whole": "整帧",
   "page.crop.reading": "×{zoom} · {total} 个镜头中的 {n} 个 · 逸出 {esc}%",
   "cpage.title": "裁剪",

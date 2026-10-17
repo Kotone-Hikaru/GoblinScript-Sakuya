@@ -279,7 +279,7 @@
   "page.conf.suggest.agree": "every shot prefers the script's own model",
   "page.conf.suggest.one": "only one model to choose from",
   "page.conf.suggest.models": "models in the vote",
-  "page.conf.gamma": "confidence exponent",
+  "page.conf.weight.tip": "how loudly this model's confidence speaks in the vote (1.00 = exactly what it said)",
   "page.crop.whole": "whole frame",
   "page.crop.reading": "×{zoom} · {n} of {total} shots · esc {esc}%",
   "cpage.title": "crop",

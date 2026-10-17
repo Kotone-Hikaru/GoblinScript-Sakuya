@@ -376,13 +376,27 @@
   .segrow .cf { flex: 0 0 auto; min-width: 30px; text-align: right;
                 font: 11px var(--chrome); color: var(--ink-soft); }
   .segrow .cf.lo { color: var(--danger-soft); }
-  /* the piece's own intensity: a compact slider and its factor. 1.00x is the
-     model's own output, so it stays quiet until the piece is moved off it */
-  .segrow .sk { flex: 0 0 54px; width: 54px; min-width: 0; height: 12px;
-                margin: 0; accent-color: var(--hi-bright); cursor: pointer; }
-  .segrow .sv { flex: 0 0 auto; min-width: 34px; text-align: right;
-                font: 11px var(--chrome); color: var(--hi-bright); }
-  .segrow .sv.one { color: var(--ink-soft); }
+  /* the piece's own intensity: a number, and a drag strip that opens under the
+     row when it is clicked. A slider living in the row itself was a 3 px target
+     with its own readout crowding it; 1.00 is the model's own output, so it
+     stays quiet until the piece is moved off it */
+  .segrow .sc { flex: 0 0 46px; width: 46px; min-width: 0; height: 16px;
+                font: 10px var(--chrome); color: var(--hi-bright);
+                background: var(--panel-2); border: 1px solid var(--edge);
+                border-radius: 4px; padding: 0 2px; text-align: right;
+                cursor: text; -moz-appearance: textfield; appearance: textfield; }
+  .segrow .sc::-webkit-outer-spin-button, .segrow .sc::-webkit-inner-spin-button {
+                -webkit-appearance: none; margin: 0; }
+  .segrow .sc.one { color: var(--ink-soft); }
+  /* the strip that opens below the row the box belongs to. It spans the list,
+     so the drag is as wide as the drawer rather than as narrow as the row. */
+  .segslide { display: flex; align-items: center; gap: 6px; margin: 1px 4px 3px 4px;
+              padding: 0 2px; }
+  .segslide input[type=range] { flex: 1 1 auto; min-width: 0; height: 14px;
+                                margin: 0; accent-color: var(--hi-bright); cursor: pointer; }
+  .segslide .sv { flex: 0 0 auto; min-width: 38px; text-align: right;
+                  font: 11px var(--chrome); color: var(--hi-bright); }
+  .segslide .sv.one { color: var(--ink-soft); }
   .segnote { font-size: 11px; color: var(--ink-soft); opacity: .85; }
   /* which models may compete for a shot. A model the reviewer does not trust
      on this material is left out entirely, so the boxes are a plain list --
@@ -402,6 +416,15 @@
            color: var(--ink-soft); cursor: pointer; white-space: nowrap; }
   .cmlab input { width: 11px; height: 11px; margin: 0; accent-color: var(--hi-bright); }
   .cmlab .sw { width: 9px; height: 9px; flex: 0 0 auto; border: 1px solid var(--edge); }
+  /* one model's vote weight, sitting on its own row. Narrow, because it is a
+     multiplier and not a value: three digits and a point is the whole range.
+     A weight of exactly 1 is unmarked, so a trimmed row reads differently at a
+     glance from one that was never touched. */
+  .cmlab input.cmw { width: 46px; height: 16px; margin-left: 2px; font: 10px var(--chrome);
+                     color: var(--hi-bright); background: var(--panel-2);
+                     border: 1px solid var(--edge); border-radius: 4px;
+                     padding: 0 2px; text-align: right; cursor: text; }
+  .cmlab input.cmw.one { color: var(--ink-soft); }
   /* The manual-fill panel. It exists only while a hand-drawn piece is the
      selected one, and it is `hidden` rather than styled away so nothing about
      a model piece ever shows a wave control. */
@@ -683,17 +706,10 @@
             <span class="cmh" data-t="page.conf.suggest.models">models in the vote</span>
             <span class="cml" id="confModelList"></span>
           </div>
-          <!-- How loudly a confidence speaks. The exponent scales the mean the
-               list shows, so a model can be discounted without being taken off
-               the ballot -- `exclude` above is the blunt version of the same
-               intent. Remembered in settings.json, like the ticks. -->
-          <div class="confmodels confgam">
-            <span class="cmh" data-t="page.conf.gamma">confidence exponent</span>
-            <span class="cml">
-              <input type="number" id="confGamma" min="0.25" max="2" step="0.05" value="1">
-              <span class="cgv" id="confGammaShown">1.00</span>
-            </span>
-          </div>
+          <!-- Each model carries its own vote weight in the list above, so
+               there is no global exponent here any more: one number per model
+               is what makes "0.5.0 speaks at 90 %" expressible, and a single
+               shared exponent could not say it. -->
           <!-- "Run it on open" is NOT here on purpose: it is a standing
                preference about how a batch is worked, so it lives in the
                picker with the other switches and is remembered in
@@ -3561,6 +3577,108 @@ function setSegScale(i, k) {
   s.scale = v;
   commitSegs();
 }
+// ---- the piece-intensity strip ---------------------------------------------
+// One strip for the whole list, opened under whichever row's number was
+// clicked, and only while that number has focus -- the same bargain the wave
+// panel's knobs make, for the same reason: the row is too narrow to carry a
+// usable slider, and a strip per row would be a control per row.
+//
+// It is BUILT ONCE and moved, never recreated: `renderSegs` empties the list on
+// every commit, so a strip owned by a row would vanish the moment the drag it
+// was performing committed. `pieceSlideAnchor()` puts it back after each
+// rebuild, which is also what keeps it honest through an undo or a retype.
+let pieceSlideEl = null;
+let pieceSlideIdx = -1;      // which row the strip belongs to; -1 = closed
+let pieceSlideDirty = false; // has this pull taken its undo step yet?
+
+function pieceSlide() {
+  if (pieceSlideEl) return pieceSlideEl;
+  const wrap = document.createElement('div');
+  wrap.className = 'segslide';
+  wrap.hidden = true;
+  const sng = document.createElement('input');
+  sng.type = 'range';
+  sng.min = '0'; sng.max = '5'; sng.step = '0.05';
+  sng.onpointerdown = () => { pieceSlideDirty = false; };
+  // Live readout and a live NUMBER while dragging -- the box is the thing the
+  // reviewer is watching, but the write happens once, on release.
+  sng.oninput = () => {
+    const i = pieceSlideIdx;
+    const s = segs[i];
+    if (!s || s.model === MANUAL) return;
+    if (!pieceSlideDirty) {
+      // The undo step is taken BEFORE the first write, so what is remembered is
+      // the piece as it stood when the hand took hold -- the same rule the wave
+      // panel's slider follows.
+      pushSegUndo('page.hist.scale', s.lo);
+      pieceSlideDirty = true;
+    }
+    const v = parseFloat(sng.value);
+    // the piece and its number move together, without a repaint: a full
+    // renderSegs mid-drag would delete the strip the hand is holding
+    s.scale = v;
+    const box = pieceSlideBox(i);
+    if (box) {
+      box.value = v.toFixed(2);
+      box.classList.toggle('one', Math.abs(v - 1) < 1e-9);
+    }
+    const sv = wrap.querySelector('.sv');
+    if (sv) {
+      sv.textContent = v.toFixed(2) + '\u00d7';
+      sv.classList.toggle('one', Math.abs(v - 1) < 1e-9);
+    }
+  };
+  sng.onchange = () => {
+    if (!pieceSlideDirty) return;
+    pieceSlideDirty = false;
+    commitSegs();
+  };
+  const sv = document.createElement('span');
+  sv.className = 'sv';
+  wrap.append(sng, sv);
+  pieceSlideEl = wrap;
+  return wrap;
+}
+/** The number box of piece `i`, wherever the list currently has it. */
+function pieceSlideBox(i) {
+  const list = $('segList');
+  return list ? list.querySelector('input.sc[data-scale-for="' + i + '"]') : null;
+}
+/** Open the strip under row `i`, or move it there if it is already open. */
+function openPieceSlide(i) {
+  const s = segs[i];
+  if (!s || s.model === MANUAL) return;
+  const wrap = pieceSlide();
+  pieceSlideIdx = i;
+  pieceSlideDirty = false;
+  const sng = wrap.children[0];
+  sng.value = String(pieceScale(s));
+  const sv = wrap.querySelector('.sv');
+  const k = pieceScale(s);
+  if (sv) {
+    sv.textContent = k.toFixed(2) + '\u00d7';
+    sv.classList.toggle('one', Math.abs(k - 1) < 1e-9);
+  }
+  wrap.hidden = false;
+  pieceSlideAnchor();
+}
+/** Close the strip: the number lost focus, or its piece went away. */
+function closePieceSlide() {
+  pieceSlideIdx = -1;
+  pieceSlideDirty = false;
+  if (pieceSlideEl) pieceSlideEl.hidden = true;
+}
+/** Put the open strip back under its own row. The list is emptied and rebuilt
+ *  on every commit, so this runs at the end of `renderSegs` -- the strip itself
+ *  is not one of the rows and would otherwise be left holding a row that no
+ *  longer exists. */
+function pieceSlideAnchor() {
+  if (!pieceSlideEl || pieceSlideEl.hidden || pieceSlideIdx < 0) return;
+  const box = pieceSlideBox(pieceSlideIdx);
+  const row = box ? box.closest('.segrow') : null;
+  if (!row) { closePieceSlide(); return; }
+  row.after(pieceSlideEl);
+}
 /** Replace piece `i` with a one-click fill.
  *
  *  The wave is COPIED, not referenced: the preset list is shared with the menu,
@@ -3718,29 +3836,47 @@ function renderSegs() {
     row.append(sw, n, t, sel);
     // This piece's own intensity. A hand-drawn piece is left out: its band is
     // what the user typed, so there is nothing about it to scale.
+    //
+    // A NUMBER, not a slider. The row is about 54 px wide at this point and an
+    // always-on slider there was a 3 px target with its readout in the way; the
+    // drag lives in a strip that opens BELOW the row when the box is clicked,
+    // which is the same bargain the wave panel's knobs make (see openSlide).
     if (s.model !== MANUAL) {
       const k = pieceScale(s);
-      const sb = document.createElement('input');
-      sb.type = 'range';
-      sb.className = 'sk';
-      sb.min = '0'; sb.max = '5'; sb.step = '0.05';
-      sb.value = String(k);
-      sb.title = T('page.spans.scale.tip');
+      const box = document.createElement('input');
+      box.type = 'number';
+      box.className = 'sc' + (Math.abs(k - 1) < 1e-9 ? ' one' : '');
+      box.min = '0'; box.max = '5'; box.step = '0.05';
+      box.value = k.toFixed(2);
+      box.title = T('page.spans.scale.tip');
+      box.dataset.scaleFor = String(i);
       // it must not double as a "select this piece" click, and it must not
       // start a drag on the bar behind it
-      sb.onclick = ev => ev.stopPropagation();
-      sb.onpointerdown = ev => ev.stopPropagation();
-      const sv = document.createElement('span');
-      sv.className = 'sv' + (Math.abs(k - 1) < 1e-9 ? ' one' : '');
-      sv.textContent = k.toFixed(2) + '×';
-      // live readout while dragging, one undo step and one round trip at release
-      sb.oninput = () => {
-        const v = parseFloat(sb.value);
-        sv.textContent = v.toFixed(2) + '×';
-        sv.classList.toggle('one', Math.abs(v - 1) < 1e-9);
+      box.onclick = ev => { ev.stopPropagation(); openPieceSlide(i); };
+      box.onpointerdown = ev => ev.stopPropagation();
+      box.onfocus = () => openPieceSlide(i);
+      // Close when the number is left -- the strip exists while the box has
+      // focus, as asked. But NOT when the focus moved into the strip itself:
+      // grabbing the slider blurs the box first, and closing on that would make
+      // the control disappear the instant it was used.
+      box.onblur = ev => {
+        const next = ev.relatedTarget;
+        // NOT named `strip`: that name is the page's own canvases element
+        // (`const strip = $('strip')`), and a local of the same name throws in
+        // the temporal dead zone for every read above it -- which is precisely
+        // what the page guard exists to catch.
+        const rowStrip = pieceSlideEl;
+        if (rowStrip && next && rowStrip.contains(next)) return;
+        // a rebuild of the list blurs the old box with nowhere to go; the
+        // anchored strip is still the right one, so leave it standing there
+        if (!next) return;
+        closePieceSlide();
       };
-      sb.onchange = () => setSegScale(i, parseFloat(sb.value));
-      row.append(sb, sv);
+      // typing is a first-class way in: commit on change, not per keystroke
+      box.onchange = () => setSegScale(i, Number(box.value));
+      box.oninput = () => box.classList.toggle('one', Math.abs(Number(box.value) - 1) < 1e-9);
+      box.onkeydown = ev => { if (ev.key === 'Escape') { closePieceSlide(); box.blur(); } };
+      row.append(box);
     }
     row.append(cf);
     row.onclick = () => { selSeg = i; renderSegs(); seekMs(s.lo + 1); };
@@ -3754,6 +3890,10 @@ function renderSegs() {
   // the panel follows the selection, and it is rebuilt from the piece every
   // time: a manual piece shows its wave controls, anything else hides them
   renderWavePanel();
+  // ...and the intensity strip, if one is open, is re-hung under its row. It is
+  // NOT a row, so the rebuild above left it detached; without this a drag that
+  // committed would take the strip away mid-gesture.
+  pieceSlideAnchor();
 }
 /** The mean confidence over one piece's rows, or null when there is none to
  *  read -- a piece is where the split lines are drawn, and this is the only
@@ -3773,11 +3913,13 @@ function segConf(s) {
   for (let r = a; r < b; r++) { const v = confRaw[r]; if (v != null) { sum += v; n++; } }
   if (!n) return null;
   const mean = sum / n;
-  // The exponent goes on the MEAN, not on each row before averaging. Row-wise
-  // it would shift a piece whose rows scatter differently by a different
-  // amount for the same setting (Jensen), and a knob that answers two
-  // questions at once is a knob nobody can aim.
-  return confGamma === 1 ? mean : Math.pow(mean, confGamma);
+  // Deliberately NOT multiplied by the model's vote weight: this column answers
+  // "what did this model say about these rows", and a weight is the reviewer's
+  // judgement about the model, not the model's reading. Scaling it here would
+  // make a preference look like a measurement -- and would disagree with the
+  // same model's number in the suggestion list, which IS weighted because there
+  // the number is the one that decided the shot.
+  return mean;
 }
 // ---- the manual-fill panel ------------------------------------------------
 // A hand-drawn piece is written from a waveform and nothing else: no model, no
@@ -4468,10 +4610,15 @@ let suggestMsg = null;     // an overriding note key (e.g. "only one model")
 // is not the same as "everything unticked": a fresh install takes part in full.
 // Held here as well as on disk so a repaint does not need a round-trip.
 let excludeModels = null;
-// The exponent the per-piece confidence reading is raised to. 1 = the plain
-// mean; above 1 a confident model dominates, below 1 the differences flatten.
-// It scales the NUMBER the list shows (and so the vote), never the drawn band.
-let confGamma = 1;
+// How loudly each model's confidence speaks in the vote, keyed by model NAME:
+// `{"v0.5.0": 0.9}` means that model's mean counts for 90 % of what it said.
+// This is the fine trim to `excludeModels`'s blunt one -- an unticked model is
+// off the ballot, a weight below 1 keeps it competing but discounts a
+// self-assessment the reviewer does not trust on this material.
+//
+// Applied to the MEAN the vote compares, never to the drawn band: the band is a
+// measurement, and scaling it would dress a preference up as one.
+let confWeights = null;
 // Run the suggestion, and keep it, the moment a clip is up -- instead of
 // waiting for the button. OFF on a fresh install: with it on, opening a video
 // costs a sampling pass before the page is usable and rewrites the pieces
@@ -4492,9 +4639,23 @@ function votingModels(c) {
   if (!excludeModels) return all;
   return all.filter(m => !excludeModels.includes(m));
 }
-/** The checkboxes. Drawn from the clip's model list on every call, because a
- *  clip can carry a different pack -- and a name in `excludeModels` that this
- *  clip does not have is simply a box that is not drawn. */
+/** One model's weight, with "never chosen" read as 1 -- the model's own word,
+ *  uncounted-down. Never 0: a 0 weight would be a second way to exclude a
+ *  model, and two controls for one intent is how a ballot gets confusing. */
+function modelWeight(name) {
+  const w = confWeights && confWeights[name];
+  return (typeof w === 'number' && isFinite(w)) ? w : 1;
+}
+/** The checkboxes and each model's own weight. Drawn from the clip's model list
+ *  on every call, because a clip can carry a different pack -- and a name in
+ *  `excludeModels` that this clip does not have is simply a box that is not
+ *  drawn.
+ *
+ *  Each row is one model and its vote weight, because they answer the same
+ *  question at two strengths: the tick says "not on this ballot", the number
+ *  says "on it, but quieter than it claims". Keeping them on one row is what
+ *  makes the relationship legible; a separate weight list below would read as
+ *  an unrelated setting. */
 function renderConfModels() {
   const host = $('confModelList');
   const c = state && state.clips && state.clips[cur];
@@ -4503,10 +4664,19 @@ function renderConfModels() {
   if (!all.length) return;
   // Rebuilding on every repaint would take the box out from under a click, so
   // the list is only thrown away when the model set itself changed -- this is
-  // called from `renderSuggest`, which runs on every commit.
+  // called from `renderSuggest`, which runs on every commit. The WEIGHTS are
+  // refreshed in the cheap path too, since a value can change without the model
+  // set changing (a hand-typed number, a restored file).
   const key = all.join('\u0000');
   if (host.dataset.key === key) {
-    for (const box of host.querySelectorAll('input')) box.checked = !excludeModels || !excludeModels.includes(box.dataset.m);
+    for (const lab of host.querySelectorAll('.cmlab')) {
+      const name = lab.dataset.m;
+      const cb = lab.querySelector('input[type=checkbox]');
+      if (cb) cb.checked = !excludeModels || !excludeModels.includes(name);
+      const wb = lab.querySelector('input[type=number]');
+      // never overwrite the box the reviewer is typing in
+      if (wb && document.activeElement !== wb) wb.value = modelWeight(name).toFixed(2);
+    }
     return;
   }
   host.dataset.key = key;
@@ -4514,6 +4684,7 @@ function renderConfModels() {
   for (const name of all) {
     const lab = document.createElement('label');
     lab.className = 'cmlab';
+    lab.dataset.m = name;
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = !excludeModels || !excludeModels.includes(name);
@@ -4536,9 +4707,41 @@ function renderConfModels() {
     const t = document.createElement('span');
     t.className = 't';
     t.textContent = name;
-    lab.append(cb, sw, t);
+    // The weight: the model's own confidence times this. 1.00 carries no mark,
+    // so a row that has been trimmed reads differently at a glance from one
+    // that has not.
+    const wb = document.createElement('input');
+    wb.type = 'number';
+    wb.className = 'cmw';
+    wb.min = '0.5'; wb.max = '1.5'; wb.step = '0.05';
+    wb.value = modelWeight(name).toFixed(2);
+    wb.title = T('page.conf.weight.tip');
+    wb.addEventListener('input', () => {
+      wb.classList.toggle('one', Math.abs(Number(wb.value) - 1) < 1e-9);
+    });
+    // On commit, not on every keystroke: this is a preference, and a half-typed
+    // "0." is not a statement about a model.
+    wb.onchange = () => setModelWeight(name, Number(wb.value));
+    wb.classList.toggle('one', Math.abs(modelWeight(name) - 1) < 1e-9);
+    lab.append(cb, sw, t, wb);
     host.append(lab);
   }
+}
+/** Write one model's weight and re-score. The undo step and the round trip are
+ *  deliberately NOT here: a weight is a standing preference about the person's
+ *  judgement of a model, not an edit to this clip -- it lives in settings.json
+ *  beside the ticks, and it is saved once the field is committed. */
+function setModelWeight(name, w) {
+  if (!isFinite(w)) return;
+  const v = Math.min(1.5, Math.max(0.5, w));
+  const cur = modelWeight(name);
+  if (Math.abs(cur - v) < 1e-9) return;
+  const next = Object.assign({}, confWeights || {});
+  if (Math.abs(v - 1) < 1e-9) delete next[name]; else next[name] = v;
+  confWeights = Object.keys(next).length ? next : null;
+  saveConfPrefs();
+  // Every proposal on screen was scored under the old weights.
+  if (suggestSpans) { suggestSpans = null; suggestMsg = null; renderSuggest(); }
 }
 /** The ticks live on the server, next to the throttle preset -- they are about
  *  the person, not about this clip or this browser. This page only writes the
@@ -4551,11 +4754,16 @@ async function saveConfPrefs() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         exclude: excludeModels && excludeModels.length ? excludeModels : null,
-        gamma: confGamma,
+        weights: confWeights,
       }),
     });
     const j = await r.json();
     excludeModels = (j && j.exclude && j.exclude.length) ? j.exclude : null;
+    // The server drops weights of exactly 1 and stores an all-1 map as absent,
+    // so reading its answer back is what keeps the boxes and the file saying the
+    // same thing -- a local map that kept the 1s would report a trim that is not
+    // in force.
+    confWeights = (j && j.weights && Object.keys(j.weights).length) ? j.weights : null;
   } catch (e) { /* an unsaved tick is not worth breaking the drawer over */ }
   renderConfModels();
 }
@@ -4564,18 +4772,9 @@ async function loadConfPrefs() {
     const j = await (await fetch('/conf_prefs')).json();
     excludeModels = (j && j.exclude && j.exclude.length) ? j.exclude : null;
     autoSuggest = !!(j && j.auto);
-    if (j && typeof j.gamma === 'number' && isFinite(j.gamma)) confGamma = j.gamma;
-  } catch (e) { excludeModels = null; autoSuggest = false; }
-  syncConfGamma();
+    confWeights = (j && j.weights && Object.keys(j.weights).length) ? j.weights : null;
+  } catch (e) { excludeModels = null; autoSuggest = false; confWeights = null; }
   renderConfModels();
-}
-/** Put the exponent where the user set it -- the box, and the reading under it,
- *  so a clamped entry (the input refuses out-of-range) cannot leave the two
- *  disagreeing about what is actually in force. */
-function syncConfGamma() {
-  const el = $('confGamma'), shown = $('confGammaShown');
-  if (el) el.value = confGamma.toFixed(2);
-  if (shown) shown.textContent = confGamma.toFixed(2);
 }
 function renderSuggest() {
   const list = $('confSuggestList');
@@ -4631,7 +4830,17 @@ function scoreSpans(confs, c) {
       const b = Math.min(arr.length, Math.round((hi - row0) / 1000 * hz));
       let sum = 0, n = 0;
       for (let r = a; r < b; r++) { const v = arr[r]; if (v != null) { sum += v; n++; } }
-      const mean = n ? sum / n : -Infinity;
+      if (!n) continue;
+      // The model's own mean, times the reviewer's weight for that model.
+      //
+      // This IS the bug that used to be here: the old global exponent was
+      // applied by `segConf` (the number the piece list shows) and never here,
+      // so the one knob that was supposed to trim a model changed the display
+      // and left the vote untouched -- a control that looked live and decided
+      // nothing. The weight belongs on the MEAN, which is what this comparison
+      // is actually made of; applied per row before averaging it would answer a
+      // second question (how scattered the rows are) for free.
+      const mean = (sum / n) * modelWeight(m);
       if (mean > bestV) { bestV = mean; best = m; }
     }
     if (best) picked.push({ lo_ms: lo, hi_ms: hi, model: best, score: bestV });
@@ -4727,19 +4936,6 @@ $('confSuggestToggle').onclick = () => { suggestOn = !suggestOn; labelSuggest();
 $('confSuggestBtn').onclick = runSuggestion;
 $('confApply').onclick = applySuggestion;
 $('confDrop').onclick = () => { suggestSpans = null; suggestMsg = null; renderSuggest(); };
-// The exponent: live while it is being set, written on commit. The list's
-// percentages ARE the reading, so they follow the knob -- a number that only
-// moved on blur would leave the user tuning against a stale display.
-$('confGamma').oninput = () => {
-  const raw = $('confGamma').value;
-  const v = Number(raw);
-  if (raw === '' || !isFinite(v)) return;      // mid-typing, e.g. a lone minus
-  confGamma = Math.min(2, Math.max(0.25, v));
-  $('confGammaShown').textContent = confGamma.toFixed(2);
-  renderSegs();
-  if (suggestSpans) renderSuggest();
-};
-$('confGamma').onchange = () => { syncConfGamma(); saveConfPrefs(); };
 
 // ---- drawing the bar ------------------------------------------------------
 function drawSpanBand(X, w, h) {

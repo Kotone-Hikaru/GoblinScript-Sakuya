@@ -838,8 +838,16 @@ fn handle(
                     if let Some(a) = p.auto {
                         s.auto_suggest = a;
                     }
-                    if let Some(g) = p.gamma {
-                        s.conf_gamma = Some(g);
+                    // Three states: silence leaves the file alone, `null` (or an
+                    // all-1 map) puts every model back on its own word, and a
+                    // map is the map. Writing `Some(w)` unconditionally would
+                    // make "back to 1.00" impossible -- the page sends its whole
+                    // state, and an all-1 state is naturally spelled as "no
+                    // weights".
+                    match p.weights {
+                        None => {}
+                        Some(None) => s.conf_weights = None,
+                        Some(Some(w)) => s.conf_weights = Some(w),
                     }
                     s.save();
                     let _ = req.respond(json_response(&conf_prefs_json(&s)));
@@ -1002,8 +1010,9 @@ pub(crate) fn conf_prefs_json(s: &crate::settings::Settings) -> serde_json::Valu
     serde_json::json!({
         "exclude": s.exclude_models,
         "auto": s.auto_suggest,
-        // absent means "never chosen", which the page reads as an exponent of 1
-        "gamma": s.conf_gamma,
+        // absent means "never chosen", which the page reads as every model
+        // counting exactly what it said
+        "weights": s.conf_weights,
     })
 }
 
@@ -1026,7 +1035,21 @@ pub(crate) fn conf_prefs_json(s: &crate::settings::Settings) -> serde_json::Valu
 pub(crate) struct ConfPrefs {
     pub exclude: Option<Vec<String>>,
     pub auto: Option<bool>,
-    pub gamma: Option<f64>,
+    /// Three states, and each is a different statement -- the extra nesting is
+    /// the point, not an accident:
+    ///
+    /// * `None`            the page said nothing about weights, so whatever is
+    ///                     remembered stays remembered;
+    /// * `Some(None)`      "put every model back to 1.00" (`null`, or a map
+    ///                     whose entries are all exactly 1);
+    /// * `Some(Some(map))` these are the weights.
+    ///
+    /// Without the middle state a reviewer could LOWER a weight but never raise
+    /// one back to 1.00: the page sends its whole state, an all-1 state is
+    /// naturally written as "no weights", and a `null` read as silence would
+    /// leave the old number in force while the box on screen said 1.00. That
+    /// exact bug was caught by the persistence probe before this shipped.
+    pub weights: Option<Option<std::collections::BTreeMap<String, f64>>>,
 }
 
 pub(crate) fn parse_conf_prefs(body: &str) -> Result<ConfPrefs> {
@@ -1049,17 +1072,40 @@ pub(crate) fn parse_conf_prefs(body: &str) -> Result<ConfPrefs> {
         }
         Some(_) => anyhow::bail!("auto must be a boolean"),
     };
-    // The page's own trim on how loudly a model's confidence reads. Bounded to
-    // the range the control offers: a value outside it is a bug somewhere, and
-    // saying so beats clamping to a number nobody typed.
-    let gamma = match v.get("gamma") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(x) => match x.as_f64() {
-            Some(g) if (0.25..=2.0).contains(&g) => Some(g),
-            _ => anyhow::bail!("gamma must be a number between 0.25 and 2"),
-        },
+    // How loudly each model's confidence speaks in the vote, keyed by name.
+    //
+    // A weight of exactly 1 is DROPPED rather than stored: it is the shipped
+    // meaning, so keeping it would fill the file with "0.5.0: 1" lines that say
+    // nothing. An object left empty by that is "everybody is back to 1.00", NOT
+    // "I have no opinion" -- which is why the field is doubly wrapped (see the
+    // struct). Every value is bounded to the range the control offers; a number
+    // outside it is a bug somewhere, and saying so beats clamping to a value
+    // nobody typed.
+    let weights = match v.get("weights") {
+        // absent = this view is not speaking about weights at all
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Object(o)) => {
+            let mut w = std::collections::BTreeMap::new();
+            for (name, val) in o {
+                let k = match val.as_f64() {
+                    Some(k) if (0.5..=1.5).contains(&k) => k,
+                    Some(k) => anyhow::bail!("weight {name} must be within 0.5..1.5, got {k}"),
+                    None => anyhow::bail!("weight {name} must be a number"),
+                };
+                if (k - 1.0).abs() > 1e-9 {
+                    w.insert(name.clone(), k);
+                }
+            }
+            if w.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(w))
+            }
+        }
+        Some(_) => anyhow::bail!("weights must be an object of model name to number"),
     };
-    Ok(ConfPrefs { exclude, auto, gamma })
+    Ok(ConfPrefs { exclude, auto, weights })
 }
 
 /// What the page needs to (re)draw everything but the tracks themselves. Style
@@ -1908,7 +1954,7 @@ mod tests {
         let p = parse_conf_prefs(r#"{"exclude":["anime-v1"]}"#).unwrap();
         assert_eq!(p.exclude.as_deref(), Some(&["anime-v1".to_string()][..]));
         assert_eq!(p.auto, None, "an absent switch must not read as OFF");
-        assert_eq!(p.gamma, None, "nor may an absent exponent");
+        assert_eq!(p.weights, None, "nor may absent weights");
         // `null` is the same statement in JSON's own spelling
         let p = parse_conf_prefs(r#"{"exclude":null,"auto":null}"#).unwrap();
         assert_eq!(p.auto, None);
@@ -1930,19 +1976,60 @@ mod tests {
         assert!(parse_conf_prefs("not json at all").is_err());
     }
 
-    /// The confidence exponent is bounded to the range the control offers, and
-    /// a value outside it is refused rather than silently clamped: a number
-    /// that came back different from the one that was sent leaves the slider
-    /// and the file disagreeing with nobody the wiser.
+    /// A per-model weight is bounded to the range the control offers, and a
+    /// value outside it is refused rather than silently clamped: a number that
+    /// came back different from the one that was sent leaves the box and the
+    /// file disagreeing with nobody the wiser.
+    ///
+    /// A weight of exactly 1 is dropped instead of stored, because it IS the
+    /// shipped meaning -- storing it would fill the file with lines that say
+    /// nothing. But a map left EMPTY by that is "everybody back to 1.00", not
+    /// "no opinion": the difference is what lets a reviewer undo a trim, so the
+    /// two are asserted apart here.
     #[test]
-    fn the_confidence_exponent_is_bounded_and_refused_when_out_of_range() {
-        assert_eq!(parse_conf_prefs(r#"{"gamma":0.5}"#).unwrap().gamma, Some(0.5));
-        assert_eq!(parse_conf_prefs(r#"{"gamma":2}"#).unwrap().gamma, Some(2.0));
-        assert!(parse_conf_prefs(r#"{"gamma":0.1}"#).is_err(), "below the floor");
-        assert!(parse_conf_prefs(r#"{"gamma":4}"#).is_err(), "above the ceiling");
-        assert!(
-            parse_conf_prefs(r#"{"gamma":"2"}"#).is_err(),
-            "a number, not a string"
+    fn the_per_model_weights_are_bounded_and_one_is_not_stored() {
+        let p = parse_conf_prefs(r#"{"weights":{"v0.5.0":0.9}}"#).unwrap();
+        let w = p.weights.unwrap().expect("a real map");
+        assert_eq!(w.get("v0.5.0"), Some(&0.9));
+        assert_eq!(
+            parse_conf_prefs(r#"{"weights":{"a":0.5,"b":1.5}}"#)
+                .unwrap()
+                .weights
+                .unwrap()
+                .expect("both ends allowed")
+                .len(),
+            2,
+            "both ends of the range are allowed"
+        );
+        for bad in [
+            r#"{"weights":{"a":0.4}}"#,
+            r#"{"weights":{"a":1.6}}"#,
+            r#"{"weights":{"a":"0.9"}}"#,
+            r#"{"weights":[0.9]}"#,
+        ] {
+            assert!(parse_conf_prefs(bad).is_err(), "must refuse {bad}");
+        }
+        // "everybody is 1.00" is a STATEMENT, not silence
+        assert_eq!(
+            parse_conf_prefs(r#"{"weights":{"a":1}}"#).unwrap().weights,
+            Some(None),
+            "an all-1 map means 'clear the trims', not 'no opinion'"
+        );
+        assert_eq!(
+            parse_conf_prefs(r#"{"weights":{}}"#).unwrap().weights,
+            Some(None),
+            "so does an empty map"
+        );
+        assert_eq!(
+            parse_conf_prefs(r#"{"weights":null}"#).unwrap().weights,
+            Some(None),
+            "and so does an explicit null"
+        );
+        // ...while saying nothing at all is the silence that changes nothing
+        assert_eq!(
+            parse_conf_prefs(r#"{"exclude":null}"#).unwrap().weights,
+            None,
+            "an absent field is not an instruction"
         );
     }
 

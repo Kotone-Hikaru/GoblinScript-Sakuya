@@ -117,15 +117,19 @@ pub struct Settings {
     /// A hint, never a demand: a port something else has taken by the time the
     /// review starts is replaced with a fresh one rather than fought over.
     pub review_port: Option<u16>,
-    /// The exponent the review's per-piece confidence reading is raised to.
+    /// Per-model multipliers on how loudly a model's confidence speaks in the
+    /// suggestion's vote: `{"v0.5.0": 0.9}` makes that model's mean count for
+    /// 90 % of what it said, so it still competes but no longer wins a shot on
+    /// a self-assessment the reviewer does not trust on this material.
     ///
-    /// A manual trim on how loudly a model's own self-assessment speaks, for a
-    /// reviewer who wants to discount one without removing it from the vote
-    /// outright (`exclude_models` does that). `None` = never chosen = 1, the
-    /// plain mean. The page applies it to the MEAN it shows, never to the
-    /// per-row band: distorting the drawn track would dress invented data up as
-    /// a measurement.
-    pub conf_gamma: Option<f64>,
+    /// This is the fine trim to `exclude_models`'s blunt one: excluding takes a
+    /// model off the ballot entirely, and there is no middle setting there.
+    /// `None` = never chosen = every model counts exactly what it said.
+    ///
+    /// Keyed by model NAME, never by position: a bundle's pack order is not a
+    /// stable identity, and a weight that followed an index would silently land
+    /// on a different model after any pack change.
+    pub conf_weights: Option<std::collections::BTreeMap<String, f64>>,
     /// Launch our own browser on the review page, aimed at the discrete GPU.
     ///
     /// OFF by default. The flag only helps a machine whose browser would
@@ -154,7 +158,7 @@ impl Default for Settings {
             exclude_models: None,
             auto_suggest: false,
             review_port: None,
-            conf_gamma: None,
+            conf_weights: None,
             gpu_browser: false,
         }
     }
@@ -338,5 +342,36 @@ mod tests {
         // file with no opinion is in, not a state a request put it in
         let absent: Settings = serde_json::from_str("{}").unwrap();
         assert!(!absent.auto_suggest);
+    }
+
+    /// The per-model weights are the one place a reviewer's judgement about a
+    /// model is written down for the NEXT batch, so a field dropped on save
+    /// would quietly give a discounted model its full voice back -- and the
+    /// reviewer would only notice as a worse suggestion, never as a lost
+    /// setting.
+    #[test]
+    fn the_per_model_weights_are_remembered_by_name() {
+        let mut s = Settings::default();
+        assert_eq!(s.conf_weights, None, "a fresh install believes every model");
+        let mut w = std::collections::BTreeMap::new();
+        w.insert("v0.5.0".to_string(), 0.9);
+        w.insert("anime-v1".to_string(), 1.25);
+        s.conf_weights = Some(w);
+        let text = serde_json::to_string(&s).unwrap();
+        // keyed by name, so the file reads as a statement about models rather
+        // than about positions in whatever bundle happened to be loaded
+        assert!(text.contains("v0.5.0"), "the key is the model's name");
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        let got = back.conf_weights.expect("the weights did not survive");
+        assert_eq!(got.get("v0.5.0"), Some(&0.9));
+        assert_eq!(got.get("anime-v1"), Some(&1.25));
+        // absent and null both mean "nobody has an opinion", which is not the
+        // same as an empty map: both are simply "count what was said"
+        for t in [r#"{"conf_weights": null}"#, "{}"] {
+            assert_eq!(
+                serde_json::from_str::<Settings>(t).unwrap().conf_weights,
+                None
+            );
+        }
     }
 }
