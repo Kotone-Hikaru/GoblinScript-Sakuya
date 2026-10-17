@@ -185,6 +185,7 @@
   "page.hint": "每次改动都会立即重写脚本",
   "page.workbench": "工作台",
   "page.workbench.title": "收起工作台，把整个窗口留给画面",
+  "page.rail.grip": "拖动可调整这一栏的宽度",
   "page.workingcopy": "480p 工作副本",
   "page.timeline.title": "点击或拖动以定位",
   "page.speed": "速度",

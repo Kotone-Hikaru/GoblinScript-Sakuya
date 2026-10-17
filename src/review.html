@@ -163,10 +163,25 @@
      knob groups, key legend -- ending in the two session buttons. It scrolls
      on its own, which is the point: revealed fine-tuning rows or a twenty-clip
      batch grow the RAIL, never at the stage's expense. */
-  #rail { flex: 0 0 clamp(272px, 23vw, 348px); min-height: 0; overflow-y: auto;
+  #rail { flex: 0 0 var(--railw, clamp(272px, 23vw, 348px)); min-height: 0; overflow-y: auto;
           background: var(--panel); border-left: 2px solid var(--edge);
           padding: 12px 14px 0; display: flex; flex-direction: column; gap: 14px; }
   body.rail-off #rail { display: none; }
+  /* The splitter: the rail's own left edge, widened into a grab target. It sits
+     INSIDE the rail (absolutely, at its left) rather than between the two
+     columns, so the rail's width is one number -- the one we remember -- and
+     not that number less however wide the handle happens to be. 9 px is wider
+     than the 2 px border it covers: a 2 px line is a thing you can see and not
+     a thing you can hit, and this is the only edge on the page you drag. */
+  #rail { position: relative; }
+  #railGrip { position: absolute; left: -5px; top: 0; bottom: 0; width: 9px;
+              cursor: col-resize; z-index: 20; }
+  #railGrip::after { content: ''; position: absolute; left: 4px; top: 0; bottom: 0;
+                     width: 1px; background: transparent; }
+  #railGrip:hover::after, body.rail-drag #railGrip::after { background: var(--hi-bright); }
+  /* while a drag is in flight the pointer must not select the panel's text or
+     turn into a text caret as it crosses the column */
+  body.rail-drag { user-select: none; cursor: col-resize; }
   .sec { display: flex; flex-direction: column; gap: 7px; }
   .sec-h { font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
            color: var(--hi-dim); border-bottom: 1px dashed var(--edge); padding-bottom: 3px; }
@@ -343,10 +358,26 @@
      where they were -- the new surface gets its own column instead of piling
      onto a page that has no room for it. Folds away to a left-edge grip with
      the same gesture as the rail, so the two flanks behave alike. */
-  #drawer { flex: 0 0 clamp(272px, 23vw, 348px); min-height: 0; overflow-y: auto;
+  #drawer { flex: 0 0 var(--railw, clamp(272px, 23vw, 348px)); min-height: 0; overflow-y: auto;
             background: var(--panel); border-right: 2px solid var(--edge);
             padding: 12px 14px 0; display: flex; flex-direction: column; gap: 13px; }
   body.drawer-off #drawer { display: none; }
+  /* The two splitters live in `#shell`, NOT inside the `<aside>` columns they
+     move. A column is its own scroll container, and a scrollbar is painted over
+     the content it belongs to and takes the hit -- so a grab strip on the
+     drawer's right edge sat underneath the drawer's own vertical scrollbar and
+     could never be pressed (measured: `elementsFromPoint` there returned
+     `#drawer`). Out here in the flex row, nothing can cover them.
+     They are positioned by `placeGrips()` from the columns' real geometry. */
+  #shell { position: relative; }
+  .grip { position: absolute; top: 0; bottom: 0; width: 9px; cursor: col-resize;
+          z-index: 30; }
+  .grip::after { content: ''; position: absolute; left: 4px; top: 0; bottom: 0;
+                 width: 1px; background: transparent; }
+  .grip:hover::after, body.rail-drag .grip::after { background: var(--hi-bright); }
+  /* while a drag is in flight the pointer must not select the panel's text or
+     turn into a text caret as it crosses the column */
+  body.rail-drag { user-select: none; cursor: col-resize; }
   #drawerGrip { display: none; flex: 0 0 24px; align-items: flex-start; justify-content: center;
                 padding-top: 12px; background: var(--panel); border-right: 2px solid var(--edge);
                 color: var(--hi-dim); font: 700 14px var(--chrome); cursor: pointer;
@@ -730,6 +761,17 @@
         <div id="shotNote" class="segnote"></div>
       </div>
     </aside>
+    <!-- The two splitters. They live in the flex row rather than inside the
+         columns they move: a column is its own scroll container, and a
+         scrollbar is painted over its own content and takes the hit, so a grab
+         strip on the drawer's right edge sat under that drawer's vertical
+         scrollbar and could never be pressed (`elementsFromPoint` there
+         returned `#drawer`). Out here nothing can cover them.
+         `placeGrips()` positions them from the columns' real geometry. -->
+    <div id="drawerGripEdge" class="grip" data-t-title="page.rail.grip"
+         title="drag to widen the piece list"></div>
+    <div id="railGrip" class="grip" data-t-title="page.rail.grip"
+         title="drag to widen the workbench"></div>
     <main>
       <div id="stage">
         <video id="vid" controls preload="metadata"></video>
@@ -1918,6 +1960,112 @@ $('railToggle').onclick = () => {
   $('railToggle').setAttribute('aria-expanded', String(!off));
   labelRail();
 };
+
+// ---- the flank width --------------------------------------------------------
+// The rail's own left edge is a splitter. One number drives BOTH flank columns:
+// they sit on opposite sides of the same stage, and a review that widened the
+// piece list to read the models in it wants the knobs beside it just as wide --
+// a bench is one bench. It is remembered in settings.json, so it survives a
+// reload, a cleared cache and a different browser.
+//
+// The width is applied as a CSS custom property rather than by measuring the
+// columns: `--railw` overrides the stylesheet's own clamp, and "never dragged"
+// is simply the property being absent. Measured pixels would have to be
+// re-derived on every resize and would fight the `clamp()` on narrow windows.
+const RAIL_MIN_W = 220;
+const RAIL_MAX_W = 520;
+let railW = 0;          // 0 = not set; the stylesheet decides
+
+function applyRailWidth(w) {
+  railW = w || 0;
+  if (railW) document.documentElement.style.setProperty('--railw', railW + 'px');
+  else document.documentElement.style.removeProperty('--railw');
+}
+function clampRail(w) {
+  // A narrow window cannot give up a third of itself to a column: cap the drag
+  // by what the stage needs, so the splitter cannot be pulled past the point
+  // where the video is gone. The stage keeps at least 420 px.
+  const room = Math.max(RAIL_MIN_W, window.innerWidth - 420);
+  const hi = Math.min(RAIL_MAX_W, room);
+  return Math.round(Math.max(RAIL_MIN_W, Math.min(hi, w)));
+}
+async function loadUiPrefs() {
+  try {
+    const j = await (await fetch('/ui_prefs')).json();
+    applyRailWidth((j && j.width) ? clampRail(j.width) : 0);
+  } catch (e) { applyRailWidth(0); }
+  // the canvases re-back themselves off a ResizeObserver, so nothing to do here
+}
+let railDrag = null;    // { x0, w0, sign } while a splitter is held
+/** Put each splitter on the edge of the column it moves.
+ *
+ *  The grips are Children of `#shell`, not of their columns, so they do not
+ *  follow the layout on their own -- they are placed here, from the columns'
+ *  own rects, and re-placed whenever the layout can have changed: a drag (which
+ *  is what moves them), a resize, and the workbench being folded away.
+ *
+ *  A hidden column takes its splitter with it: there is no edge to grab, and a
+ *  9 px strip floating over the picture would be a control with no meaning. */
+function placeGrips() {
+  const shell = $('shell').getBoundingClientRect();
+  for (const [id, col, right] of [
+    ['drawerGripEdge', 'drawer', true],
+    ['railGrip', 'rail', false],
+  ]) {
+    const g = $(id);
+    const c = $(col);
+    if (!g) continue;
+    // `offsetParent` is null for a display:none column, which is exactly the
+    // test we want: a folded-away bench has no edge
+    if (!c || !c.offsetParent) { g.hidden = true; continue; }
+    g.hidden = false;
+    const b = c.getBoundingClientRect();
+    g.style.left = Math.round((right ? b.right : b.left) - shell.left - 4) + 'px';
+  }
+}
+function railDown(ev, el, sign) {
+  if (ev.button !== 0) return;
+  ev.preventDefault();
+  railDrag = {
+    x0: ev.clientX,
+    w0: (sign > 0 ? $('drawer') : $('rail')).getBoundingClientRect().width,
+    sign,
+  };
+  document.body.classList.add('rail-drag');
+  try { el.setPointerCapture(ev.pointerId); } catch (e) { /* an optimisation */ }
+}
+function railMove(ev) {
+  if (!railDrag) return;
+  const w = clampRail(railDrag.w0 + railDrag.sign * (ev.clientX - railDrag.x0));
+  applyRailWidth(w);
+  placeGrips();     // the columns just moved; their splitters have to follow
+}
+function railUp() {
+  if (!railDrag) return;
+  railDrag = null;
+  document.body.classList.remove('rail-drag');
+  placeGrips();
+  // saved on RELEASE only: a drag is dozens of pointermove events, and a POST
+  // per pixel would be dozens of writes to the same file for one gesture.
+  if (!railW) return;
+  const body = JSON.stringify({ width: railW });
+  fetch('/ui_prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+    .catch(() => { /* a forgotten width is not worth an error banner */ });
+}
+for (const [id, sign] of [['railGrip', -1], ['drawerGripEdge', 1]]) {
+  const el = $(id);
+  el.addEventListener('pointerdown', ev => railDown(ev, el, sign));
+  el.addEventListener('pointermove', railMove);
+  el.addEventListener('pointerup', railUp);
+  el.addEventListener('pointercancel', railUp);
+}
+// the columns move for reasons other than a drag: a resize, the bench folding
+// away, a clip list appearing. One observer covers all of them.
+new ResizeObserver(placeGrips).observe($('shell'));
+addEventListener('resize', () => {
+  if (railW) applyRailWidth(clampRail(railW));
+  placeGrips();
+});
 
 // the one disclosure: every group's raw numbers in place, folded away by default
 function labelAdv() {
@@ -3671,13 +3819,30 @@ function closePieceSlide() {
 /** Put the open strip back under its own row. The list is emptied and rebuilt
  *  on every commit, so this runs at the end of `renderSegs` -- the strip itself
  *  is not one of the rows and would otherwise be left holding a row that no
- *  longer exists. */
+ *  longer exists.
+ *
+ *  It RE-SEEDS too, for the same reason `seedSlide` does on the wave panel: the
+ *  number box is the truth. A value can arrive there by typing (which commits
+ *  and rebuilds the whole list), and a strip that only moved would leave its
+ *  thumb at the number the box used to hold -- the reviewer types 3 and watches
+ *  the slider stay at 1, which reads as the edit not having landed. Skipped
+ *  mid-pull, where the box is following the thumb rather than the other way. */
 function pieceSlideAnchor() {
   if (!pieceSlideEl || pieceSlideEl.hidden || pieceSlideIdx < 0) return;
   const box = pieceSlideBox(pieceSlideIdx);
   const row = box ? box.closest('.segrow') : null;
   if (!row) { closePieceSlide(); return; }
   row.after(pieceSlideEl);
+  if (pieceSlideDirty) return;
+  const s = segs[pieceSlideIdx];
+  if (!s) { closePieceSlide(); return; }
+  const k = pieceScale(s);
+  pieceSlideEl.children[0].value = String(k);
+  const sv = pieceSlideEl.querySelector('.sv');
+  if (sv) {
+    sv.textContent = k.toFixed(2) + '\u00d7';
+    sv.classList.toggle('one', Math.abs(k - 1) < 1e-9);
+  }
 }
 /** Replace piece `i` with a one-click fill.
  *
@@ -5061,6 +5226,8 @@ function noteRenderer() {
   watchBoot();           // follow the remembered address into the next run
   noteRenderer();        // which GPU is drawing this page
   await loadConfPrefs();  // which models vote, and whether to run unasked
+  await loadUiPrefs();    // how wide the workbench was left
+  placeGrips();           // ...which moves the two splitters onto their edges
   buildPresetOptions();  // dropdown labels carry each preset's number
   sizeStrip();
   sizeTimeline();

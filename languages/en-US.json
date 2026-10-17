@@ -185,6 +185,7 @@
   "page.hint": "every change rewrites the script instantly",
   "page.workbench": "workbench",
   "page.workbench.title": "fold the workbench away and give the frame the whole window",
+  "page.rail.grip": "drag to resize this column",
   "page.workingcopy": "480p working copy",
   "page.timeline.title": "click or drag to scrub",
   "page.speed": "speed",
