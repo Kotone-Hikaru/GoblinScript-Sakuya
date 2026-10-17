@@ -143,9 +143,18 @@ adding or removing one re-runs the head pass, because it changes what the
 models were shown. Nothing in the bench touches the draft file: it is the
 session's edit, like a knob.
 
+Each piece also carries **its own intensity**, 0 to 5, where 1 is the model's
+own answer. It scales about the piece's *own mean* rather than about mid-range,
+so turning a quiet wave up widens it instead of pressing it against the floor --
+and it moves the piece's vertices rather than the rows they were found on, so a
+stronger setting can never cost the piece a point.
+
 A **confidence suggestion** can propose a model per piece from each model's own
 confidence, sampled with one instant restyle each. It is a proposal and nothing
-else: it is off until asked for, and applying it is its own button.
+else: it is off until asked for, and applying it is its own button. Which models
+are even on the ballot is yours to set, per model, and the choice is remembered
+in `settings.json`; a model you switch off is never sampled, so it cannot spend
+your wait or win a shot on a self-assessment you do not trust.
 
 Every step is undoable (**Ctrl+Z** / **Ctrl+Shift+Z**), one step per edit, with
 the piece, cut, model or merge that it changed named in the tooltip.
@@ -191,14 +200,31 @@ baselines and the control loop explained (in Chinese).
 
 * The **#strip** has two transports: *play*, where it follows the video and a
   click jumps, and *edit*, where the wheel slides, Ctrl+wheel zooms, dragging a
-  boundary moves a cut and right-click picks the model (**E** switches).
+  boundary moves a cut and right-click picks the model (**E** switches; **Tab**
+  does the same from anywhere).
+* Both flank columns are **resizable**: drag the edge of the piece list or of
+  the workbench. The two share one width -- they sit either side of the same
+  stage, so widening the list to read the models in it widens the knobs to
+  match -- and the width is remembered in `settings.json`, so it survives a
+  reload, a cleared cache and a different browser.
 * The **crop page** can add, move and remove the starts of its shots -- a long
   shot whose subject walks out of the rect is the case a detector cannot call
   and a person can (Enter at the playhead, Delete, or drag on the bar). Every
   edit is clamped to the frame grid and strictly between its neighbours, so the
   page cannot make a plan the segmented decoder would refuse. Boundary 0 (the
   clip's own start) can be added to, never moved or removed.
-* Every new string ships in both English and Chinese (110 new keys).
+* The **speed readout** under the strip shows the rate at the playhead and the
+  distance covered over the trailing second, painted on the same green-to-amber
+  scale as the heat bar and going plain red once either passes the cap. Where
+  the cap is *cutting* is washed red on the strip, which is the bar that colours
+  itself by speed -- on the whole-clip timeline a red band would read as a
+  property of the video, which is not what it means.
+* The canvases repaint at 60 Hz while the video plays and **not at all** when it
+  does not: a paused page costs nothing, and a gesture paints immediately
+  instead of waiting for the next tick.
+* Default playback volume is 15%, deliberately not remembered -- this is a
+  visual editor, and a quiet default is friendlier than a loud one.
+* Every new string ships in both English and Chinese (138 new keys).
 
 ## What you need
 
