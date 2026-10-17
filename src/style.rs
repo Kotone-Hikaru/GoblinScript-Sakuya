@@ -1302,69 +1302,57 @@ pub struct PieceScale {
     pub k: f64,
 }
 
-/// Apply per-piece intensity to the level rows each piece covers.
+/// Apply per-piece intensity to the ACTIONS each piece already produced.
 ///
 /// About the piece's OWN mean, not mid-range. A waveform living at 20-40 gets
 /// pushed toward the floor by a factor above 1 the mid-range way, which reads
 /// as "stronger made it smaller" -- the user's own report, and the reason this
 /// is a mean rather than 50.
 ///
-/// The mean is taken from the rows the draft just produced and the scale is
-/// applied to THOSE, never to an earlier scaled copy: that is what makes
-/// dragging a knob to 2 and back to 1 restore the model's own output exactly,
-/// instead of compounding.
+/// ⭐ It scales the ACTIONS, not the level rows, and that distinction is the
+/// whole point. Scaling the rows happens upstream of `extrema_actions`, and a
+/// piece scaled past the 0..100 rails becomes a FLAT PLATEAU there -- rows the
+/// extremum finder cannot report a peak on, so it drops the interior ones. The
+/// piece then loses vertices: measured on a real clip, k=2 deleted the point at
+/// 983 ms and pulled the tail from 58/64 down to 51/57, which is why a bigger
+/// multiplier produced a *smaller-looking* shape. Scaling the finished actions
+/// cannot do that: every vertex keeps its time and its neighbours, only its
+/// position moves. It is also the same thing `shape_actions` does for the
+/// whole-clip `intensity`, so the two knobs now behave alike.
 ///
-/// Runs on the level array, upstream of the extrema/RDP/seam/speed stages, so a
-/// piece scaled up is still held to the device's limits afterwards.
-pub fn scale_pieces(level: &mut [f64], times: &[f64], pieces: &[PieceScale]) {
+/// The mean is taken from the piece's OWN actions and the scale applied to
+/// those, never to an already-scaled copy: that is what makes dragging a knob
+/// to 2 and back to 1 restore the model's output exactly, instead of
+/// compounding.
+///
+/// Runs BEFORE `shape_actions`, so a piece scaled up is still held to the
+/// device's slope limit afterwards -- the cap keeps the last word.
+pub fn scale_pieces(actions: &mut [Action], pieces: &[PieceScale]) {
     for pc in pieces {
         if (pc.k - 1.0).abs() < 1e-9 {
             continue;
         }
-        let (a, b) = match (rows_from(times, pc.lo_ms), rows_from(times, pc.hi_ms)) {
-            (Some(a), Some(b)) => (a, b),
-            _ => continue,
-        };
-        if b <= a || b > level.len() {
+        // The piece's own vertices, in one pass, so the mean is the mean of the
+        // shape being scaled rather than of a row range that may not line up
+        // with it.
+        let idx: Vec<usize> = actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                let t = a.at as f64;
+                t >= pc.lo_ms && t < pc.hi_ms
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if idx.is_empty() {
             continue;
         }
-        let mut sum = 0.0;
-        let mut n = 0usize;
-        for v in &level[a..b] {
-            if v.is_finite() {
-                sum += *v;
-                n += 1;
-            }
-        }
-        if n == 0 {
-            continue;
-        }
-        let m = sum / n as f64;
-        for v in &mut level[a..b] {
-            if v.is_finite() {
-                *v = (m + (*v - m) * pc.k).clamp(0.0, 100.0);
-            }
+        let m = idx.iter().map(|&i| actions[i].pos as f64).sum::<f64>() / idx.len() as f64;
+        for &i in &idx {
+            let x = m + (actions[i].pos as f64 - m) * pc.k;
+            actions[i].pos = x.round().clamp(0.0, 100.0) as i64;
         }
     }
-}
-
-/// Index of the first row at or after `ms` in a sorted clock, or `None` when
-/// there is no clock to ask.
-fn rows_from(times: &[f64], ms: f64) -> Option<usize> {
-    if times.is_empty() {
-        return None;
-    }
-    let mut lo = 0usize;
-    let mut hi = times.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if times[mid] < ms {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Some(lo)
 }
 
 /// Replace every action inside a hand-drawn piece with the piece SOLVED from
@@ -3348,6 +3336,75 @@ mod tests {
         let mut a = vec![Action { at: 0, pos: 50 }, Action { at: 1, pos: 90 }];
         shape_actions(&mut a, &Params::default(), &[]);
         assert_eq!(a[1].pos, 50);
+    }
+
+    #[test]
+    fn a_piece_scale_moves_vertices_and_never_deletes_one() {
+        // The bug this pins: the scale used to run on the level ROWS, upstream
+        // of `extrema_actions`. A piece pushed past the rails became a flat
+        // plateau, the extremum finder could not report a peak inside one, and
+        // the piece came back with FEWER vertices -- so k=5 drew a shape that
+        // looked smaller than k=1's. On actions, every vertex survives: times
+        // untouched, only positions move away from the piece's own mean.
+        let mut a = vec![
+            Action { at: 33, pos: 16 },
+            Action { at: 349, pos: 15 },
+            Action { at: 983, pos: 37 },
+            Action { at: 4928, pos: 63 },
+            Action { at: 5260, pos: 89 },
+            Action { at: 7800, pos: 58 },
+            Action { at: 7833, pos: 64 },
+        ];
+        let before: Vec<i64> = a.iter().map(|x| x.at).collect();
+        let mean = a.iter().map(|x| x.pos as f64).sum::<f64>() / a.len() as f64;
+        let span_before = a.iter().map(|x| x.pos).max().unwrap()
+            - a.iter().map(|x| x.pos).min().unwrap();
+        scale_pieces(
+            &mut a,
+            &[PieceScale { lo_ms: 0.0, hi_ms: 8000.0, k: 2.0 }],
+        );
+        assert_eq!(a.len(), 7, "a vertex was lost");
+        assert_eq!(
+            a.iter().map(|x| x.at).collect::<Vec<_>>(),
+            before,
+            "times must not move -- this is why we are not row-scanning"
+        );
+        let span_after = a.iter().map(|x| x.pos).max().unwrap()
+            - a.iter().map(|x| x.pos).min().unwrap();
+        assert!(
+            span_after > span_before,
+            "k=2 must spread the piece wider, not squeeze it: {span_before} -> {span_after}"
+        );
+        // about the piece's OWN mean, so a low-lying wave is not pushed to the
+        // floor the way a mid-range scale would
+        let mean_after = a.iter().map(|x| x.pos as f64).sum::<f64>() / a.len() as f64;
+        assert!(
+            (mean_after - mean).abs() < 1.5,
+            "the piece's mean must stay put: {mean} -> {mean_after}"
+        );
+    }
+
+    #[test]
+    fn a_piece_scale_of_one_is_the_models_own_output() {
+        // The restore-to-the-model property comes from the PIPELINE: every
+        // re-style recomputes `extrema_actions` from the un-scaled rows, so a
+        // knob dragged 2 -> 1 hands the scale the model's own list again. What
+        // `scale_pieces` itself must guarantee is the cheap half of that: a
+        // factor of 1 is a no-op, so k=1 can never nudge a vertex even by a
+        // rounding step.
+        let orig = vec![
+            Action { at: 0, pos: 16 },
+            Action { at: 500, pos: 70 },
+            Action { at: 900, pos: 22 },
+        ];
+        let mut a = orig.clone();
+        scale_pieces(&mut a, &[PieceScale { lo_ms: -1.0, hi_ms: 1e9, k: 1.0 }]);
+        assert_eq!(a, orig);
+        // a piece that covers nothing is skipped too, which is how a span whose
+        // model vanished degrades instead of blanking the clip
+        let mut b = orig.clone();
+        scale_pieces(&mut b, &[PieceScale { lo_ms: 1e6, hi_ms: 2e6, k: 3.0 }]);
+        assert_eq!(b, orig);
     }
 
     /// A piece's recipe, for the splice tests below.

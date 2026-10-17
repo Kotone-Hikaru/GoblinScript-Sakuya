@@ -1552,6 +1552,7 @@ fn restyle(
 
 /// `restyle` on caller-supplied tracks: the mixed review's write, the same
 /// file path and the same readout, only the rows come from a splice.
+#[allow(clippy::too_many_arguments)]
 fn restyle_mixed(
     d: &DraftOut,
     man: &bundle::Manifest,
@@ -1560,8 +1561,9 @@ fn restyle_mixed(
     cap_x: &[f64],
     cap_f0: &[f64],
     manual_ms: &[crate::wave::ManualSpan],
+    pieces: &[style::PieceScale],
 ) -> Result<(usize, Vec<[i64; 2]>, f64)> {
-    let s = style_draft_with(d, man, params, &[], tracks, cap_x, cap_f0, manual_ms);
+    let s = style_draft_with(d, man, params, &[], tracks, cap_x, cap_f0, manual_ms, pieces);
     write_styled(&d.dst, &s, man, params)?;
     Ok((s.actions.len(), s.artifacts, s.art_rate))
 }
@@ -1610,9 +1612,10 @@ fn review_style(
         // The rows the script is written from: the chosen model's tracks over the
         // whole clip, each span's own model spliced in on its rows, with the
         // per-row amplitude bound that follows (each pack keeps its own `amp_cap_x`).
-        let (mixed, cap_x, cap_f0, conf, manual_ms) = mixed_tracks(d, b, p, choice, &bb)?;
-        let (actions, _, _) =
-            restyle_mixed(d, &bb.manifest, p, &mixed, &cap_x, &cap_f0, &manual_ms)?;
+        let (mixed, cap_x, cap_f0, conf, manual_ms, pieces) = mixed_tracks(d, b, p, choice, &bb)?;
+        let (actions, _, _) = restyle_mixed(
+            d, &bb.manifest, p, &mixed, &cap_x, &cap_f0, &manual_ms, &pieces,
+        )?;
         Ok(review::Restyled { actions, conf })
     })
 }
@@ -1684,6 +1687,7 @@ fn mixed_tracks(
     Vec<f64>,
     Vec<f64>,
     Vec<crate::wave::ManualSpan>,
+    Vec<style::PieceScale>,
 )> {
     let n = d.tracks.vmarg.len();
     let none = Vec::new();
@@ -1694,6 +1698,7 @@ fn mixed_tracks(
             Vec::new(),
             d.tracks.conf.clone(),
             none,
+            Vec::new(),
         ));
     }
     let mut mixed = d.tracks.clone();
@@ -1757,10 +1762,14 @@ fn mixed_tracks(
             });
         }
     }
-    // Each ordinary piece's own intensity, about its own mean. Applied to the
-    // raw spliced level, so a knob dragged to 2 and back to 1 restores the
-    // model's own output instead of compounding, and so the extrema / RDP /
-    // seam / speed stages downstream still get the last word. Hand-drawn
+    // Each ordinary piece's own intensity, about its own mean. Handed BACK to
+    // the styler rather than applied here: the level rows are upstream of
+    // `extrema_actions`, and a piece scaled past the rails becomes a flat
+    // plateau there, whose interior peaks the extremum finder cannot report --
+    // so the piece silently lost vertices (on a real clip k=2 dropped the point
+    // at 983 ms and pulled the tail from 58/64 to 51/57, which is why a bigger
+    // multiplier looked SMALLER). Applied to the finished actions instead,
+    // every vertex keeps its time and its neighbours and only moves. Hand-drawn
     // pieces are left out on purpose: their band is what the user typed, not a
     // model's guess to be nudged.
     let pieces: Vec<style::PieceScale> = choice
@@ -1773,11 +1782,8 @@ fn mixed_tracks(
             k: sp.scale,
         })
         .collect();
-    if !pieces.is_empty() {
-        style::scale_pieces(&mut mixed.level, &d.times, &pieces);
-    }
     let conf = mixed.conf.clone();
-    Ok((mixed, cap_x, cap_f0, conf, manual_ms))
+    Ok((mixed, cap_x, cap_f0, conf, manual_ms, pieces))
 }
 
 /// The tracks `b`'s model at `seed` would make, WITHOUT disturbing the
@@ -1815,7 +1821,7 @@ fn style_draft(
     params: &style::Params,
     pins: &[style::Action],
 ) -> Styled {
-    style_draft_with(d, man, params, pins, &d.tracks, &[], &[], &[])
+    style_draft_with(d, man, params, pins, &d.tracks, &[], &[], &[], &[])
 }
 
 /// `style_draft` on tracks the caller supplies instead of the draft's own --
@@ -1835,6 +1841,7 @@ fn style_draft_with(
     cap_x: &[f64],
     cap_f0: &[f64],
     manual_ms: &[crate::wave::ManualSpan],
+    pieces: &[style::PieceScale],
 ) -> Styled {
     let mut cfg = style_cfg(man, params);
     if !cap_x.is_empty() {
@@ -1865,6 +1872,13 @@ fn style_draft_with(
         &force,
         cfg.cut_ease,
     );
+    // Each piece's own intensity, about its own mean, BEFORE the output-domain
+    // stages below: `shape_actions` still gets the last word (the whole-clip
+    // intensity and, above all, the device's slope cap), and a piece scaled to
+    // 2 and back to 1 restores the model's own vertices exactly because this
+    // always reads the un-scaled list. Applied to ACTIONS and not to level rows
+    // -- see `style::scale_pieces` for why the row form silently ate vertices.
+    style::scale_pieces(&mut actions, pieces);
     style::shape_actions(&mut actions, params, manual_ms);
     // The drawing's own vertices LAST, before the clock moves: a piece written
     // by hand is solved from its wave rather than read off the row scan above,
