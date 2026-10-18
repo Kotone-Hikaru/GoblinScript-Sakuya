@@ -2639,6 +2639,66 @@ mod tests {
         );
     }
 
+    /// Two data-loss bugs the reviewer hit, pinned so they cannot come back.
+    ///
+    /// 1. **The auto-suggest guard was one slot.** `autoSuggestRan === i`
+    ///    remembered the last clip only, so leaving clip 0 for clip 1 and
+    ///    coming back re-armed it -- the suggestion ran again and APPLIED over
+    ///    pieces the reviewer had since finished by hand. The guard has to be a
+    ///    set of clips, and a clip that already carries spans must be refused
+    ///    outright: an auto-applied proposal is only ever defensible on a draft
+    ///    nobody has touched, and a reviewer's own span list is the strongest
+    ///    evidence that this one has been touched (a restyle cannot invent one).
+    ///
+    /// 2. **Splitting a drawing shared its recipe.** `{ ...s }` is a shallow
+    ///    copy, so both halves of a cut piece pointed at ONE `wave` object --
+    ///    and `editWave` mutates it in place (`fn(s.wave)`). Tuning the first
+    ///    half silently re-tuned the second, and the two halves of one drawing
+    ///    stayed locked together forever.
+    #[test]
+    fn a_page_split_in_two_does_not_share_a_recipe_and_is_not_re_suggested() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let html =
+            std::fs::read_to_string(dir.join("review.html")).expect("the review page is missing");
+
+        // 1. the guard is a Set, and a clip carrying spans is refused
+        assert!(
+            html.contains("let autoSuggestRan = new Set();"),
+            "the auto-suggest guard must remember EVERY clip it has offered to, not just the \
+             last one -- with a single slot, coming back to a clip re-ran the suggestion and \
+             overwrote the reviewer's finished pieces"
+        );
+        assert!(
+            html.contains("autoSuggestRan.has(i)"),
+            "the guard has to be consulted as a set"
+        );
+        assert!(
+            html.contains("if ((c.spans || []).length) return;"),
+            "a clip that already carries the reviewer's own pieces must never be auto-touched"
+        );
+        assert!(
+            !html.contains("autoSuggestRan === i"),
+            "the single-slot comparison is the bug itself and must not come back"
+        );
+
+        // 2. cutting a piece deep-copies the recipe
+        let cut = html
+            .split("function cutInPlace(ms)")
+            .nth(1)
+            .expect("cutInPlace is gone");
+        let body = &cut[..cut.find("\n}\n").map(|e| e + 2).unwrap_or(cut.len())];
+        assert!(
+            body.contains("params: { ...(b.wave.params || {}) }"),
+            "cutInPlace must deep-copy `wave.params` as well as `wave`: `{{ ...s }}` alone shares \
+             the recipe object, and `editWave` mutates it in place -- so the two halves of one \
+             drawing stayed locked together"
+        );
+        assert!(
+            !body.contains("segs.splice(i, 1, { ...s, hi: ms }, { ...s, lo: ms })"),
+            "the shallow spread is the bug itself and must not come back"
+        );
+    }
+
     /// A page left beside the exe by an OLDER run must never be served: it is
     /// the difference between a page that knows where the window goes next and
     /// one that sits there finished, which is a window opened per batch.

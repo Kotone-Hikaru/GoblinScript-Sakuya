@@ -2192,23 +2192,44 @@ function stepAction(dir) {
     if (pv) seekMs(pv.at);
   }
 }
-// A focused <video> toggles playback on Space all by itself -- the native media
-// controls listen at the target, before this page's document-level keys run.
-// So pressing Space over the picture toggled twice and looked like "plays for a
-// moment, then pauses", which is exactly what it did. Cancelling the key in the
-// capture phase stops the media element from ever seeing it; the switch below
-// then does the one toggle it was always meant to be. Clicking the picture is
-// what focuses #vid (tabIndex 0), so this is a normal way to hit the bug.
+// Space is the transport everywhere on this page, so EVERY element's own idea of
+// what Space means is cancelled in the capture phase, before it can act.
+//
+// Two different defaults were getting in the way, and they need the same fix:
+//   * a focused <video> toggles playback itself (native media controls listen at
+//     the target) -- so pressing Space over the picture toggled TWICE and looked
+//     like "plays for a moment, then pauses";
+//   * a focused <button> clicks itself, and a focused checkbox flips itself --
+//     so Space over a control did that instead of playing the video.
+// Cancelling at capture stops all of them; the handler below then does the one
+// toggle it was always meant to be. Modifiers are left alone.
 document.addEventListener('keydown', e => {
-  const el = document.activeElement;
-  if (e.key === ' ' && el && el.tagName === 'VIDEO') e.preventDefault();
+  if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey) e.preventDefault();
 }, true);
 document.addEventListener('keydown', e => {
+  // ⭐ SPACE IS THE TRANSPORT, ALWAYS -- before every focus guard below.
+  //
+  // This runs before the "never steal keys from a control" checks on purpose.
+  // Those checks exist so typing in a box is typing, but Space is not text in
+  // any control this page has (every input is number/range/checkbox; there is
+  // no textarea and nothing contenteditable), so letting a focused box swallow
+  // it only ever cost the reviewer playback. The cost is deliberate and small:
+  // a focused checkbox can no longer be toggled with Space (clicking it still
+  // works), and a focused button no longer answers Space (Enter still clicks
+  // it, which is the key people reach for anyway).
+  //
+  // Modifiers are excluded so Ctrl+Space and friends keep whatever meaning the
+  // browser or OS gives them.
+  if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    if (vid.paused) vid.play(); else vid.pause();
+    return;
+  }
   // never steal keys from a control the user is editing
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-  // let space/enter still click a focused button (arrows here step the video)
-  if (tag === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
+  // let enter still click a focused button (arrows here step the video)
+  if (tag === 'BUTTON' && e.key === 'Enter') return;
   // undo / redo: one pair of keys for both benches. Spans and shot cuts keep
   // separate stacks; `undoNow`/`redoNow` pick the one the user last touched.
   if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
@@ -2230,7 +2251,8 @@ document.addEventListener('keydown', e => {
     case 'ArrowRight': stepFrame(1); break;
     case 'ArrowUp':    stepAction(1); break;   // up = next action
     case 'ArrowDown':  stepAction(-1); break;  // down = previous action
-    case ' ':          if (vid.paused) vid.play(); else vid.pause(); break;
+    // Space is not here: it is handled above, before the focus guards, because
+    // it must reach the video whatever holds the keyboard focus.
     case ',':          stepRate(-1); break;   // slower
     case '.':          stepRate(1); break;    // faster
     // the spanning bench's tools, by their first letters (see the tool tips)
@@ -3679,7 +3701,20 @@ function cutInPlace(ms) {
   // how the wave used to vanish here: the halves came back as recipe-less
   // manual pieces, and the server drops a manual span with no wave, so both
   // disappeared on the next post.
-  segs.splice(i, 1, { ...s, hi: ms }, { ...s, lo: ms });
+  //
+  // ⚠️ The recipe is DEEP-copied, and that is the whole point of the clone
+  // below. `{ ...s }` is a shallow copy, so both halves would share ONE wave
+  // object -- and `editWave` mutates it in place (`fn(s.wave)`). Tuning the
+  // first half then silently re-tuned the second, and the two halves of one
+  // drawn piece stayed locked together forever. The exemptions are plain
+  // booleans and copy fine; `wave.params` is the nested object that needed its
+  // own copy.
+  const half = (b) => {
+    const o = { ...b };
+    if (b.wave) o.wave = { ...b.wave, params: { ...(b.wave.params || {}) } };
+    return o;
+  };
+  segs.splice(i, 1, half({ ...s, hi: ms }), half({ ...s, lo: ms }));
   return i;
 }
 function cutAt(ms) {
@@ -4015,35 +4050,21 @@ function renderSegs() {
       box.value = k.toFixed(2);
       box.title = T('page.spans.scale.tip');
       box.dataset.scaleFor = String(i);
-      // it must not double as a "select this piece" click, and it must not
-      // start a drag on the bar behind it
-      box.onclick = ev => { ev.stopPropagation(); openPieceSlide(i); };
+      // The strip follows the SELECTION now, not this box's focus, so a click
+      // only has to select the piece -- `renderSegs` opens the strip from
+      // `selSeg` on the next pass. Both handlers still stop there: this box
+      // must not double as a "select this piece" click, and must not start a
+      // drag on the bar behind it.
       box.onpointerdown = ev => ev.stopPropagation();
-      box.onfocus = () => openPieceSlide(i);
-      // Close when the number is left -- the strip exists while the box has
-      // focus, as asked. But NOT when the focus moved into the strip itself:
-      // grabbing the slider blurs the box first, and closing on that would make
-      // the control disappear the instant it was used.
-      box.onblur = ev => {
-        const next = ev.relatedTarget;
-        // NOT named `strip`: that name is the page's own canvases element
-        // (`const strip = $('strip')`), and a local of the same name throws in
-        // the temporal dead zone for every read above it -- which is precisely
-        // what the page guard exists to catch.
-        const rowStrip = pieceSlideEl;
-        if (rowStrip && next && rowStrip.contains(next)) return;
-        // a rebuild of the list blurs the old box with nowhere to go; the
-        // anchored strip is still the right one, so leave it standing there
-        if (!next) return;
-        closePieceSlide();
-      };
       // typing is a first-class way in: commit on change, not per keystroke
       box.onchange = () => setSegScale(i, Number(box.value));
       box.oninput = () => box.classList.toggle('one', Math.abs(Number(box.value) - 1) < 1e-9);
-      box.onkeydown = ev => { if (ev.key === 'Escape') { closePieceSlide(); box.blur(); } };
+      box.onkeydown = ev => { if (ev.key === 'Escape') box.blur(); };
       row.append(box);
     }
     row.append(cf);
+    // Selecting a piece is what opens its intensity strip (see renderSegs) --
+    // the number boxes only ever edit what is already selected.
     row.onclick = () => { selSeg = i; renderSegs(); seekMs(s.lo + 1); };
     list.append(row);
     // ...and the controls for a hand-drawn piece go right under the row they
@@ -4059,6 +4080,13 @@ function renderSegs() {
   // NOT a row, so the rebuild above left it detached; without this a drag that
   // committed would take the strip away mid-gesture.
   pieceSlideAnchor();
+  // The strip belongs to the SELECTION, not to whichever number box happens to
+  // hold focus: reaching for a slider by first clicking a 3-character number
+  // box was a step nobody wanted. Selecting a piece opens its strip; selecting
+  // a hand-drawn piece (which has no such knob) closes it.
+  const sel = segs[selSeg];
+  if (sel && sel.model !== MANUAL) openPieceSlide(selSeg);
+  else if (!sel || sel.model === MANUAL) closePieceSlide();
 }
 /** The mean confidence over one piece's rows, or null when there is none to
  *  read -- a piece is where the split lines are drawn, and this is the only
@@ -4790,9 +4818,12 @@ let confWeights = null;
 // without a click, which is not something to discover switched on. READ from
 // settings.json (the picker's O key writes it); this page has no switch for it.
 let autoSuggest = false;
-// Set while the boot-time pass is running, so it is not started twice for the
-// same clip by a re-entry.
-let autoSuggestRan = null;
+// Clips the boot-time pass has already been offered to. A SET, not one index:
+// with a single slot, leaving clip 0 for clip 1 and coming back re-armed it, so
+// the suggestion ran again and APPLIED over pieces the reviewer had since spent
+// time editing. That is data loss, not a nuisance -- an auto-applied proposal
+// has no business running twice on the same clip.
+let autoSuggestRan = new Set();
 
 function labelSuggest() {
   $('confSuggestToggle').classList.toggle('on', suggestOn);
@@ -5079,12 +5110,22 @@ function applySuggestion() {
  *  exactly as the draft had them rather than half-applied.
  *
  *  Guarded by clip index so a re-entry (a re-style, a language change, a second
- *  click) does not queue a second sampling pass over the same clip. */
+ *  click) does not queue a second sampling pass over the same clip -- and the
+ *  guard is a SET of clips, so leaving a clip and coming back does not re-arm
+ *  it. It also refuses any clip that already carries pieces of its own: an
+ *  auto-applied proposal is only ever worth making on a draft nobody has
+ *  touched, and a reviewer's own span list is the strongest evidence of that
+ *  having happened (a restyle cannot invent one). */
 async function autoRunSuggestion(i) {
-  if (autoSuggestRan === i || suggestBusy) return;
+  if (suggestBusy) return;
   const c = state && state.clips && state.clips[i];
   if (cur !== i || !c) return;
-  autoSuggestRan = i;
+  if (autoSuggestRan.has(i)) return;
+  autoSuggestRan.add(i);
+  // A clip with spans is a clip somebody decided something about. Never touch
+  // it: this path applies its answer without asking, and the whole complaint
+  // this guard answers is that it once did so over finished work.
+  if ((c.spans || []).length) return;
   // The sampling swaps every model's track through the server, and the drawer's
   // switch says what is happening; the pass leaves the reviewer's own model and
   // pieces behind it either way.
