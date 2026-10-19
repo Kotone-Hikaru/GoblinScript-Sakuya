@@ -158,6 +158,41 @@
   #stylingNote.hidden { display: none; }
   body.styling #strip, body.styling #timeline { opacity: .55; transition: opacity .12s; }
 
+  /* ---- the shelter: hiding what is on the stage ----
+     This rig is used to write scripts for material nobody wants a passing
+     colleague to read over a shoulder. Both covers sit OVER the picture and
+     take no pointer events, so the transport keeps working underneath.
+
+     The two cost very different amounts, and the difference is structural
+     rather than a matter of degree:
+
+       #shelterImg  is one opaque div with a static CSS texture. It is not
+                    painted, sampled or filtered -- the compositor blends it
+                    like any background. Cost: nil.
+
+       #shelterBlur is a canvas ONE EIGHTH of the stage's size. The frame is
+                    sampled into it and blurred AT THAT SIZE (via ctx.filter),
+                    then the canvas is scaled up by CSS. So the blur pass runs
+                    over 1/64 of the pixels, and no filter is ever applied at
+                    the final size. This distinction is the whole trick: an
+                    element with `filter: blur()` PLUS `transform: scale()` is
+                    re-rasterised by the compositor at the magnified scale,
+                    which quietly throws the saving away. Doing the blur inside
+                    a small canvas cannot be undone that way, because by the
+                    time it reaches the compositor it is just a bitmap. */
+  #shelterImg, #shelterBlur { position: absolute; inset: 0; width: 100%; height: 100%;
+                              pointer-events: none; z-index: 4; }
+  #shelterImg { background:
+      repeating-linear-gradient(45deg, rgba(255,255,255,.05) 0 2px, rgba(0,0,0,0) 2px 4px),
+      radial-gradient(circle at 28% 30%, rgba(190,212,244,.30), rgba(0,0,0,0) 62%),
+      radial-gradient(circle at 72% 74%, rgba(246,222,200,.24), rgba(0,0,0,0) 58%),
+      #20242b; }
+  #shelterBlur { object-fit: cover; image-rendering: auto; }
+  #shelterImg.hidden, #shelterBlur.hidden { display: none; }
+  /* the shelter's own switch: sits with the mode switch, because it is the
+     other thing that decides what the strip's bar is FOR */
+  .sheltersw .mode + .mode { border-left: 2px solid var(--edge); }
+
   /* ---- rail: the goblins' workbench ----
      A column of stacked sections -- clip list, recipe, fine-tuning toggle,
      knob groups, key legend -- ending in the two session buttons. It scrolls
@@ -775,6 +810,11 @@
     <main>
       <div id="stage">
         <video id="vid" controls preload="metadata"></video>
+        <!-- The two covers (see the CSS). They live over the picture but under
+             every readout, and take no pointer events, so the transport, the
+             crop overlay and the wrench all keep working behind them. -->
+        <div id="shelterImg" class="hidden"></div>
+        <canvas id="shelterBlur" class="hidden"></canvas>
         <div id="sim">
           <div id="simtrack"><div id="simfill"></div><div id="simghost" class="hidden"></div><div id="simhandle"></div></div>
           <div id="simpos">–</div>
@@ -811,6 +851,18 @@
                   data-t="page.strip.play">play</span></button>
           <button type="button" id="stripModeEdit" class="mode">✎ <span
                   data-t="page.strip.edit">edit</span></button>
+        </span>
+        <!-- The shelter: covers for the picture, for working on material nobody
+             else should read over a shoulder. Two buttons, each a TOGGLE --
+             pressing the lit one puts the video back, so "off" needs no third
+             button of its own. They do NOT pause anything: the transport, the
+             script and every knob keep running underneath, which is the point
+             -- the work continues, only the picture is hidden. -->
+        <span class="sheltersw modesw" data-t-title="page.shelter.tip">
+          <button type="button" id="shelterStill" class="mode">▩ <span
+                  data-t="page.shelter.still">still</span></button>
+          <button type="button" id="shelterFrost" class="mode">❄ <span
+                  data-t="page.shelter.frost">frost</span></button>
         </span>
         <span id="confcap" class="hidden"></span>
         <!-- What the script is doing RIGHT HERE, against what the device is
@@ -2275,6 +2327,14 @@ document.addEventListener('keydown', e => {
       break;
     // judging two lines is flipping between them while the video plays
     case 'x': case 'X': swap(); break;
+    // the shelter, cycled by one key: off -> still -> frost -> off. One key
+    // rather than three because it is reached for suddenly, when someone walks
+    // in -- a decision about WHICH cover is not a decision worth making under
+    // that kind of pressure, and the first press already does the job.
+    case 'h': case 'H': {
+      setShelter(shelter === 'off' ? 'still' : shelter === 'still' ? 'frost' : 'off');
+      break;
+    }
     default: return;
   }
   e.preventDefault();
@@ -3033,6 +3093,86 @@ function labelStripMode() {
   p.classList.toggle('on', !stripEdit);
   e.classList.toggle('on', stripEdit);
 }
+
+// ---- the shelter: covering the picture ------------------------------------
+//
+// Three states, and only one of them is "show the video":
+//
+//   'off'   nothing over the picture
+//   'still' #shelterImg, an opaque div with a static CSS texture
+//   'frost' #shelterBlur, a canvas 1/8 the stage's size, blurred with
+//           ctx.filter AT THAT SIZE, then scaled up by CSS
+//
+// NONE of them pause, seek or otherwise touch the transport. The reviewer's
+// complaint this answers is "I cannot have this on screen at work", not "I want
+// to stop watching" -- the script still needs watching.
+//
+// Why the frost is a canvas and not `filter: blur()` on the video:
+//
+//   The obvious version -- put a CSS blur on the <video> and `transform:
+//   scale(8)` a wrapper around it -- does NOT let the browser blur 1/64 of the
+//   pixels. The compositor rasterises a filtered layer at the scale it is
+//   finally drawn at, so it re-runs the blur at the magnified size and the
+//   saving evaporates. Blurring INSIDE a small canvas cannot be undone that
+//   way: what reaches the compositor is a finished bitmap.
+//
+//   Cost of this version, per frame: sample 1/64 of the frame into the canvas,
+//   one blur pass over those few thousand pixels, then the compositor scales
+//   one small bitmap up. The radius is applied in the small canvas, so it comes
+//   out 8x larger on screen -- which is exactly the look wanted, for free.
+let shelter = 'off';
+// The canvas is sized from the stage every time it is shown, and the sampling
+// is driven from `tick` so it follows the playhead like every other layer.
+const SHELTER_DIV = 8;          // the canvas is 1/8 of the stage, each way
+const SHELTER_BLUR = 6;         // px at canvas scale = ~48 px on screen at 8x
+function sizeShelterBlur() {
+  const c = $('shelterBlur');
+  if (!c) return;
+  const st = $('stage');
+  // Layout size, not devicePixelRatio: this canvas exists to be CHEAP, and its
+  // pixels are all going to be smeared anyway. Backing it at dpr would multiply
+  // the very thing the cover is meant to shrink.
+  const w = Math.max(16, Math.round(st.clientWidth / SHELTER_DIV));
+  const h = Math.max(9, Math.round(st.clientHeight / SHELTER_DIV));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+}
+/** Draw one frame of the frosted cover. Called from `tick` while it is up. */
+function paintShelter() {
+  if (shelter !== 'frost') return;
+  const c = $('shelterBlur');
+  if (!c) return;
+  sizeShelterBlur();
+  const g = c.getContext('2d');
+  if (!g) return;
+  // `ctx.filter` is the important half: the blur is applied while drawing INTO
+  // this small canvas, so it costs 1/64 of a full-surface pass.
+  g.filter = 'blur(' + SHELTER_BLUR + 'px)';
+  try {
+    // cover, not contain: the canvas is the stage's aspect, the video's is its
+    // own, and letterboxing a blurred cover would put sharp black bars back on
+    // screen -- which is precisely what it is hiding.
+    g.drawImage(vid, 0, 0, c.width, c.height);
+  } catch (e) {
+    // a frame not ready yet: leave the canvas as it was rather than clearing it
+    // to transparency, which would flash the picture through
+  }
+  g.filter = 'none';
+}
+function labelShelter() {
+  const s = $('shelterStill'), f = $('shelterFrost');
+  if (s) s.classList.toggle('on', shelter === 'still');
+  if (f) f.classList.toggle('on', shelter === 'frost');
+}
+/** Set the cover. `null`/'off' shows the video again. */
+function setShelter(mode) {
+  shelter = (mode === 'still' || mode === 'frost') ? mode : 'off';
+  const img = $('shelterImg'), blur = $('shelterBlur');
+  if (img) img.classList.toggle('hidden', shelter !== 'still');
+  if (blur) blur.classList.toggle('hidden', shelter !== 'frost');
+  if (shelter === 'frost') paintShelter();
+  labelShelter();
+  // the transport is untouched on purpose -- see the block comment
+}
 // speed (pos-units/s) -> a cool-to-hot colour, so the strip reads as a heatmap
 // of the script's own intensity. ~500 u/s is already a fast stroke; the ramp
 // saturates there.
@@ -3395,6 +3535,11 @@ strip.addEventListener('pointerleave', () => {
 });
 $('stripModePlay').onclick = () => setStripEdit(false);
 $('stripModeEdit').onclick = () => setStripEdit(true);
+// Each shelter button is a TOGGLE: the lit one is the current cover, and
+// pressing it again takes the cover away. That is why there is no third
+// "show" button -- three states, two controls, and the state is visible.
+$('shelterStill').onclick = () => setShelter(shelter === 'still' ? 'off' : 'still');
+$('shelterFrost').onclick = () => setShelter(shelter === 'frost' ? 'off' : 'frost');
 
 // ---- the repaint gate -------------------------------------------------------
 // The frame loop used to repaint five canvases (two of them the full width of
@@ -3467,6 +3612,11 @@ function tick(ts) {
     drawConfReadout(ms);
     drawCrop(ms);
     drawSpeed(ms);
+    // the frosted cover samples the frame, so it has to be refreshed on the same
+    // cadence as everything else -- and only while it is actually up. It costs a
+    // drawImage into a canvas 1/64 the stage's area, so it is not the reason the
+    // budget exists; skipping it when hidden just avoids pointless work.
+    if (shelter === 'frost') paintShelter();
     // the script menu is the current PIECE's, so it follows the playhead rather
     // than the clip: this is what makes it agree with the band under the cursor
     syncModelSel(ms);
