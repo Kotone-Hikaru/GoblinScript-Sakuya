@@ -109,11 +109,41 @@ pub fn hand_off(url: &str) -> bool {
 /// Show `url` to the person: hand the open window over, or open a new one.
 pub fn deliver(url: &str, open: bool) {
     if hand_off(url) {
+        raise_soon();
         return;
     }
     if open {
         crate::review::open_browser(url);
     }
+    raise_soon();
+}
+
+/// Lift the page's window to the front, shortly, without blocking the caller.
+///
+/// A stage calls [`deliver`] and then gets on with its own work -- it must not
+/// wait on the desktop, and on a build with no switch (or no Windows) there is
+/// nothing to wait for at all. So this only runs when the setting says so, and
+/// it runs on its own thread.
+///
+/// The short delay is for the HAND-OFF case: there the window is already up on
+/// the PREVIOUS page and is about to navigate. Raising it immediately would
+/// still work, but the title the search matches on belongs to the page being
+/// left, and a browser that has not yet committed the new document can be
+/// mid-swap. A few hundred milliseconds puts the raise after the page has
+/// arrived, so what comes to the front is the stage that is actually waiting.
+fn raise_soon() {
+    if !crate::settings::Settings::load().raises_window() {
+        return;
+    }
+    if !crate::raise::available() {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(400));
+        // The answer is deliberately ignored: no window on screen, or a desktop
+        // that refused, is not an error in the pipeline. The stage still runs.
+        let _ = crate::raise::raise_by_title("goblinscript");
+    });
 }
 
 #[cfg(test)]

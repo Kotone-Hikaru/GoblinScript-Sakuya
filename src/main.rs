@@ -21,6 +21,7 @@ mod exposure;
 mod mascot;
 mod pagewin;
 mod prefetch;
+mod raise;
 mod ffmpeg;
 mod heads;
 mod lang;
@@ -3757,6 +3758,9 @@ fn real_main() -> Result<()> {
                 settings.auto_suggest,
                 // and the GPU browser, on the same terms
                 settings.gpu_browser,
+                // whether a waiting stage may lift the page's window to the
+                // front; nothing to arm, `pagewin::deliver` reads it live
+                settings.raises_window(),
                 start_dir.clone(),
                 std::mem::take(&mut report),
                 cli.dl_dir.clone(),
@@ -3808,6 +3812,10 @@ fn real_main() -> Result<()> {
                     // The GPU browser window, on the same terms again: a
                     // standing preference, acted on the next time a page opens.
                     settings.gpu_browser = p.gpu_browser;
+                    // Whether a waiting stage raises the window. Stored as a
+                    // concrete bool rather than left as "never chosen" so the
+                    // person's answer survives an unrelated edit of the file.
+                    settings.raise_window = Some(p.raise_window);
                     settings.remember_presentation();
                     settings.save();
                     // the picker's users have no flags to re-run with -- the

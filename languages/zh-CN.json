@@ -115,6 +115,8 @@
   "picker.toggle.autosuggest": "打开即建议分段",
   "picker.toggle.gpubrowser": "独显浏览器",
   "picker.act.gpubrowser": "独显浏览器",
+  "picker.toggle.raisewindow": "等待时置顶窗口",
+  "picker.act.raisewindow": "窗口置顶",
   "picker.chrome.theme": " 配色：",
   "picker.chrome.audio": " 声音：",
   "picker.chrome.volume": " 音量：",

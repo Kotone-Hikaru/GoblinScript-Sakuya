@@ -115,6 +115,8 @@
   "picker.toggle.autosuggest": "conf-suggest on open",
   "picker.toggle.gpubrowser": "GPU browser",
   "picker.act.gpubrowser": "gpu browser",
+  "picker.toggle.raisewindow": "raise the window",
+  "picker.act.raisewindow": "raise window",
   "picker.chrome.theme": " theme: ",
   "picker.chrome.audio": " audio: ",
   "picker.chrome.volume": " volume: ",

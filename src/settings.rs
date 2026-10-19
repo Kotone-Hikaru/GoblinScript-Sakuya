@@ -154,6 +154,22 @@ pub struct Settings {
     /// what makes "drag either edge, the whole bench follows" true rather than
     /// a surprise.
     pub rail_width: Option<u16>,
+    /// Raise the browser window when a stage is waiting on a person.
+    ///
+    /// A batch runs for minutes and then stops -- the crop page wants a
+    /// decision, the review page wants a reading -- and a browser that has
+    /// drifted behind something else gives no sign of it: the run looks busy
+    /// while it is actually blocked. With this on, the window is lifted to the
+    /// front of the Z order at those moments.
+    ///
+    /// It does NOT take the keyboard focus (see `crate::raise`), which is why
+    /// this is safe to leave on: the window comes up, the caret stays where it
+    /// was, and a person mid-sentence somewhere else is not interrupted.
+    ///
+    /// ON by default. Unlike the switches that spend a wait or rewrite pieces,
+    /// this one only decides whether a window is visible, and a run blocked on
+    /// a page nobody can see is the failure it prevents.
+    pub raise_window: Option<bool>,
 }
 
 impl Default for Settings {
@@ -177,6 +193,7 @@ impl Default for Settings {
             conf_weights: None,
             gpu_browser: false,
             rail_width: None,
+            raise_window: None,
         }
     }
 }
@@ -222,6 +239,15 @@ impl Settings {
         self.muted = crate::sound::muted();
         self.music = crate::sound::music_on();
         self.volume = Some(crate::sound::volume());
+    }
+
+    /// Whether a waiting stage should lift the browser window to the front.
+    ///
+    /// `None` means never chosen, and the answer is YES: the switch only
+    /// decides whether a window is visible, never where the caret goes, so its
+    /// safe default is on. A settings file that says `false` is honoured.
+    pub fn raises_window(&self) -> bool {
+        self.raise_window.unwrap_or(true)
     }
 
     /// The remembered directory, if it still exists.
@@ -368,6 +394,33 @@ mod tests {
         // file with no opinion is in, not a state a request put it in
         let absent: Settings = serde_json::from_str("{}").unwrap();
         assert!(!absent.auto_suggest);
+    }
+
+    /// The raise switch decides whether a blocked stage is VISIBLE, and it is
+    /// the one switch here whose default is ON -- so both halves matter: a file
+    /// that says nothing must raise (the person never asked for silence), and a
+    /// file that says `false` must be honoured rather than overridden by the
+    /// default.
+    #[test]
+    fn the_raise_switch_defaults_on_and_a_no_is_remembered() {
+        let fresh = Settings::default();
+        assert_eq!(
+            fresh.raise_window, None,
+            "a fresh install has said nothing about it"
+        );
+        assert!(fresh.raises_window(), "saying nothing means raise");
+
+        let mut s = Settings::default();
+        s.raise_window = Some(false);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.raise_window, Some(false), "the no did not survive");
+        assert!(!back.raises_window(), "an explicit no must win over the default");
+
+        // and the ON answer survives a write/read too, so turning it back on is
+        // not silently lost either
+        s.raise_window = Some(true);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.raises_window());
     }
 
     /// The per-model weights are the one place a reviewer's judgement about a

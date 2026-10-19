@@ -52,6 +52,11 @@ pub struct Pick {
     /// launched by the caller, which also owns the settings file the choice is
     /// remembered in.
     pub gpu_browser: bool,
+    /// Lift the page's window to the front when a stage stops and waits for a
+    /// person (R). Not about how the work is done but about whether the person
+    /// can SEE that it has stopped -- a run blocked on a page nobody can see
+    /// looks exactly like a run still working.
+    pub raise_window: bool,
 }
 
 /// What the batch that just ran left behind, for the picker to hand back.
@@ -196,6 +201,10 @@ struct App {
     /// preference rather than a demand: it is remembered when a batch starts,
     /// and a machine whose user never touches it never sees a second browser.
     gpu_browser: bool,
+    /// Raise the waiting page's window to the front (R). It never takes the
+    /// keyboard focus, so it can be on by default without ever interrupting
+    /// someone typing elsewhere.
+    raise_window: bool,
     /// Feedback from the batch that just ran (drafted/skipped/failed) -- shown
     /// so an instant, all-skipped start is not silent.
     status: Option<String>,
@@ -262,6 +271,7 @@ impl App {
         throttle: Option<String>,
         auto_suggest: bool,
         gpu_browser: bool,
+        raise_window: bool,
         start: Option<PathBuf>,
         report: Report,
         dl_dir: Option<PathBuf>,
@@ -281,6 +291,7 @@ impl App {
             throttle,
             auto_suggest,
             gpu_browser,
+            raise_window,
             status: report.status,
             errors: !report.failures.is_empty(),
             err_off: 0,
@@ -316,7 +327,12 @@ impl App {
     /// this keeps those call sites about what they are actually testing.
     #[cfg(test)]
     fn plain(force: bool, autocrop: bool, crop_edit: bool, start: Option<PathBuf>, report: Report) -> Self {
-        Self::new(force, autocrop, crop_edit, None, false, false, start, report, None, Vec::new())
+        // `raise_window` gets its production default (on) rather than a made-up
+        // `false`: the three switches above default off and are spelled out
+        // here, but a picker under test should look like the one a user gets.
+        Self::new(
+            force, autocrop, crop_edit, None, false, false, true, start, report, None, Vec::new(),
+        )
     }
 
     /// Re-read the folder from disk, then rebuild the view. The ONLY entry
@@ -2766,6 +2782,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     ));
     opts.push(onoff(&t, t!("picker.toggle.autosuggest"), "O", app.auto_suggest));
     opts.push(onoff(&t, t!("picker.toggle.gpubrowser"), "W", app.gpu_browser));
+    opts.push(onoff(&t, t!("picker.toggle.raisewindow"), "H", app.raise_window));
     let opt_rows = pack_lines(opts, "   ", area.width, FOOT_MAX_ROWS);
 
     // The link key is advertised only when yt-dlp is installed: an offer the app
@@ -2800,6 +2817,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("P", t!("picker.act.throttle")),
             ("O", t!("picker.act.autosuggest")),
             ("W", t!("picker.act.gpubrowser")),
+            ("H", t!("picker.act.raisewindow")),
         ];
         if crate::dl::available() {
             v.push(("L", t!("picker.act.pastelink")));
@@ -3233,6 +3251,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Option<Pick>> {
                 throttle: app.throttle.clone(),
                 auto_suggest: app.auto_suggest,
                 gpu_browser: app.gpu_browser,
+                raise_window: app.raise_window,
                 dir: app.cur.clone(),
                 // only the marks that are in this batch: a mark left on a
                 // video the user did not start is not an instruction
@@ -3284,6 +3303,16 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Option<Pick>> {
         // whose user has no command line to pass `--gpu-browser` on.
         KeyCode::Char('w') | KeyCode::Char('W') => {
             app.gpu_browser = !app.gpu_browser;
+            crate::sound::play_click();
+        }
+        // Bring the waiting page's window to the front. Unlike the switches
+        // around it this does not change WHAT the run does, only whether the
+        // person can see that it is waiting on them -- which is why it defaults
+        // on: a stage blocked on a window nobody can see is indistinguishable
+        // from one still working. It never takes the keyboard focus, so leaving
+        // it on cannot interrupt someone typing elsewhere.
+        KeyCode::Char('h') | KeyCode::Char('H') => {
+            app.raise_window = !app.raise_window;
             crate::sound::play_click();
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -3371,13 +3400,17 @@ pub fn pick(
     throttle: Option<String>,
     auto_suggest: bool,
     gpu_browser: bool,
+    raise_window: bool,
     start: Option<PathBuf>,
     report: Report,
     dl_dir: Option<PathBuf>,
     dl_args: Vec<String>,
 ) -> Result<Option<Pick>> {
     let mut term = ratatui::init();
-    let mut app = App::new(force, autocrop, crop_edit, throttle, auto_suggest, gpu_browser, start, report, dl_dir, dl_args);
+    let mut app = App::new(
+        force, autocrop, crop_edit, throttle, auto_suggest, gpu_browser, raise_window, start,
+        report, dl_dir, dl_args,
+    );
     let r = run(&mut term, &mut app);
     // The pools outlive the screen otherwise, and the batch about to run wants
     // the disk (and, for a probe, the process table) to itself.
