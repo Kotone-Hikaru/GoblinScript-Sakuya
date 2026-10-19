@@ -31,10 +31,26 @@
 //! ## Which window
 //!
 //! Found by TITLE, matched case-insensitively against the page's own
-//! `<title>` (`GoblinScript review`, `GoblinScript crop`, ...). Titles are what
-//! the pages set themselves, they survive the window being reused across
-//! stages, and matching them needs no handle kept from a previous stage -- which
-//! is exactly what a long batch cannot promise.
+//! `<title>`, which is why the needle is the program name and not a page name:
+//! the pages translate their titles (`GoblinScript review` / `GoblinScript
+//! 校对`), but every one of them is prefixed with the program's own name, which
+//! is not translated.
+//!
+//! ⚠️ A title match alone is NOT enough, and finding that out cost a bug: the
+//! console this pipeline runs in is titled `GoblinScript` too (Windows Terminal
+//! reports `CASCADIA_HOSTING_WINDOW_CLASS`, conhost `ConsoleWindowClass`), so a
+//! bare substring search matches "the black box the run is printing into" just
+//! as readily as the browser. `EnumWindows` order is Z order, so which one came
+//! first was an accident of what the person had touched last.
+//!
+//! So the choice is made on the window CLASS, not only the title:
+//!
+//!   * a browser's top-level class is preferred (`Chrome_WidgetWin_1` covers
+//!     Chrome, Edge, Brave, Vivaldi and Opera; `MozillaWindowClass` Firefox);
+//!   * a terminal's class is NEVER chosen, whatever its title says -- raising a
+//!     console at somebody tells them nothing about the page that is waiting;
+//!   * any other class that matches the title is still accepted, so a browser
+//!     this list has not heard of (a WebView2 host, an exotic build) works.
 //!
 //! A browser puts every tab in one top-level window, so raising is per window
 //! and cannot pick a tab; the stage has already navigated the tab it owns, so
@@ -61,6 +77,57 @@ pub fn available() -> bool {
     imp::AVAILABLE
 }
 
+/// Is this window class a terminal -- the thing that must never be raised while
+/// a page is waiting?
+///
+/// Kept here, outside the `windows` module and free of any API, so the decision
+/// can be tested on any host. The cost of getting it wrong is not a crash: it is
+/// a black console jumping in front of the person and the page staying hidden.
+pub fn is_terminal_class(class: &str) -> bool {
+    matches!(
+        class,
+        "ConsoleWindowClass"          // conhost
+        | "CASCADIA_HOSTING_WINDOW_CLASS" // Windows Terminal
+        | "PseudoConsoleWindow"       // ConPTY hosts
+        | "mintty"                    // MSYS / Git Bash
+        | "VSCodeWindowClass"         // the editor's own terminal panel host
+    )
+}
+
+/// Is this window class a browser's top-level window?
+///
+/// `Chrome_WidgetWin_` is not one class but a family: Chrome, Edge, Brave,
+/// Vivaldi and Opera all report it with a version suffix, which is why this is a
+/// prefix test.
+pub fn is_browser_class(class: &str) -> bool {
+    class.starts_with("Chrome_WidgetWin_") || matches!(class, "MozillaWindowClass" | "IEFrame")
+}
+
+/// Which candidate to raise, given each window's `(class, title)` in
+/// `EnumWindows` order. `None` when nothing qualifies -- raising nothing is the
+/// right answer for "the page is not on screen".
+///
+/// Split out from the Win32 walk so the choice itself is a pure function: the
+/// bug this replaces was in the CHOICE, and a choice that can only be exercised
+/// by setting up a real desktop is a choice nobody checks.
+pub fn choose(cands: &[(String, String)], needle: &str) -> Option<usize> {
+    let needle = needle.to_lowercase();
+    let matches_title = |c: &(String, String)| c.1.to_lowercase().contains(&needle);
+
+    // A browser, first: that is the thing being waited on.
+    if let Some(i) = cands
+        .iter()
+        .position(|c| matches_title(c) && is_browser_class(&c.0))
+    {
+        return Some(i);
+    }
+    // Anything else that is not a terminal: a browser class this list has not
+    // heard of still gets raised rather than silently doing nothing.
+    cands
+        .iter()
+        .position(|c| matches_title(c) && !is_terminal_class(&c.0))
+}
+
 #[cfg(windows)]
 mod imp {
     use std::ffi::OsString;
@@ -71,14 +138,15 @@ mod imp {
     type Hwnd = isize;
     type Bool = i32;
 
-    // The four entry points this needs, declared by hand rather than pulling in
-    // a windows-* crate: the rest of the program adds no dependencies for
-    // platform calls, and five declarations are cheaper than a new tree.
+    // Declared by hand rather than pulling in a windows-* crate: the rest of the
+    // program adds no dependencies for platform calls, and a handful of
+    // declarations are cheaper than a new dependency tree.
     #[link(name = "user32")]
     extern "system" {
         fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> Bool, l: isize) -> Bool;
         fn GetWindowTextW(h: Hwnd, buf: *mut u16, n: i32) -> i32;
         fn GetWindowTextLengthW(h: Hwnd) -> i32;
+        fn GetClassNameW(h: Hwnd, buf: *mut u16, n: i32) -> i32;
         fn IsWindowVisible(h: Hwnd) -> Bool;
         fn IsIconic(h: Hwnd) -> Bool;
         fn ShowWindow(h: Hwnd, cmd: i32) -> Bool;
@@ -105,12 +173,26 @@ mod imp {
     // already-visible window actually get painted.
     const SWP_FLAGS: u32 = 0x0001 | 0x0002 | 0x0010 | 0x0040;
 
-    /// What `EnumWindows` is looking for, handed through the `lparam` as a raw
-    /// pointer. The callback runs on this thread, synchronously, inside the
-    /// `EnumWindows` call, so the borrow cannot outlive the struct.
+    /// Every visible window's `(hwnd, class, title)`, gathered in one pass.
+    ///
+    /// The whole list rather than the first hit, because the CHOICE needs to see
+    /// more than one candidate: the console and the browser can both be titled
+    /// with the program's name, and only their classes tell them apart.
+    /// `EnumWindows` order is Z order, which is what makes "first" meaningless
+    /// here -- it is whatever the person touched last.
     struct Search<'a> {
+        found: Vec<(Hwnd, String, String)>,
         needle: &'a str,
-        found: Option<Hwnd>,
+    }
+
+    fn wide_to_string(buf: &[u16], len: i32) -> String {
+        if len <= 0 {
+            return String::new();
+        }
+        let n = (len as usize).min(buf.len());
+        OsString::from_wide(&buf[..n])
+            .to_string_lossy()
+            .into_owned()
     }
 
     extern "system" fn visit(h: Hwnd, l: isize) -> Bool {
@@ -124,39 +206,46 @@ mod imp {
         if unsafe { IsWindowVisible(h) } == 0 {
             return 1;
         }
-        let len = unsafe { GetWindowTextLengthW(h) };
-        if len <= 0 {
+        let tlen = unsafe { GetWindowTextLengthW(h) };
+        if tlen <= 0 {
             return 1;
         }
-        let mut buf = vec![0u16; len as usize + 1];
-        let got = unsafe { GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32) };
-        if got <= 0 {
+        let mut tbuf = vec![0u16; tlen as usize + 1];
+        let tgot = unsafe { GetWindowTextW(h, tbuf.as_mut_ptr(), tbuf.len() as i32) };
+        let title = wide_to_string(&tbuf, tgot);
+        // Cheap rejection before the class lookup: most windows are titled
+        // something else entirely.
+        if !title.to_lowercase().contains(s.needle) {
             return 1;
         }
-        buf.truncate(got as usize);
-        let title = OsString::from_wide(&buf).to_string_lossy().to_lowercase();
-        if title.contains(s.needle) {
-            s.found = Some(h);
-            return 0; // stop: the first match is the one to raise
-        }
-        1
+        let mut cbuf = vec![0u16; 256];
+        let cgot = unsafe { GetClassNameW(h, cbuf.as_mut_ptr(), cbuf.len() as i32) };
+        let class = wide_to_string(&cbuf, cgot);
+        s.found.push((h, class, title));
+        1 // keep going: a later candidate may be the browser
     }
 
     pub fn raise_by_title(needle: &str) -> bool {
-        let needle = needle.to_lowercase();
+        let lower = needle.to_lowercase();
         let mut search = Search {
-            needle: &needle,
-            found: None,
+            found: Vec::new(),
+            needle: &lower,
         };
         // SAFETY: the callback only reads/writes the `Search` it is handed, and
         // `EnumWindows` calls it synchronously before returning.
         unsafe {
             EnumWindows(visit, &mut search as *mut Search as isize);
         }
-        let h = match search.found {
-            Some(h) => h,
+        let cands: Vec<(String, String)> = search
+            .found
+            .iter()
+            .map(|(_, c, t)| (c.clone(), t.clone()))
+            .collect();
+        let idx = match super::choose(&cands, &lower) {
+            Some(i) => i,
             None => return false,
         };
+        let h = search.found[idx].0;
 
         // A minimised window has no place in the Z order to be raised to, so it
         // is restored first -- still without activation. SHOWNOACTIVATE so the
@@ -196,6 +285,10 @@ mod imp {
 mod tests {
     use super::*;
 
+    fn pair(class: &str, title: &str) -> (String, String) {
+        (class.to_string(), title.to_string())
+    }
+
     /// The title the pages actually set -- the match is on the page's own
     /// `<title>`, so a rename there must be caught here rather than discovered
     /// as "the window never comes up".
@@ -217,6 +310,84 @@ mod tests {
                 "{name}'s title is {:?}, which the raise would never match",
                 &rest[..end]
             );
+        }
+    }
+
+    /// THE BUG THIS REPLACED. The console this pipeline runs in is titled
+    /// `GoblinScript`, exactly like the pages are, and `EnumWindows` hands
+    /// windows over in Z order -- so "first title match" could raise the black
+    /// console box and leave the page hidden. Both are in this list, the
+    /// console first, and the browser must still win.
+    #[test]
+    fn the_console_never_wins_over_the_browser() {
+        let cands = [
+            pair("CASCADIA_HOSTING_WINDOW_CLASS", "GoblinScript"),
+            pair("Chrome_WidgetWin_1", "GoblinScript 校对 - Google Chrome"),
+        ];
+        assert_eq!(choose(&cands, "goblinscript"), Some(1));
+
+        // ...and the order must not matter: put the browser first and the answer
+        // is still the browser, for the right reason rather than by luck
+        let flipped = [cands[1].clone(), cands[0].clone()];
+        assert_eq!(choose(&flipped, "goblinscript"), Some(0));
+    }
+
+    /// A terminal on its own is NOT raised. Bringing a console forward tells the
+    /// person nothing about the page that is waiting, so "nothing happened" is
+    /// the correct outcome.
+    #[test]
+    fn a_console_alone_is_never_raised() {
+        for class in [
+            "ConsoleWindowClass",
+            "CASCADIA_HOSTING_WINDOW_CLASS",
+            "PseudoConsoleWindow",
+            "mintty",
+        ] {
+            let cands = [pair(class, "GoblinScript")];
+            assert_eq!(
+                choose(&cands, "goblinscript"),
+                None,
+                "{class} must never be raised"
+            );
+        }
+    }
+
+    /// A browser class this list has not heard of still works, so a WebView2
+    /// host or an exotic build is not silently unsupported.
+    #[test]
+    fn an_unknown_browser_still_gets_raised() {
+        let cands = [pair("SomeNewBrowserWindow", "GoblinScript review")];
+        assert_eq!(choose(&cands, "goblinscript"), Some(0));
+    }
+
+    /// Titles are matched case-insensitively, and a window titled something else
+    /// entirely is not a candidate at all.
+    #[test]
+    fn only_the_programs_own_windows_are_candidates() {
+        let cands = [
+            pair("Chrome_WidgetWin_1", "Some other tab - Google Chrome"),
+            pair("Chrome_WidgetWin_1", "GOBLINSCRIPT CROP - Google Chrome"),
+        ];
+        assert_eq!(choose(&cands, "goblinscript"), Some(1));
+        let none = [pair("Chrome_WidgetWin_1", "Some other tab - Google Chrome")];
+        assert_eq!(choose(&none, "goblinscript"), None);
+    }
+
+    /// Every class this program cares about is recognised by name, not by
+    /// accident of a substring: `Chrome_WidgetWin_1` is a browser while
+    /// `ConsoleWindowClass` is a terminal, and neither is the other.
+    #[test]
+    fn the_class_families_do_not_overlap() {
+        assert!(is_browser_class("Chrome_WidgetWin_1"));
+        assert!(is_browser_class("Chrome_WidgetWin_0"));
+        assert!(is_browser_class("MozillaWindowClass"));
+        assert!(!is_browser_class("ConsoleWindowClass"));
+        assert!(is_terminal_class("ConsoleWindowClass"));
+        for b in ["Chrome_WidgetWin_1", "MozillaWindowClass"] {
+            assert!(!is_terminal_class(b), "{b} is not a terminal");
+        }
+        for t in ["ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"] {
+            assert!(!is_browser_class(t), "{t} is not a browser");
         }
     }
 
