@@ -179,9 +179,24 @@
                     re-rasterised by the compositor at the magnified scale,
                     which quietly throws the saving away. Doing the blur inside
                     a small canvas cannot be undone that way, because by the
-                    time it reaches the compositor it is just a bitmap. */
-  #shelterImg, #shelterBlur { position: absolute; inset: 0; width: 100%; height: 100%;
-                              pointer-events: none; z-index: 4; }
+                    time it reaches the compositor it is just a bitmap.
+
+     NO z-index here, deliberately. They are absolutely positioned and come
+     after the <video> in the DOM, which is enough to cover it -- while the
+     readouts (the simulator bar, the crop rect, the confidence note) come after
+     them and therefore paint ON TOP. Giving these a positive z-index put the
+     covers over the simulator's position bar, hiding the one readout that has
+     to stay visible while the picture is hidden.
+
+     The frost canvas is NOT stretched to the stage. The video is drawn with
+     `object-fit: contain`, so the picture is letterboxed inside the stage, and
+     a stage-shaped cover would have to squeeze that picture into the wrong
+     aspect -- visibly, as a horizontal smear. So the canvas is placed by
+     `sizeShelterBlur()` over the LETTERBOXED PICTURE RECT and its backing store
+     is built at the same aspect as the video: sampling then maps 1:1 and the
+     frost inherits the picture's proportions instead of inventing new ones. */
+  #shelterImg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #shelterBlur { position: absolute; pointer-events: none; }
   #shelterImg { background:
       repeating-linear-gradient(45deg, rgba(255,255,255,.05) 0 2px, rgba(0,0,0,0) 2px 4px),
       radial-gradient(circle at 28% 30%, rgba(190,212,244,.30), rgba(0,0,0,0) 62%),
@@ -3125,16 +3140,40 @@ let shelter = 'off';
 // is driven from `tick` so it follows the playhead like every other layer.
 const SHELTER_DIV = 8;          // the canvas is 1/8 of the stage, each way
 const SHELTER_BLUR = 6;         // px at canvas scale = ~48 px on screen at 8x
+/** Where the video is actually PAINTED inside the stage, in stage-local px.
+ *
+ *  `object-fit: contain` letterboxes the picture: the element fills the stage,
+ *  but the pixels land in a smaller rect centred in it. The frost has to sit on
+ *  THAT rect, not on the element's box, or it covers the black bars and -- if it
+ *  also mismatches the aspect -- squashes the picture. This is the same
+ *  arithmetic `#croprect` uses to line its rect up with the frame. */
+function pictureRect() {
+  const st = $('stage');
+  const W = st.clientWidth, H = st.clientHeight;
+  const vw = vid.videoWidth, vh = vid.videoHeight;
+  // before metadata arrives there is no aspect to honour; fall back to the stage
+  if (!(vw > 0 && vh > 0)) return [0, 0, W, H];
+  const scale = Math.min(W / vw, H / vh);
+  const w = vw * scale, h = vh * scale;
+  return [(W - w) / 2, (H - h) / 2, w, h];
+}
 function sizeShelterBlur() {
   const c = $('shelterBlur');
   if (!c) return;
-  const st = $('stage');
-  // Layout size, not devicePixelRatio: this canvas exists to be CHEAP, and its
-  // pixels are all going to be smeared anyway. Backing it at dpr would multiply
-  // the very thing the cover is meant to shrink.
-  const w = Math.max(16, Math.round(st.clientWidth / SHELTER_DIV));
-  const h = Math.max(9, Math.round(st.clientHeight / SHELTER_DIV));
-  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  const [x, y, w, h] = pictureRect();
+  // Sit the canvas exactly on the letterboxed picture. CSS size = the picture's
+  // own box; the backing store is 1/8 of that, so the browser scales one small
+  // bitmap up to it.
+  c.style.left = x + 'px';
+  c.style.top = y + 'px';
+  c.style.width = w + 'px';
+  c.style.height = h + 'px';
+  // Backing size as 1/8 of the PICTURE (not of the stage), and NOT multiplied
+  // by devicePixelRatio: this canvas exists to be cheap, and every pixel of it
+  // is about to be smeared anyway.
+  const bw = Math.max(16, Math.round(w / SHELTER_DIV));
+  const bh = Math.max(9, Math.round(h / SHELTER_DIV));
+  if (c.width !== bw || c.height !== bh) { c.width = bw; c.height = bh; }
 }
 /** Draw one frame of the frosted cover. Called from `tick` while it is up. */
 function paintShelter() {
@@ -3148,9 +3187,11 @@ function paintShelter() {
   // this small canvas, so it costs 1/64 of a full-surface pass.
   g.filter = 'blur(' + SHELTER_BLUR + 'px)';
   try {
-    // cover, not contain: the canvas is the stage's aspect, the video's is its
-    // own, and letterboxing a blurred cover would put sharp black bars back on
-    // screen -- which is precisely what it is hiding.
+    // Fill the canvas: its aspect is the PICTURE's aspect (see pictureRect), so
+    // filling it neither stretches the picture nor leaves bars inside it. The
+    // blur pulls colour in from outside the edge for the first few pixels, which
+    // is why the whole rect is covered rather than the picture being shrunk
+    // inside it -- a shrunken draw would show the frame's own edge as a ring.
     g.drawImage(vid, 0, 0, c.width, c.height);
   } catch (e) {
     // a frame not ready yet: leave the canvas as it was rather than clearing it
