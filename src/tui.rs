@@ -916,7 +916,7 @@ fn logo_rows(
     let mut l1 = vec![
         art(1),
         Span::styled("    GoblinScript", gb),
-        Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), ver),
+        Span::styled(concat!(" v", env!("GS_VERSION")), ver),
     ];
     let mut l2 = vec![art(2), Span::styled(format!("    {}", t!("app.tagline")), tag)];
     let mut l3 = vec![art(3)];
@@ -1229,7 +1229,7 @@ fn draw_intro(f: &mut Frame, t: f32) {
 
         // The version, centred just under the wordmark, easing in once the
         // letters have settled -- the goblin signs its work with a build number.
-        let ver: Vec<char> = concat!("v", env!("CARGO_PKG_VERSION")).chars().collect();
+        let ver: Vec<char> = concat!("v", env!("GS_VERSION")).chars().collect();
         let vin = ((t - 1.0) / 0.5).clamp(0.0, 1.0) * dim; // fade in after the drop
         if vin > 0.0 {
             let vx = ox + (word_cols - ver.len() as i32) / 2;
@@ -1268,7 +1268,7 @@ fn draw_intro(f: &mut Frame, t: f32) {
         let msg = marquee(&format!(
             "  ***  {}  ***  GOBLINSCRIPT v{}  ***  {}  ",
             t!("app.tagline"),
-            env!("CARGO_PKG_VERSION"),
+            env!("GS_VERSION"),
             t!("picker.intro.anykey"),
         ));
         let n = msg.len() as i32;

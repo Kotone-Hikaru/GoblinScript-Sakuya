@@ -188,7 +188,7 @@ pub fn serve(mut cli: Cli, b: Bundle, cache_root: PathBuf, params: style::Params
     // parse. Everything the console prints after it is the drafting log.
     {
         let hello = serde_json::json!({
-            "goblinscript": env!("CARGO_PKG_VERSION"),
+            "goblinscript": env!("GS_VERSION"),
             "port": port,
             "token": token,
             "checkpoint": man.checkpoint,
@@ -295,7 +295,7 @@ fn route(
     let find = |id: &str| sessions.lock().unwrap().get(id).cloned();
     match (method, parts) {
         (Method::Get, ["health"]) => Reply::Json(serde_json::json!({
-            "goblinscript": env!("CARGO_PKG_VERSION"),
+            "goblinscript": env!("GS_VERSION"),
             "checkpoint": man.checkpoint,
             "basis_id": man.basis_id,
             "encoder": man.encoder,

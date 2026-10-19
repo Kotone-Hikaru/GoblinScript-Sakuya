@@ -135,7 +135,7 @@ pub fn record_fatal(e: &anyhow::Error) -> Option<PathBuf> {
 fn header() -> String {
     format!(
         "\n==== goblinscript {} on {} -- run started {} ====\n",
-        env!("CARGO_PKG_VERSION"),
+        env!("GS_VERSION"),
         std::env::consts::OS,
         stamp(now())
     )

@@ -589,7 +589,7 @@ const MIN_CORRIDOR: u16 = PITCH * 4;
 /// art, both of which start four columns past the block. In COLUMNS -- the
 /// tagline is translated, and a byte count would put the rule's end inside a
 /// multi-byte glyph.
-const WORDMARK: &str = concat!("GoblinScript v", env!("CARGO_PKG_VERSION"));
+const WORDMARK: &str = concat!("GoblinScript v", env!("GS_VERSION"));
 
 fn tagline() -> &'static str {
     crate::t!("app.tagline")
@@ -805,7 +805,7 @@ pub fn header_rows_at(width: u16, tick: usize, dancing: bool) -> Vec<String> {
             "{}    {}{}",
             art(1),
             style("GoblinScript").fg(con(t.accent)).bold(),
-            style(concat!(" v", env!("CARGO_PKG_VERSION"))).fg(con(t.muted)),
+            style(concat!(" v", env!("GS_VERSION"))).fg(con(t.muted)),
         ),
         format!("{}    {}", art(2), style(tagline()).fg(con(t.accent))),
         art(3).to_string(),

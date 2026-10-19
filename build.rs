@@ -24,8 +24,77 @@ fn main() {
             println!("cargo:warning=goblin resources not embedded ({e})");
         }
     }
+    version();
     soundtrack();
     packs();
+}
+
+/// The four-part version this binary reports: `<cargo version>.<commit count>`.
+///
+/// Cargo's `version` accepts exactly three dot-separated numbers, so the fourth
+/// part cannot live there. It is baked in here instead, as `GS_VERSION`, and
+/// every place that shows a version reads that: `--version`, the BIOS banner,
+/// the picker's wordmark, the marquee, the error log's header and the serve
+/// handshake all agree because they all read one string.
+///
+/// The fourth part counts commits since the `spans-base` tag -- the fork's own
+/// baseline -- so it measures THIS work, not upstream's history, and it does not
+/// move when upstream is fetched. It is a count of commits, not of builds: three
+/// rebuilds of one commit all say the same thing, which is the point.
+///
+/// Delay is not a failure: no git, no tag, or a source tarball with no `.git`
+/// all fall back to `0` with a build warning. A checkout that cannot answer the
+/// question still has to produce a binary.
+fn version() {
+    // Re-run when the commit history moves. `.git/HEAD` covers checkout/switch;
+    // the branch ref covers a new commit; `logs/HEAD` covers amend and rebase,
+    // which rewrite history without changing the count in an obvious file.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/logs/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(refname) = head.strip_prefix("ref: ").map(str::trim) {
+            println!("cargo:rerun-if-changed=.git/{refname}");
+        }
+    }
+
+    let base = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    // An explicit override, for a build with no repository at all.
+    let n = match std::env::var("GS_COMMITS") {
+        Ok(v) => v.parse::<u32>().ok(),
+        Err(_) => count_commits(),
+    };
+    let (n, part) = match n {
+        Some(n) => (n, n.to_string()),
+        None => {
+            println!(
+                "cargo:warning=commit count unavailable (no git, no `spans-base` tag, or no \
+                 `.git`) -- the version will read {base}.0"
+            );
+            (0, "0".to_string())
+        }
+    };
+    let _ = n;
+    println!("cargo:rustc-env=GS_VERSION={base}.{part}");
+}
+
+/// Commits since `spans-base`, or `None` when git cannot answer.
+///
+/// `spans-base` rather than `origin/main`: the upstream ref is moved by any
+/// `git fetch`, so a count taken from it can go DOWN after a fetch -- a version
+/// number that runs backwards is worse than none. The tag is the fork's own
+/// fixed anchor.
+fn count_commits() -> Option<u32> {
+    let out = std::process::Command::new("git")
+        // Never let a credential prompt or a pager hang a build.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .args(["rev-list", "--count", "spans-base..HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
 /// Write `$OUT_DIR/packs.rs`: a `PACKS` table of (name, head, mask, env_step)

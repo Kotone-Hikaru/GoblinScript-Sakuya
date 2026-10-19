@@ -1,6 +1,9 @@
 [package]
 name = "goblinscript"
-version = "0.6.0"
+# THREE parts, because cargo allows exactly three. The fourth -- the commit
+# count -- is baked in by build.rs as `GS_VERSION` and is what everything
+# displays; see `version()` there for why it cannot live in this line.
+version = "0.6.3"
 edition = "2021"
 description = "Video in, funscript out. Made by real goblins: frozen V-JEPA 2.1 perception + the trained head, as one CLI."
 license = "MIT"

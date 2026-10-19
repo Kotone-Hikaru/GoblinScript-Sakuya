@@ -49,7 +49,7 @@ use std::time::Duration;
 
 /// Stamped into every funscript's `metadata.author`, so a written file carries
 /// the tool and build that made it -- "GoblinScript v0.2.0".
-const AUTHOR: &str = concat!("GoblinScript v", env!("CARGO_PKG_VERSION"));
+const AUTHOR: &str = concat!("GoblinScript v", env!("GS_VERSION"));
 
 /// Stamped into every funscript's `metadata.tags`, marking provenance so a
 /// player or library can tell a machine-drafted script from a hand-authored
@@ -70,7 +70,12 @@ use bundle::Bundle;
 use cache::{Cache, CacheMeta};
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "goblinscript", version, about = "Video in, funscript out. Made by real goblins.")]
+// `version = env!("GS_VERSION")` rather than the bare `version` flag: the bare
+// form reads cargo's THREE-part version, while the four-part one -- with the
+// commit count -- is what `build.rs` bakes in. Every other place that shows a
+// version reads the same string, so `--version`, the BIOS banner, the picker's
+// wordmark and the error log can never disagree about which build this is.
+#[command(name = "goblinscript", version = env!("GS_VERSION"), about = "Video in, funscript out. Made by real goblins.")]
 struct Cli {
     /// Video file(s) to draft, a FOLDER (every video in it, sub-folders not
     /// searched), or http(s) link(s) to fetch and then draft (that needs yt-dlp
@@ -4533,7 +4538,42 @@ mod funscript_tests {
     fn author_always_present_and_versioned() {
         let out = render();
         assert!(out.contains(&format!("\"author\":\"{AUTHOR}\"")), "{out}");
-        assert!(AUTHOR.contains(env!("CARGO_PKG_VERSION")), "author carries version");
+        assert!(AUTHOR.contains(env!("GS_VERSION")), "author carries version");
+    }
+
+    /// The version is FOUR parts: `<major>.<source>.<milestone>.<commits>`.
+    ///
+    /// Cargo only accepts three, so `build.rs` appends the commit count and
+    /// bakes the result in as `GS_VERSION` -- and every surface reads that one
+    /// string. This pins the shape so a future edit cannot quietly drop back to
+    /// three parts (or hand-roll a second, disagreeing version somewhere).
+    ///
+    /// The first three parts MUST equal `CARGO_PKG_VERSION`: if they drift, the
+    /// string in the binary and the version in `Cargo.toml` have started telling
+    /// different stories, which is the failure this mechanism exists to prevent.
+    #[test]
+    fn the_version_is_four_parts_and_agrees_with_cargo() {
+        let v = env!("GS_VERSION");
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "the version must be <major>.<source>.<milestone>.<commits>, got {v:?}"
+        );
+        for (i, p) in parts.iter().enumerate() {
+            assert!(
+                !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()),
+                "part {} of {v:?} is not a number: {p:?}",
+                i + 1
+            );
+        }
+        let first_three = parts[..3].join(".");
+        assert_eq!(
+            first_three,
+            env!("CARGO_PKG_VERSION"),
+            "the first three parts must be cargo's own version, or the binary and \
+             Cargo.toml disagree"
+        );
     }
 
     // Provenance is stamped on every file: a generated script is marked as one.

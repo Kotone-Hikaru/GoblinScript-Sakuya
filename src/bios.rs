@@ -226,7 +226,7 @@ impl Post {
             art(0),
             head(&format!(
                 "GOBLIN INDUSTRIES (R) SCRIPT BIOS v{}",
-                env!("CARGO_PKG_VERSION")
+                env!("GS_VERSION")
             ))
         );
         self.hold(BANNER_MS);
