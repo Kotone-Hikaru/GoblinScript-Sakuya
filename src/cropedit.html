@@ -36,6 +36,31 @@
   video { width: 100%; height: 100%; object-fit: contain; display: block; }
   #shade { position: absolute; inset: 0; pointer-events: none; }
   #shade > div { position: absolute; background: rgba(0,0,0,.62); }
+  /* ---- the shelter ----------------------------------------------------
+     Same two covers as the review page, and here for the same reason: this
+     page is stared at for minutes while a decision is made, and the material
+     is not something to leave on screen. Neither cover takes pointer events,
+     so the rect, the grips and the shade all keep working underneath -- the
+     work is editing a rect, which does not require seeing the picture.
+
+     NO z-index, deliberately (the review page learned this the hard way): the
+     covers come right after the <video> in the DOM, which is enough to hide it,
+     while #shade and #rect come after THEM and therefore paint on top. Giving
+     these a z-index put the cover over the drag handles.
+
+     The frost canvas is placed on the letterboxed PICTURE rect by
+     sizeShelterBlur(), not stretched over the stage, so it inherits the video's
+     proportions instead of squashing them. */
+  #shelterImg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #shelterImg { background:
+      repeating-linear-gradient(45deg, rgba(255,255,255,.05) 0 2px, rgba(0,0,0,0) 2px 4px),
+      radial-gradient(circle at 28% 30%, rgba(190,212,244,.30), rgba(0,0,0,0) 62%),
+      radial-gradient(circle at 72% 74%, rgba(246,222,200,.24), rgba(0,0,0,0) 58%),
+      #20242b; }
+  #shelterBlur { position: absolute; pointer-events: none; }
+  #shelterImg.hidden, #shelterBlur.hidden { display: none; }
+  .sheltersw .mode + .mode { border-left: 2px solid var(--edge); }
+  #shelterStill.on, #shelterFrost.on { background: var(--hi-bright); color: #0e130c; }
   #rect { position: absolute; border: 2px solid var(--hi); cursor: move; }
   #rect.hand { border-color: var(--hi-bright); border-style: solid; box-shadow: 0 0 0 1px #0e130c inset; }
   .grip { position: absolute; width: 14px; height: 14px; background: var(--hi);
@@ -106,6 +131,12 @@
   <div id="left">
     <div id="stage">
       <video id="vid" src="/video" preload="metadata"></video>
+      <!-- The two covers (see the CSS). Right after the video, so everything
+           that comes after them -- the shade, the rect, its grips -- stays on
+           top. They take no pointer events: the rect is still draggable with
+           the picture hidden, which is what makes this usable at all. -->
+      <div id="shelterImg" class="hidden"></div>
+      <canvas id="shelterBlur" class="hidden"></canvas>
       <div id="shade">
         <div id="sh-t"></div><div id="sh-b"></div><div id="sh-l"></div><div id="sh-r"></div>
       </div>
@@ -132,6 +163,14 @@
       <button id="gview" data-t="cpage.gview">goblin view</button>
       <button id="split" data-t="cpage.split">split here</button>
       <button id="unsplit" data-t="cpage.unsplit">join back</button>
+      <!-- The shelter. Two buttons, each a TOGGLE (pressing the lit one brings
+           the picture back), so two buttons cover three states and the state is
+           visible. They do not pause or seek anything: the point is to keep
+           working with the picture hidden, not to stop working. -->
+      <span class="sheltersw" data-t-title="cpage.shelter.tip">
+        <button id="shelterStill" data-t="cpage.shelter.still">still</button>
+        <button id="shelterFrost" data-t="cpage.shelter.frost">frost</button>
+      </span>
       <span class="note" id="clock">0:00 / 0:00</span>
       <span class="note" id="zoom"></span>
     </div>
@@ -222,6 +261,84 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 function fix(r) {
   const w = clamp(r[2], cap, 1), h = clamp(r[3], cap, 1);
   return [clamp(r[0], 0, 1 - w), clamp(r[1], 0, 1 - h), w, h];
+}
+
+// ---- the shelter: hiding the picture --------------------------------------
+//
+// Same three states as the review page, and the same reasoning behind them:
+//
+//   'off'   nothing over the picture
+//   'still' #shelterImg, an opaque div with a static CSS texture
+//   'frost' #shelterBlur, a canvas 1/8 the PICTURE's size, blurred AT THAT SIZE
+//           with ctx.filter, then scaled up by CSS
+//
+// The stage is edited with the picture hidden, which is the whole point: a rect
+// is moved while the thing inside it is unreadable, and that works because the
+// rect's geometry does not depend on the pixels under it.
+//
+// The blur must happen INSIDE the small canvas. `filter: blur()` on the video
+// plus `transform: scale(8)` does not save the work: the compositor rasterises a
+// filtered layer at the size it is finally drawn at, so the blur re-runs at the
+// magnified scale. A blur done in a small canvas reaches the compositor as a
+// finished bitmap and cannot be undone that way.
+let shelter = 'off';
+const SHELTER_DIV = 8;          // the canvas is 1/8 of the picture, each way
+const SHELTER_BLUR = 6;         // px at canvas scale = ~48 px on screen at 8x
+
+/** Put the canvas exactly on the letterboxed picture and size its backing store
+ *  to 1/8 of it.
+ *
+ *  `picBox()` already knows where the picture is (the rect is drawn with the same
+ *  arithmetic), so the frost sits on the SAME rectangle the crop applies to --
+ *  which is also the honest answer to "what will the goblins see". */
+function sizeShelterBlur() {
+  const c = $('shelterBlur');
+  if (!c) return;
+  const b = picBox();
+  const st = $('stage').getBoundingClientRect();
+  c.style.left = (b.x - st.left) + 'px';
+  c.style.top = (b.y - st.top) + 'px';
+  c.style.width = b.w + 'px';
+  c.style.height = b.h + 'px';
+  // NOT multiplied by devicePixelRatio: this canvas exists to be cheap, and
+  // every pixel of it is about to be smeared anyway.
+  const bw = Math.max(16, Math.round(b.w / SHELTER_DIV));
+  const bh = Math.max(9, Math.round(b.h / SHELTER_DIV));
+  if (c.width !== bw || c.height !== bh) { c.width = bw; c.height = bh; }
+}
+
+/** Draw one frame of the frosted cover -- only while it is up. */
+function paintShelter() {
+  if (shelter !== 'frost') return;
+  const c = $('shelterBlur');
+  if (!c) return;
+  sizeShelterBlur();
+  const g = c.getContext('2d');
+  if (!g) return;
+  // `ctx.filter` is the important half: the blur is applied while drawing INTO
+  // this small canvas, so it costs 1/64 of a full-surface pass.
+  g.filter = 'blur(' + SHELTER_BLUR + 'px)';
+  try {
+    g.drawImage(vid, 0, 0, c.width, c.height);
+  } catch (e) {
+    // a frame not ready yet: leave the canvas as it was rather than clearing it
+    // to transparency, which would flash the picture through
+  }
+  g.filter = 'none';
+}
+
+function labelShelter() {
+  const s = $('shelterStill'), f = $('shelterFrost');
+  if (s) s.classList.toggle('on', shelter === 'still');
+  if (f) f.classList.toggle('on', shelter === 'frost');
+}
+
+function setShelter(mode) {
+  shelter = (mode === 'still' || mode === 'frost') ? mode : 'off';
+  $('shelterImg').classList.toggle('hidden', shelter !== 'still');
+  $('shelterBlur').classList.toggle('hidden', shelter !== 'frost');
+  labelShelter();
+  if (shelter === 'frost') paintShelter();
 }
 
 // ---- drawing -------------------------------------------------------------
@@ -591,6 +708,14 @@ function render() {
 for (const ev of ['timeupdate', 'seeked', 'seeking', 'play', 'pause']) {
   vid.addEventListener(ev, render);
 }
+// The frost samples the frame, so it has to be repainted wherever the picture
+// changes -- on the same events the rect is drawn on, plus a seek while PAUSED,
+// which is how this page is actually used (park on a shot, judge the rect). A
+// cover that only refreshed while playing would leave the previous frame on
+// screen, which for a privacy cover is the failure it exists to prevent.
+for (const ev of ['timeupdate', 'seeked', 'seeking', 'play', 'pause', 'loadeddata', 'resize']) {
+  vid.addEventListener(ev, () => { if (shelter === 'frost') paintShelter(); });
+}
 vid.addEventListener('timeupdate', () => {
   // loop the shot being judged: the action inside a rect repeats until the
   // rect is right, without a hand on the bar
@@ -601,6 +726,9 @@ vid.addEventListener('timeupdate', () => {
 });
 vid.addEventListener('loadedmetadata', () => { drawAll(); render(); });
 addEventListener('resize', drawRect);
+// A window resize changes where the picture sits, so the frost has to follow it
+// or it would cover the wrong rectangle.
+addEventListener('resize', () => { if (shelter === 'frost') paintShelter(); });
 
 // Keys: the arrows are the TRANSPORT (this page is watched more than it is
 // drawn on), WASD nudges the rect, R puts the goblins' own rect back.
@@ -636,8 +764,18 @@ addEventListener('keydown', e => {
     // cannot, so it is a key and not a hidden gesture
     case 'Enter': e.preventDefault(); splitHere(); break;
     case 'Delete': case 'Backspace': e.preventDefault(); unsplitHere(); break;
+    // the shelter, cycled by one key: off -> still -> frost -> off. One key
+    // rather than a choice, because it is reached for suddenly, when someone
+    // walks in -- that is not a moment to be picking between two covers.
+    case 'h': case 'H':
+      setShelter(shelter === 'off' ? 'still' : shelter === 'still' ? 'frost' : 'off');
+      break;
   }
 });
+// Each button is a TOGGLE: pressing the lit one puts the picture back, so two
+// buttons cover three states and the state is visible.
+$('shelterStill').onclick = () => setShelter(shelter === 'still' ? 'off' : 'still');
+$('shelterFrost').onclick = () => setShelter(shelter === 'frost' ? 'off' : 'frost');
 function nudge(r) { segs[cur].rect = fix(r); drawRect(); post({ i: cur, rect: segs[cur].rect }); }
 
 // ---- is anybody there? ---------------------------------------------------
