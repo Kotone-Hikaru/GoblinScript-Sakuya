@@ -118,19 +118,55 @@ pub fn deliver(url: &str, open: bool) {
     raise_soon();
 }
 
+/// Wait this long before the first attempt. The delay is for the HAND-OFF case:
+/// there the window is already up on the PREVIOUS page and is about to
+/// navigate. Raising it immediately would still work, but the title the search
+/// matches on belongs to the page being left, and a browser that has not yet
+/// committed the new document can be mid-swap. A few hundred milliseconds puts
+/// the raise after the page has arrived, so what comes to the front is the
+/// stage that is actually waiting.
+const RAISE_AFTER: Duration = Duration::from_millis(400);
+
+/// How long to keep trying after that. A COLD launch -- no browser of ours
+/// running yet, which is the first page of every batch -- takes longer than
+/// [`RAISE_AFTER`] to put a window up at all: measured on this machine, the
+/// window exists at 484-677 ms and not at 400 ms. A single attempt therefore
+/// missed it every time, and the stage waited behind whatever the person had
+/// open. Looking again for a few seconds is the whole fix; nothing else about
+/// the raise changes.
+const RAISE_FOR: Duration = Duration::from_secs(6);
+
+/// How often to look while the window is not there yet. Short enough that the
+/// raise lands within a frame or two of the window appearing, long enough that
+/// the desktop walk is not a busy loop.
+const RAISE_EVERY: Duration = Duration::from_millis(150);
+
+/// Try to raise, retrying until it lands or `tries` runs out.
+///
+/// Split out from the thread so the RETRY itself can be exercised: a single
+/// attempt was the bug, and a single attempt is exactly what a test cannot tell
+/// apart from a loop that never gets a second turn.
+fn keep_raising<F>(mut raise: F, tries: usize, every: Duration) -> bool
+where
+    F: FnMut() -> bool,
+{
+    for i in 0..tries {
+        if i > 0 {
+            std::thread::sleep(every);
+        }
+        if raise() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Lift the page's window to the front, shortly, without blocking the caller.
 ///
 /// A stage calls [`deliver`] and then gets on with its own work -- it must not
 /// wait on the desktop, and on a build with no switch (or no Windows) there is
 /// nothing to wait for at all. So this only runs when the setting says so, and
 /// it runs on its own thread.
-///
-/// The short delay is for the HAND-OFF case: there the window is already up on
-/// the PREVIOUS page and is about to navigate. Raising it immediately would
-/// still work, but the title the search matches on belongs to the page being
-/// left, and a browser that has not yet committed the new document can be
-/// mid-swap. A few hundred milliseconds puts the raise after the page has
-/// arrived, so what comes to the front is the stage that is actually waiting.
 fn raise_soon() {
     if !crate::settings::Settings::load().raises_window() {
         return;
@@ -139,10 +175,15 @@ fn raise_soon() {
         return;
     }
     std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(RAISE_AFTER);
         // The answer is deliberately ignored: no window on screen, or a desktop
         // that refused, is not an error in the pipeline. The stage still runs.
-        let _ = crate::raise::raise_by_title("goblinscript");
+        let tries = (RAISE_FOR.as_millis() / RAISE_EVERY.as_millis()).max(1) as usize;
+        let _ = keep_raising(
+            || crate::raise::raise_by_title("goblinscript"),
+            tries,
+            RAISE_EVERY,
+        );
     });
 }
 
@@ -189,5 +230,74 @@ mod tests {
         assert!(!hand_off("http://127.0.0.1:4/"));
         assert!(!parked(), "a dead window is not left behind");
         left();
+    }
+
+    /// THE BUG THIS REPLACES, in miniature. A cold launch puts its window up
+    /// after the first attempt has already run, so a single attempt misses it
+    /// and the stage waits behind whatever the person had open. The retry is
+    /// what makes the raise land; one attempt is not.
+    #[test]
+    fn a_raise_that_arrives_late_still_lands() {
+        let mut calls = 0;
+        let landed = keep_raising(
+            || {
+                calls += 1;
+                // the window is only there from the third look onwards
+                calls >= 3
+            },
+            40,
+            Duration::ZERO,
+        );
+        assert!(landed, "the third attempt should have found the window");
+        assert_eq!(calls, 3, "it must stop looking once the raise lands");
+    }
+
+    /// The first attempt succeeding is the HAND-OFF case: the window is already
+    /// up and must not be raised again and again.
+    #[test]
+    fn a_raise_that_lands_at_once_does_not_keep_looking() {
+        let mut calls = 0;
+        let landed = keep_raising(
+            || {
+                calls += 1;
+                true
+            },
+            40,
+            Duration::ZERO,
+        );
+        assert!(landed);
+        assert_eq!(calls, 1, "one raise is enough when the window is there");
+    }
+
+    /// No window at all must end quietly after the budget, not loop forever.
+    #[test]
+    fn a_window_that_never_appears_gives_up() {
+        let mut calls = 0;
+        let landed = keep_raising(
+            || {
+                calls += 1;
+                false
+            },
+            7,
+            Duration::ZERO,
+        );
+        assert!(!landed);
+        assert_eq!(calls, 7, "it looks exactly as many times as it is allowed");
+    }
+
+    /// The budget has to outlast a cold launch, which is what the measurement
+    /// said it did not: the window was up at 484-677 ms while the only attempt
+    /// ran at 400 ms. These are the numbers the fix rests on.
+    #[test]
+    fn the_raise_budget_outlasts_a_cold_launch() {
+        assert!(
+            RAISE_AFTER + RAISE_FOR > Duration::from_millis(700),
+            "a raise budget of {RAISE_AFTER:?}+{RAISE_FOR:?} would still miss a \
+             window that takes 677 ms to appear"
+        );
+        assert!(
+            RAISE_EVERY < RAISE_FOR,
+            "one look in the whole budget is the bug again"
+        );
     }
 }
