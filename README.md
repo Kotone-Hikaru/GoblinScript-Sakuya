@@ -11,10 +11,11 @@ you can fine-tune anything else in your favorite editor.
 > **This is a fork of ofs69's GoblinScript.**
 > [Kotone-Hikaru/GoblinScript-Sakuya](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya)
 > builds on [ofs69/GoblinScript](https://github.com/ofs69/GoblinScript) -- a GPU
-> throttle, the spanning bench, hand-drawn wave pieces and a slider panel. The
-> app, its pages, the training pipeline and the models are **ofs69's work**;
-> everything that is not listed under [What this fork adds](#what-this-fork-adds)
-> is theirs. See [Credits](#credits).
+> throttle, the spanning bench, hand-drawn wave pieces, a slider panel, a shelter
+> for the picture, a batch crop pass and a window that comes forward when it
+> wants you. The app, its pages, the training pipeline and the models are
+> **ofs69's work**; everything that is not listed under
+> [What this fork adds](#what-this-fork-adds) is theirs. See [Credits](#credits).
 
 > **This repository is the inference client only.**
 >
@@ -46,6 +47,7 @@ goblinscript video.mp4 --models v0.5.1,v0.3.0
                                         video.funscript and video.v0.3.0.funscript
 goblinscript video.mp4 --throttle gentle
                                         keep the GPU usable; see the fork's notes below
+goblinscript D:\clips --batch-crop      judge every crop at the end, then draft them all
 ```
 
 A release carries several models, each named for the release that first
@@ -66,11 +68,24 @@ action if they picked the wrong part, or click through if they got it right;
 what you draw is kept for that video. Turn the page off with `--no-crop-edit`,
 or with **K** in the picker, and a batch runs with nobody at the keyboard.
 
+On a batch, judging every crop as each video is transcoded means sitting down
+once per video. **`--batch-crop`** (or **J** in the picker) makes the run take
+two passes instead: the first transcodes, cuts and asks about the crop for every
+video, the second drafts them all with the answers from the cache and opens no
+page at all. The crop is still decided *before* the expensive stage, so
+correcting one is still free -- only *when* you are asked changes. It is off by
+default because it costs machine time to save yours: see
+[The batch crop pass](#the-batch-crop-pass).
+
 `goblinscript --help` lists every option. A VR video opens a page in your
 browser to aim it once; flat video needs no flags at all. English and Chinese
 ship with it, and any `languages/*.json` you translate shows up on the **G**
 key. Existing scripts are never overwritten without `--force`, and the video
 file itself is never touched.
+
+**Nothing on screen has to be readable while you work.** Both browser pages
+carry a shelter -- two covers over the picture, reachable with their buttons or
+by cycling **H**. See [The shelter](#the-shelter).
 
 ### Serving an editor
 
@@ -131,6 +146,14 @@ tracks are back.
 Everything below is [Kotone-Hikaru](https://github.com/Kotone-Hikaru)'s work on top
 of upstream `5bf8d6f`, written for the review page and the GPU it runs on. The
 app, its pipeline and the models are unchanged where these do not touch them.
+
+Three of these are about drafting -- how a script is cut into pieces, how a piece
+can be drawn rather than modelled, and how the GPU is kept usable while it works.
+The last three are about the other half of the job, the hours spent *watching and
+deciding*: covering a picture that should not be read over your shoulder, judging
+a batch's crops in one sitting, and a window that comes forward when it needs you.
+They are the cheapest things here, and the first one is worth knowing before you
+open a video at work.
 
 ### The spanning bench
 
@@ -196,6 +219,107 @@ remembered choice. The boot screen always reports which state it is in, so
 [`THROTTLE_USAGE.md`](THROTTLE_USAGE.md) is the manual, with the measured
 baselines and the control loop explained (in Chinese).
 
+### The shelter
+
+Both pages that show the picture -- the crop page and the review page -- can
+cover it. Not pause it, not stop the work: **cover it**, because a script is
+written by watching a video and this material is not something to leave on a
+screen that a passing colleague can read.
+
+Two covers, each a toggle (pressing the lit one puts the picture back), so two
+buttons carry three states and the state is visible:
+
+* **still** -- an opaque card with a static texture. It costs nothing: the
+  compositor blends it like any background.
+* **frost** -- the frame, sampled into a canvas **one eighth** of the picture
+  each way and blurred *at that size*, then scaled up by CSS.
+
+**H** cycles off → still → frost → off. It is one key rather than a choice
+because it is reached for suddenly, when someone walks in, and that is not a
+moment to be picking between two covers. (The picker uses **H** for a different
+switch -- the window raise below -- because a terminal and a page never have the
+keyboard at the same time.)
+
+Neither cover takes pointer events, so the native transport, the crop
+rectangle and its handles, the simulator and every readout keep working behind
+them -- a rectangle is judged by where it sits, which does not require reading
+the pixels. And the frost follows a seek *while paused*, which is how both
+pages are actually used: a cover that only refreshed during playback would leave
+the previous frame on screen, which is exactly the leak it exists to prevent.
+
+The frost is a canvas rather than `filter: blur()` on the video for one reason,
+and it is the difference between cheap and free. A blur applied inside a small
+canvas reaches the compositor as a finished bitmap. The obvious version -- a CSS
+blur on the video inside a `transform: scale(8)` wrapper -- does not: the
+compositor rasterises a filtered layer at the size it is finally drawn at, so
+the blur re-runs at the magnified scale and the saving evaporates. The two
+differ by about **64×** (the area). The blur radius itself is nearly free either
+way: Skia's blur is three box passes, and a box blur sums with a sliding window,
+so cost is independent of radius.
+
+### The batch crop pass
+
+`--batch-crop` (picker **J**) asks about every crop **at the end of the batch**
+instead of one per video, by making the run take two passes:
+
+| | what it does |
+|---|---|
+| **pass 1** | transcode → exposure → cuts → probe the crop → **open the page**. Stops there. |
+| **pass 2** | the crops are decided. Take each answer from the cache and run the expensive stage. **No page opens.** |
+
+The property that makes this a schedule change rather than a re-architecture is
+one the pipeline already had: **the crop is decided before the expensive stage**,
+which is what makes correcting it free. Batching changes *when* you are asked,
+never *where* the question sits relative to the work it affects.
+
+What it costs, and why it is off by default: the transcode of video *N+1* used
+to run in the GPU shadow of video *N*'s expensive stage. Splitting the passes
+removes that overlap, so a batch spends **more pure machine time and less of
+yours**. That is a trade to choose, not one to discover.
+
+A single video is never split into two passes -- there is nothing to batch, and
+a second pass would cost a full walk over the cache to arrive at the same place.
+The first pass's working files are deliberately **not** swept: the normalise,
+the cut list and the crop plan are exactly what the second pass comes back for.
+
+### A window that comes forward
+
+When a stage stops and waits for a person -- the crop page, the review page --
+the browser window is lifted to the front of the Z order if it has drifted
+behind something else. A run blocked on a page nobody can see looks exactly like
+a run still working, which is the failure this prevents.
+
+It does **not** take the keyboard focus, and that is the whole design rather
+than half of it. On Windows, taking the foreground is privileged: it is refused
+unless the caller is already the foreground process, was started by it, or has
+just received input. This program is a console app whose console window belongs
+to the terminal, and by the time a stage needs attention the person has long
+since moved elsewhere -- so it is essentially never eligible, and a focus grab
+would silently degrade to a taskbar flash. Reordering the Z axis is *not*
+privileged: toggling the topmost bit on and off, both halves with
+`SWP_NOACTIVATE`, lifts the window over its neighbours without asking for
+anything.
+
+The price is small and stated plainly: the window comes up, the caret does not,
+so you click it and carry on. The alternative -- a real focus grab -- can swallow
+characters someone was typing into another window, and a tool that announces
+itself has no business doing that.
+
+The window is found by title, matched case-insensitively against the pages' own
+`<title>`. A title alone is not enough, though, and finding that out cost a bug:
+the console this pipeline runs in is titled with the program's name too, so a
+bare substring search can match the black terminal box just as readily as the
+browser, and which one won was an accident of what you had touched last. The
+choice is therefore made on the window **class**: a browser class wins
+(`Chrome_WidgetWin_*` covers Chrome, Edge, Brave, Vivaldi and Opera;
+`MozillaWindowClass`, `IEFrame`), a terminal class is **never** raised whatever
+its title says, and any other class that matches the title is still accepted so
+an unfamiliar browser works instead of silently doing nothing.
+
+The switch lives in the picker (**H**) with the other standing preferences and
+is remembered in `settings.json`. It defaults **on**: unlike the switches that
+spend a wait or rewrite pieces, it only decides whether a window is visible.
+
 ### Smaller changes
 
 * The **#strip** has two transports: *play*, where it follows the video and a
@@ -224,7 +348,28 @@ baselines and the control loop explained (in Chinese).
   instead of waiting for the next tick.
 * Default playback volume is 15%, deliberately not remembered -- this is a
   visual editor, and a quiet default is friendlier than a loud one.
-* Every new string ships in both English and Chinese (138 new keys).
+* The picker's option row carries every standing preference, so a double-clicked
+  exe -- whose user has no command line -- can reach all of it: **P** throttle,
+  **O** conf-suggest on open, **W** GPU browser, **H** raise the window (**J**
+  batch crop). Each is remembered in `settings.json` and applied to the next
+  batch.
+* Closing a page is **cancelling**, and it stops the whole batch rather than
+  leaving a process waiting on a window that no longer exists: a page says
+  goodbye as it is torn down, and a run that has gone quiet far too long is
+  treated as gone too. A goodbye is not acted on immediately, because a reload
+  says goodbye exactly as a close does -- it is held for a moment and retracted
+  by the page coming back, so **F5 cannot kill a batch**. Working files are kept,
+  so re-running a video resumes it.
+* The **version has four parts**, and the fourth is a **commit count**, not a
+  build id: `0.6.3.45` is the 45th commit on this fork's own baseline. Rebuilding
+  one commit ten times says the same thing ten times -- which is the point, since
+  a number that moves without the code moving tells you nothing. Every surface
+  reads that one string (`--version`, the boot banner, the picker's wordmark, the
+  error log, the `--serve` handshake), so they cannot disagree. A build with no
+  repository -- a source tarball, no `spans-base` tag -- falls back to `.0` with a
+  build warning rather than failing.
+* Every new string ships in both English and Chinese (147 keys added on top of
+  the fork's base, counted from `languages/en-US.json`).
 
 ## What you need
 
