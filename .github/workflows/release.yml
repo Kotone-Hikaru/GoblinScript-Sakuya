@@ -91,12 +91,41 @@ jobs:
       # The tag names the version; Cargo.toml declares it. A zip whose boot
       # screen says one thing and whose tag says another is the one lie a
       # release page can carry, so the two are held equal here.
+      #
+      # Equal in their first three parts, not in all four. Cargo allows exactly
+      # three -- it rejects a fourth outright -- so the fourth part cannot live
+      # in Cargo.toml at all. `build.rs` computes it from `git rev-list --count
+      # spans-base..HEAD` and bakes it in as GS_VERSION, which is what every
+      # surface displays. The tag is `v0.6.3.51`; Cargo.toml says `0.6.3`.
+      #
+      # Comparing the whole string, as this once did, is a check that can only
+      # ever fail -- so it never caught anything, it just made every release
+      # stop on its first step. What it must catch is a tag that names a
+      # different MAJOR.MINOR.PATCH than the crate it is building.
       - name: Tag matches the crate version
         shell: bash
         run: |
+          set -eu
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "v$ver" = "$GITHUB_REF_NAME" ] \
-            || { echo "Cargo.toml says $ver, the tag says $GITHUB_REF_NAME"; exit 1; }
+          tag=${GITHUB_REF_NAME#v}
+          case "$tag" in
+            "$ver"|"$ver".*) ;;
+            *) echo "Cargo.toml says $ver, the tag says $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          # The fourth part is a commit count, so it has one shape. Anything
+          # else on the end is a typo, and a typo in a tag is what this step is
+          # for.
+          rest=${tag#"$ver"}
+          case "$rest" in
+            "") echo "warning: $GITHUB_REF_NAME has no commit count; the boot screen will add one" ;;
+            # A dot and digits, and nothing after them. `.[0-9]*` would not do:
+            # the `*` swallows a trailing `.7`, so a five-part tag would pass.
+            .[0-9]*) case "${rest#.}" in *[!0-9]*)
+                       echo "the fourth part of $GITHUB_REF_NAME is not a commit count: '$rest'"; exit 1 ;;
+                     esac ;;
+            *) echo "the fourth part of $GITHUB_REF_NAME is not a commit count: '$rest'"; exit 1 ;;
+          esac
+          echo "tag $GITHUB_REF_NAME matches crate $ver"
 
       - name: Fetch the build inputs
         shell: bash
