@@ -1,4 +1,4 @@
-> [English](README.md) | **简体中文**
+> [English](README.md) | 简体中文
 
 # GoblinScript
 
@@ -31,16 +31,16 @@
 双击 `goblinscript.exe`，终端里会打开一个选择器：用方向键浏览，空格键选中，按 **S** 让哥布林开工。或者从命令行：
 
 ```
-goblinscript video.mp4                  脚本出现在视频旁边
-goblinscript D:\clips                   那个文件夹里的每个视频
-goblinscript video.mp4 --out D:\scripts 把脚本放到别处
-goblinscript video.mp4 --model v0.4.0   用它带的另一个模型出稿
+goblinscript video.mp4                  the script appears next to the video
+goblinscript D:\clips                   every video in that folder
+goblinscript video.mp4 --out D:\scripts put the scripts somewhere else
+goblinscript video.mp4 --model v0.4.0  draft with another of the models it carries
 goblinscript video.mp4 --models v0.5.1,v0.3.0
-                                        两个都要，只读一遍视频：
-                                        得到 video.funscript 和 video.v0.3.0.funscript
+                                        both, from one look at the video:
+                                        video.funscript and video.v0.3.0.funscript
 goblinscript video.mp4 --throttle gentle
-                                        让 GPU 保持可用；见下面这个分支的说明
-goblinscript D:\clips --batch-crop      把裁剪判定全留到最后，然后一起出稿
+                                        keep the GPU usable; see the fork's notes below
+goblinscript D:\clips --batch-crop      judge every crop at the end, then draft them all
 ```
 
 一次发布带好几个模型，每个都以最早发布它的那个版本命名，而且它们看视频的方式完全一样——所以多跑一个模型只花几秒，而不是再编码一遍。`--model` 挑一个，`--models` 把它们并排写出来、不走复核。复核页在出稿时用每个模型读同一段视频，所以它能立刻切换一份脚本所用的模型。视频下方，**script** 标出正在写这份脚本的模型，**vs** 在它下面再铺一条线：另一个模型的、用同样这些旋钮写出的线，或者是那份 **pinned** 脚本，按它当时带着的模型和旋钮原样保留。**⇄**（或 **x**）交换脚本和它下面那条线，于是选择就是在视频播放时来回翻看完成的。每份脚本都记下写它的模型和设置。
@@ -71,7 +71,7 @@ goblinscript D:\clips --batch-crop      把裁剪判定全留到最后，然后�
 | `DELETE /sessions/ID` | 忘掉这个会话（它的缓存保留） |
 | `POST /quit` | 退出 |
 
-需要人来做的决定，仍然交给控制台为他们打开的浏览器页面。编码之前是 VR 瞄准页和裁剪页：走到其中一个的会话状态读作 `working`，页面的 `key` 和 `url` 在 `page` 下，在那里按下 Done 之后出稿继续。`vr` 省略表示自动探测，`true` 表示不管探测器怎么想都打开瞄准页（并且给一个已经有瞄准的视频重新瞄一次），`false` 表示直接对原始帧出稿，或者给一个 sidecar 对象表示原样应用。`crop_edit` 省略表示刚探测完裁剪时打开裁剪页，`true` 表示总是打开，`false` 表示从不。`browser: false` 把打开页面的活留给客户端，否则由服务端打开。
+需要人来做的决定，仍然交给控制台为他们打开的浏览器页面。编码之前是 VR 瞄准页和裁剪页：走到其中一个的会话状态读作 `working`，页面的 `key` 和 `url` 在 `page` 下，在那里按下 Done 之后出稿继续。`vr` 省略时由探测器判断，`true` 表示不管探测器怎么想都打开瞄准页（并且给一个已经有瞄准的视频重新瞄一次），`false` 表示直接对原始帧出稿，或者给一个 sidecar 对象表示原样应用。`crop_edit` 省略表示刚探测完裁剪时打开裁剪页，`true` 表示总是打开，`false` 表示从不。`browser: false` 把打开页面的活留给客户端，否则由服务端打开。
 
 出稿之后是**工作台**：复核页，带着视频、模拟器和每个样式旋钮，开着的时候一直占着自己的端口。想开几次就开几次。在那里定下来的旋钮从那时起就是这个会话的样式——每次样式调用都从它们出发，状态把它们放在 `params` 和 `flags` 下带回来，`style_rev` 统计改动的次数，好让客户端知道该再问一次。
 
@@ -196,23 +196,23 @@ funscript 驱动成人玩具，而哥布林是拿成人视频教出来的。这�
 ## 构建
 
 ```
-cargo build --release     # 构建；里面还没有哥布林
-cargo test                # 在干净的检出上是绿的；见下面的运行时说明
+cargo build --release     # builds; no goblins in it yet
+cargo test                # green on a bare checkout; see the runtime note below
 ```
 
 模型不在这个仓库里，但一个**已发布**的 `goblinscript.exe` 会把它自己的交出来。向它要一份，然后让你的构建指向它写出来的东西：
 
 ```
-goblinscript --dump-bundle bundle          # 从一个发布版 exe 里取出，写进 ./bundle
+goblinscript --dump-bundle bundle          # from a release exe, into ./bundle
 cargo run --release -- --bundle bundle VIDEO
 ```
 
 那就是发布版出稿所用的同一批字节，所以你的构建现在出稿表现一致。如果想改为把它们烤进去——你自己的独立 exe，或者一个完整的发布 zip，旁边放 `LICENSE` 和第三方声明：
 
 ```
-cargo build --release --features embed     # 编译时读取 ./bundle
-cargo xtask dist                           # -> Windows 上是 dist/goblinscript-VER-windows-dml.zip，
-                                           #    Linux 上是 dist/goblinscript-VER-linux-cuda.zip
+cargo build --release --features embed     # reads ./bundle at compile time
+cargo xtask dist                           # -> dist/goblinscript-VER-windows-dml.zip on Windows,
+                                           #    dist/goblinscript-VER-linux-cuda.zip on Linux
 ```
 
 Windows 构建通过 cargo 取它自己的 ONNX Runtime，不需要设置任何东西。Linux 构建链接微软的 `onnxruntime-linux-x64-gpu_cuda12` 包，也就是那个覆盖所有 NVIDIA 显卡的包：解开它，把 `ORT_LIB_LOCATION` 指向它的 `lib` 文件夹，并设置 `ORT_PREFER_DYNAMIC_LINK=1`。它还需要发行版提供的 `libasound2-dev` 和 `pkg-config`。crate 树在两边都交给 cargo 去取。
