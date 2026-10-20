@@ -1,3 +1,5 @@
+> [English](README.md) | [简体中文](README.zh-CN.md)
+
 # GoblinScript
 
 Drop in a video, get a funscript. **Made by real goblins.**
