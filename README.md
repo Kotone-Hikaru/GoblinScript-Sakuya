@@ -215,9 +215,9 @@ Three presets -- `gentle`, `balanced`, `aggressive` -- cycle with **P** in the
 picker and are remembered in `settings.json`; `--throttle custom` with
 `--throttle-*` flags tunes it by hand, and `--no-throttle` overrides a
 remembered choice. The boot screen always reports which state it is in, so
-"nothing is holding my GPU back" is answerable at a glance.
-[`THROTTLE_USAGE.md`](THROTTLE_USAGE.md) is the manual, with the measured
-baselines and the control loop explained (in Chinese).
+"nothing is holding my GPU back" is answerable at a glance. `goblinscript --help`
+lists the presets and every `--throttle-*` flag; the presets themselves are the
+three the picker cycles.
 
 ### The shelter
 
