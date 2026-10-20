@@ -3661,6 +3661,20 @@ function tick(ts) {
     // the script menu is the current PIECE's, so it follows the playhead rather
     // than the clip: this is what makes it agree with the band under the cursor
     syncModelSel(ms);
+    // ...and the piece list beside it has to agree too. The menu under the
+    // picture has followed the playhead since it was written, but the rows did
+    // not: they kept naming whichever piece was CLICKED last, so the page
+    // answered "which piece is this" twice, in two different ways. Only while
+    // the picture RUNS -- a razor cut, a merge or a drag happens paused, and
+    // none of them may have its selection pulled out from under it mid-gesture
+    // -- never while a control inside the list holds the keyboard, because the
+    // rebuild below would take the focus (and the half-typed number) away, and
+    // never while an edge is being dragged, because that drag owns the
+    // selection until the hand lets go.
+    if (moving && dragEdge === null && !razorDrag && !typingInSegList(document.activeElement)) {
+      const at = segAt(ms);
+      if (at >= 0 && at !== selSeg) { selSeg = at; renderSegs(); }
+    }
   }
   requestAnimationFrame(tick);
 }
@@ -4164,6 +4178,19 @@ function wavePanel() {
 }
 
 // ---- the list -------------------------------------------------------------
+/** Is the keyboard inside one of the list's TEXT boxes? The list is rebuilt
+ *  wholesale on every pass, so a pass that ran while a number was half-typed
+ *  would throw the focus -- and the digits -- away mid-edit.
+ *
+ *  Only the text boxes count. A model menu is a `<select>`, which commits on
+ *  change and holds nothing uncommitted, so a rebuild there costs a blur and
+ *  nothing else; refusing to follow the playhead for as long as a menu happens
+ *  to still hold focus would quietly undo this whole fix. */
+function typingInSegList(el) {
+  const list = $('segList');
+  if (!el || !list || el === list || !list.contains(el)) return false;
+  return el.tagName === 'INPUT' && el.type !== 'range' && el.type !== 'checkbox';
+}
 function renderSegs() {
   const list = $('segList');
   if (!list) return;
