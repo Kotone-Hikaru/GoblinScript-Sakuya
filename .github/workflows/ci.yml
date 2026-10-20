@@ -11,6 +11,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A run that only ever starts by itself cannot be tested. This is the button
+  # that says "run it now", and it is also what proves the workflow is wired up
+  # at all: a repository whose push events never fire looks identical, from the
+  # outside, to one whose workflow is broken.
+  workflow_dispatch:
+
+# Read the tree, run the tests, report. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A push while a run is in flight supersedes it: the point is to know whether
+# what is on main right now passes, not what passed four pushes ago.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +37,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    # A hung job holds a runner until someone notices. Neither platform needs
+    # anywhere near this: the slowest step is the first dependency build.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
