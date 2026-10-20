@@ -2,6 +2,8 @@
 
 # GoblinScript
 
+[![CI](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya/actions/workflows/ci.yml/badge.svg)](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya/actions/workflows/ci.yml)
+
 Drop in a video, get a funscript. **Made by real goblins.**
 
 A goblin watches the video and scrawls a matching script: strokes where the

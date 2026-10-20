@@ -2,6 +2,8 @@
 
 # GoblinScript
 
+[![CI](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya/actions/workflows/ci.yml/badge.svg)](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya/actions/workflows/ci.yml)
+
 丢进一个视频，得到一个 funscript。**由真正的哥布林制作。**
 
 一只哥布林看着视频，随手涂出一份对得上的脚本：动作在哪里就有笔划，按屏幕上的运动对齐时间。结果落在视频旁边，名为 `video.funscript`，任何读 funscript 的播放器都能直接用。把它当成一份扎实的初稿——哥布林的目标是踩准节奏和时间，其余的东西你可以在自己喜欢的编辑器里慢慢微调。
