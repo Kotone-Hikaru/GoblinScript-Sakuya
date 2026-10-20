@@ -16,6 +16,15 @@ on:
   # at all: a repository whose push events never fire looks identical, from the
   # outside, to one whose workflow is broken.
   workflow_dispatch:
+  # A backstop, not a substitute. On 2026-10-20 this repository's push events
+  # reached GitHub -- the event feed carries `refs/heads/main` with the right
+  # head -- and still started no run, while a manual dispatch ran the same file
+  # to green on both platforms. Whatever suppresses the push trigger, a daily
+  # run means main cannot go unchecked for longer than a day even so. It only
+  # ever runs the default branch, and GitHub disables it after 60 days without
+  # a commit, which is itself a signal that nobody is pushing.
+  schedule:
+    - cron: '0 3 * * *'
 
 # Read the tree, run the tests, report. Nothing here writes to the repository.
 permissions:
