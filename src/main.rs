@@ -469,6 +469,30 @@ struct Cli {
     #[arg(long)]
     no_crop_edit: bool,
 
+    /// Judge every crop at the END of the batch, instead of one per video as
+    /// each is transcoded.
+    ///
+    /// Two passes over the selected videos: the first transcodes, cuts, probes
+    /// the crop and asks about it for all of them; the second runs the expensive
+    /// stage, taking the answers from the cache without asking again. You sit
+    /// down once instead of once per video.
+    ///
+    /// The crop is still decided BEFORE the expensive stage, so correcting it is
+    /// still free -- this changes WHEN the question is asked, never where it
+    /// sits relative to the work it affects.
+    ///
+    /// What it costs: the next video's transcode used to run in the GPU shadow
+    /// of this one's expensive stage. Splitting the passes removes that overlap,
+    /// so a batch spends more pure machine time and less of yours. OFF by
+    /// default, and ignored for a single video (there is nothing to batch).
+    #[arg(long)]
+    no_batch_crop: bool,
+
+    /// Judge every crop at the end of the batch. See `--no-batch-crop`: this is
+    /// the affirmative form, for demanding it on a command line.
+    #[arg(long, conflicts_with = "no_batch_crop")]
+    batch_crop: bool,
+
     /// Draft the picture as-is: skip the exposure correction (one gamma that
     /// maps a clip outside the corpus's luma band back into it; a clip
     /// inside the band is never touched either way).
@@ -1337,6 +1361,49 @@ fn review_clip(o: &DraftOut, b: &Bundle) -> Result<review::Clip> {
 enum Outcome {
     Drafted(DraftOut),
     Skipped,
+    /// Everything up to and including the crop decision is done and cached;
+    /// the expensive stage was NOT run. Only [`CropAsk::Defer`] produces this,
+    /// and the second pass of a batch-crop run picks it up from the cache.
+    Prepared,
+}
+
+/// Which passes over the batch, and what each may ask about the crop.
+///
+/// A pure function of two inputs so the decision can be TESTED. The rest of the
+/// batch loop cannot be: it runs ffmpeg and onnx. Leaving this inline would mean
+/// the only way to check "a single video is never split into two passes" is to
+/// run the whole pipeline twice -- which is exactly the kind of thing nobody
+/// checks. (Learned the hard way one commit earlier: a window-selection bug that
+/// six plausible-sounding rules could not catch, and a real desktop caught in
+/// one look.)
+fn crop_passes(batch_crop: bool, videos: usize) -> Vec<CropAsk> {
+    // One video is one page: a second pass would cost a full walk over the cache
+    // to arrive at the same place, and there is no interruption to amortise.
+    if batch_crop && videos > 1 {
+        vec![CropAsk::Defer, CropAsk::Done]
+    } else {
+        vec![CropAsk::Now]
+    }
+}
+
+/// When a draft asks the person about the crop.
+///
+/// The decision itself is unchanged -- it is still made BEFORE the expensive
+/// stage, which is what makes correcting it free. What changes is WHEN, and
+/// therefore whether a batch interrupts its person once per video.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CropAsk {
+    /// Ask in this draft, now. The one-video-at-a-time behaviour, and the
+    /// default: one video means one page, and there is no batched alternative
+    /// that would interrupt less.
+    Now,
+    /// Stop after the crop decision and cache it. The first pass of a
+    /// batch-crop run: it transcodes, detects cuts, probes the crop and opens
+    /// the page, then leaves, so the NEXT pass finds everything it needs.
+    Defer,
+    /// Do not open the page: the answer is already in the cache from a
+    /// [`CropAsk::Defer`] pass. Used by the second pass.
+    Done,
 }
 
 /// Each video's VR aim, for the batch about to run. Absent = flat, drafted
@@ -2056,8 +2123,16 @@ fn crop_page(
     probed: bool,
     dur_ms: f64,
     man: &bundle::Manifest,
+    // Whether this draft is allowed to open the page at all. False on the
+    // second pass of a batch-crop run: the answer is already in the cache, and
+    // asking again would be the very interruption the first pass existed to
+    // avoid.
+    may_ask: bool,
 ) -> Result<Option<autocrop::Plan>> {
     let someone = live.tty || live.sink.is_some();
+    if !may_ask {
+        return Ok(None);
+    }
     if !(cli.crop_edit || (!cli.no_crop_edit && someone && probed)) {
         return Ok(None);
     }
@@ -2413,6 +2488,9 @@ fn draft(
     // Where the stage events go besides the console: the API server's
     // session, or nothing on a console run.
     sink: Option<Arc<dyn StageSink>>,
+    // Whether this draft asks about the crop now, stops after asking, or takes
+    // the cached answer and gets on with the expensive stage.
+    ask: CropAsk,
 ) -> Result<Outcome> {
     let man = &b.manifest;
     let vr_cfg = vr_for(vrs, video);
@@ -2701,7 +2779,8 @@ fn draft(
         // would re-encode the whole video. It opens on the identity plan too
         // -- "the attention wants the whole frame" is exactly the answer
         // someone may want to overrule.
-        let p = match crop_page(&cli, &live, &norm, &p, probed, dur_ms, man)? {
+        let may_ask = !matches!(ask, CropAsk::Done);
+        let p = match crop_page(&cli, &live, &norm, &p, probed, dur_ms, man, may_ask)? {
             Some(edited) => {
                 autocrop::write_cached(&cache.dir, man, &edited, gamma)?;
                 live.done("console.stage.cropedit", &autocrop::stage_line(&edited, false));
@@ -2724,6 +2803,31 @@ fn draft(
         }
         None
     };
+
+    // 2.7 the deferral point of a batch-crop run.
+    //
+    // Everything the expensive stage needs is now on disk: the normalize
+    // (`cache.norm_video`), the cut list (`cache.write_cuts`) and the crop plan
+    // (`autocrop::write_cached`, which the page's answer has just gone through).
+    // So this is where a batch stops for one video and goes on to the next,
+    // instead of running the hours-long pass in the middle of a batch whose
+    // person wanted to judge all the crops first.
+    //
+    // Returning here is what makes the second pass cheap at the front: it finds
+    // the normalize, the cuts and the plan all cached, so it pays the 9-frame
+    // exposure probe (~1 s) and nothing else before the expensive stage.
+    //
+    // ⚠️ The working files must SURVIVE this return. The batch loop's `sweep`
+    // is what deletes them, and a `Prepared` outcome never enters it -- a
+    // deferral is not a finished video, and sweeping here would throw away
+    // exactly what the second pass is coming back for.
+    if matches!(ask, CropAsk::Defer) {
+        live.done(
+            "console.stage.cropedit",
+            t!("console.cropedit.prepared"),
+        );
+        return Ok(Outcome::Prepared);
+    }
 
     // The crop's pixel identity: latents from a plan decoded off a taller
     // normalize differ from the same plan off a spec-height one, so the
@@ -3761,6 +3865,8 @@ fn real_main() -> Result<()> {
                 // whether a waiting stage may lift the page's window to the
                 // front; nothing to arm, `pagewin::deliver` reads it live
                 settings.raises_window(),
+                // judge every crop at the end of the batch, as last left
+                settings.batch_crop,
                 start_dir.clone(),
                 std::mem::take(&mut report),
                 cli.dl_dir.clone(),
@@ -3816,6 +3922,10 @@ fn real_main() -> Result<()> {
                     // concrete bool rather than left as "never chosen" so the
                     // person's answer survives an unrelated edit of the file.
                     settings.raise_window = Some(p.raise_window);
+                    // Judge every crop at the end of the batch. A preference
+                    // about how the person's TIME is spent, so it is remembered
+                    // like the others rather than passed per run.
+                    settings.batch_crop = p.batch_crop;
                     settings.remember_presentation();
                     settings.save();
                     // the picker's users have no flags to re-run with -- the
@@ -3889,7 +3999,67 @@ fn real_main() -> Result<()> {
         // that terminal belongs to whoever typed into it, and taking it over to
         // animate a mascot is not a thing a command does.
         let header = picker_mode.then(chrome::Header::begin).flatten();
-        for (i, v) in cli.videos.iter().enumerate() {
+        // ---- how many passes over the batch, and what each one may ask ----
+        //
+        // Normally one pass, asking about each crop as it goes: one video means
+        // one page, and there is nothing to batch.
+        //
+        // Batch-crop makes it two. The FIRST pass transcodes, cuts, probes the
+        // crop and opens the page for every video, then leaves -- so the person
+        // sits down once, at the end, instead of once per video. The SECOND pass
+        // takes each cached answer and runs the expensive stage, never opening a
+        // page at all.
+        //
+        // The property that makes this safe is the one already in the pipeline:
+        // the crop is decided BEFORE the expensive stage, so correcting it is
+        // still free. Batching changes WHEN the question is asked, never where
+        // it sits relative to the work it affects.
+        //
+        // What it costs: the transcode of video N+1 used to run in the GPU
+        // shadow of video N's expensive stage (`prefetch`). Splitting the passes
+        // removes that overlap, so the batch spends more pure machine time --
+        // and less of the person's, which is the trade this switch is for.
+        // A flag on a command line wins; otherwise the remembered preference.
+        // Ignored for a single video, below: there is nothing to batch, and a
+        // second pass would only cost a second walk over the cache.
+        let batch_crop = cli.batch_crop || settings.batch_crop;
+        let passes = crop_passes(batch_crop, cli.videos.len());
+        // Which videos the FIRST pass actually prepared. The second pass walks
+        // only these: a video already scripted was skipped there, and visiting
+        // it again would count it twice in the summary and redo the check for
+        // nothing.
+        let mut prepared: Vec<usize> = Vec::new();
+        for ask in passes.iter() {
+            let deferring = matches!(ask, CropAsk::Defer);
+            if deferring {
+                println!();
+                println!(
+                    "{}",
+                    style(t!("console.batchcrop.first")).fg(con(theme().accent)).bold()
+                );
+            } else if passes.len() > 1 {
+                println!();
+                println!(
+                    "{}",
+                    style(t!("console.batchcrop.second")).fg(con(theme().accent)).bold()
+                );
+            }
+            // The videos loop runs INSIDE this pass: a pass is a reason to go
+            // over the whole batch, not a label printed once at the top.
+            //
+            // The SECOND pass takes its list from `prepared` rather than from
+            // `cli.videos`: only a video whose crop was decided has anything for
+            // it to do. Everything else was skipped or failed in the first pass
+            // and must not be counted again here.
+            let batch: Vec<usize> = if deferring {
+                (0..cli.videos.len()).collect()
+            } else if passes.len() > 1 {
+                prepared.clone()
+            } else {
+                (0..cli.videos.len()).collect()
+            };
+            for &i in &batch {
+            let v = &cli.videos[i];
             // the next video that will actually be drafted -- one already
             // scripted is skipped, and normalizing it would be pure waste
             let next = cli.videos[i + 1..]
@@ -3913,8 +4083,10 @@ fn real_main() -> Result<()> {
             // the first one would otherwise have swept.
             let mut sweep: Vec<PathBuf> = Vec::new();
             for (c, bb, nx) in &runs {
-                match draft(c, bb, v, &cache_root, &params, i, cli.videos.len(), &pf, *nx, &vrs, None)
-                {
+                match draft(
+                    c, bb, v, &cache_root, &params, i, cli.videos.len(), &pf, *nx, &vrs, None,
+                    *ask,
+                ) {
                     Ok(Outcome::Drafted(mut out)) => {
                         drafted += 1;
                         if cli.review {
@@ -3932,6 +4104,16 @@ fn real_main() -> Result<()> {
                             // the draft is done, so they are done too (a
                             // failure never reaches this arm and keeps them)
                             sweep.push(out.cache_dir.clone());
+                        }
+                    }
+                    // The crop is decided and cached; the expensive stage waits
+                    // for the second pass. NOT swept: the working files are
+                    // exactly what that pass is coming back for.
+                    Ok(Outcome::Prepared) => {
+                        // Remembered by INDEX, not by path: the second pass walks
+                        // `cli.videos` and must pick up the same entries.
+                        if !prepared.contains(&i) {
+                            prepared.push(i);
                         }
                     }
                     Ok(Outcome::Skipped) => skipped += 1,
@@ -3961,6 +4143,7 @@ fn real_main() -> Result<()> {
             for d in sweep {
                 let _ = std::fs::remove_dir_all(&d);
             }
+        }
         }
         // The batch is over, so the screen goes back: the summary, the review
         // and the picker that follows it all want the whole of it.
@@ -4168,6 +4351,31 @@ mod cli_tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// Batch-crop splits the batch into two passes -- but only when there IS a
+    /// batch. A single video must never pay a second walk over the cache to
+    /// arrive at the same place, and there is no interruption to amortise.
+    ///
+    /// This is a pure function for one reason: the loop it feeds cannot be
+    /// tested (it runs ffmpeg and onnx), and a decision that can only be checked
+    /// by running the whole pipeline twice is a decision nobody checks.
+    #[test]
+    fn batch_crop_is_two_passes_only_for_a_real_batch() {
+        assert_eq!(crop_passes(false, 10), vec![CropAsk::Now]);
+        assert_eq!(crop_passes(false, 1), vec![CropAsk::Now]);
+
+        // the switch ON but nothing to batch: still one pass
+        assert_eq!(crop_passes(true, 1), vec![CropAsk::Now]);
+        assert_eq!(crop_passes(true, 0), vec![CropAsk::Now]);
+
+        // ...and a real batch is defer-then-done, in that order: the crop must be
+        // decided in the FIRST pass, or the second would have nothing to take.
+        let two = crop_passes(true, 2);
+        assert_eq!(two.len(), 2);
+        assert!(matches!(two[0], CropAsk::Defer));
+        assert!(matches!(two[1], CropAsk::Done));
+        assert_eq!(crop_passes(true, 20).len(), 2);
     }
 
     /// A `cli.<id>` key whose id is not an argument does NOTHING -- the help

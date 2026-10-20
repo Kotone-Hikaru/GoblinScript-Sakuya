@@ -170,6 +170,20 @@ pub struct Settings {
     /// this one only decides whether a window is visible, and a run blocked on
     /// a page nobody can see is the failure it prevents.
     pub raise_window: Option<bool>,
+    /// Judge every crop at the END of the batch, instead of one per video as
+    /// each is transcoded.
+    ///
+    /// A preference about the person's TIME rather than about how the work is
+    /// done: with it on, a batch transcodes and probes every video first, asks
+    /// about the crops in one sitting, then runs the expensive stages. The crop
+    /// is still decided before the expensive stage, so correcting it is still
+    /// free -- only WHEN the question is asked changes.
+    ///
+    /// OFF by default, for the same reason `auto_suggest` is: splitting the
+    /// passes removes the transcode-overlap between videos, so the batch spends
+    /// MORE pure machine time. That is a trade a person should choose, not one
+    /// they should discover.
+    pub batch_crop: bool,
 }
 
 impl Default for Settings {
@@ -194,6 +208,7 @@ impl Default for Settings {
             gpu_browser: false,
             rail_width: None,
             raise_window: None,
+            batch_crop: false,
         }
     }
 }

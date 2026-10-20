@@ -849,6 +849,10 @@ fn work(
                         None,
                         &vrs,
                         Some(sink),
+                        // The API drafts ONE video on demand, so there is
+                        // nothing to batch: it asks about the crop here, the
+                        // way a one-video run always has.
+                        crate::CropAsk::Now,
                     )?;
                     match out {
                         Outcome::Drafted(d) => {
@@ -856,6 +860,12 @@ fn work(
                             Ok(())
                         }
                         Outcome::Skipped => anyhow::bail!("the draft was skipped"),
+                        // Unreachable by construction: `CropAsk::Now` above
+                        // never defers. Says so rather than pretending a
+                        // prepared draft is a finished one.
+                        Outcome::Prepared => {
+                            anyhow::bail!("a crop decision cannot defer here (CropAsk::Now)")
+                        }
                     }
                 }))
             }
