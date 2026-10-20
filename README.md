@@ -145,7 +145,10 @@ tracks are back.
 
 Everything below is [Kotone-Hikaru](https://github.com/Kotone-Hikaru)'s work on top
 of upstream `5bf8d6f`, written for the review page and the GPU it runs on. The
-app, its pipeline and the models are unchanged where these do not touch them.
+app and its pipeline are unchanged where these do not touch them. The bundle
+carries two extra models, trained here rather than shipped by upstream -- see
+[the two anime models](#the-two-anime-models), which also says why you should
+keep using the default one unless your footage looks like their training set.
 
 Three of these are about drafting -- how a script is cut into pieces, how a piece
 can be drawn rather than modelled, and how the GPU is kept usable while it works.
@@ -320,6 +323,58 @@ The switch lives in the picker (**H**) with the other standing preferences and
 is remembered in `settings.json`. It defaults **on**: unlike the switches that
 spend a wait or rewrite pieces, it only decides whether a window is visible.
 
+### The two anime models
+
+The bundle carries two models that upstream does not ship. Both were trained
+here, with ofs69's own training pipeline, on anime and MMD footage: a corpus of
+**1,029 clips (77.6 hours)**, of which **128 clips (9.7 hours) were held out of
+training** and are the only clips that every number below comes from.
+`anime-v1` trained on the remaining 901, `anime-v1.1-from-0.3.0` on 899 after two
+clips were dropped between the two runs. Both start from an upstream checkpoint.
+They are `anime-v1` and `anime-v1.1-from-0.3.0`, and **the default is still
+upstream's `v0.5.1`**. Nothing selects them for you.
+
+They are not a general improvement, and on footage unlike their training set
+they may well be worse than the default. Because the holdout is drawn from that
+same anime corpus, what these numbers measure is "does this model fit anime
+footage" -- not "is this model better":
+
+| vs a reference arm | corr | travel | slow-section spikes `sl>3x` |
+|---|---|---|---|
+| upstream `v0.6.0` (reference) | 0.359 | 0.690 | 5.30 |
+| `anime-v1` | 0.541 | 0.523 | **1.73** |
+| `anime-v1.1-from-0.3.0` | **0.564** | 0.639 | 2.65 |
+
+`corr` is agreement with the human script; `travel` is how much of the stroke's
+range the script actually uses; `sl>3x` counts spikes three times too fast
+during slow passages -- an artifact, where lower is better.
+
+Note what the baseline is: `v0.6.0`, which is the checkpoint these two were
+compared against during training. **The default `v0.5.1` was never run on this
+holdout**, so the table does not say how these two compare to what you get out of
+the box -- only how they compare to that one upstream arm.
+
+Three things to take from that table. First, **`anime-v1` is the quiet one**: it
+trades amplitude for calm -- travel down to 0.523, spikes down to a third of
+upstream's. Second, **`anime-v1.1` wins on the averages** (best `corr`, travel
+close to upstream) **but buys that with more spikes than `anime-v1`** -- 2.65
+against 1.73, still better than upstream's 5.30 but no longer the quiet model.
+It ships with `amp_cap_x=2.0`, an inference-time amplitude cap swept after
+training: at the untuned default the same checkpoint reads 3.33, and with the
+cap off it reads 4.19. Third, **none of these numbers was measured on anything
+but anime**, so they say nothing about live action, 3D renders or whatever else
+you point the app at. They are an argument for trying these models on anime, not
+for believing they are better in general.
+
+This is why upstream's `v0.5.1` remains the default and why `anime-v1.1` is not
+called a finished model: on its own holdout it improves every average while
+making the artifact floor worse, and by the project's own evaluation rules an
+average bought with a worse artifact floor is a worse model. It is here because
+the training was done and the evidence is real, not because it is recommended.
+
+Use `--model anime-v1` (or pick it in the review page) if your footage is anime
+or MMD. If it is not, leave the default alone.
+
 ### Smaller changes
 
 * The **#strip** has two transports: *play*, where it follows the video and a
@@ -449,13 +504,17 @@ and what is measured to keep it honest.
 ## Credits
 
 **GoblinScript is [ofs69](https://github.com/ofs69)'s project.** The design, the
-perception, the styling engine, the review and crop pages, the model bundles,
-the `--serve` sidecar, the build and release machinery and the
+perception, the styling engine, the review and crop pages, the upstream model
+bundles, the `--serve` sidecar, the build and release machinery and the
 [GoblinTrainingGrounds](https://github.com/ofs69/GoblinTrainingGrounds) training
 pipeline that makes the packs are all ofs69's work. This fork adds what is
 listed above and nothing more; the upstream repository is the canonical project
 and its releases are the ones most people want. Please star and follow the
 original.
+
+The one exception is the two `anime-*` models: those were trained here, with
+ofs69's own training pipeline, from an upstream checkpoint. Every other model in
+the bundle is upstream's.
 
 The [Sakuya fork](https://github.com/Kotone-Hikaru/GoblinScript-Sakuya) was made
 by [Kotone-Hikaru](https://github.com/Kotone-Hikaru), mostly as an experiment in
