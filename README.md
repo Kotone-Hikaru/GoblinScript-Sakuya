@@ -284,6 +284,13 @@ to run in the GPU shadow of video *N*'s expensive stage. Splitting the passes
 removes that overlap, so a batch spends **more pure machine time and less of
 yours**. That is a trade to choose, not one to discover.
 
+The page itself changes to match: instead of one page per video in a fixed
+order, the whole batch is listed down the left -- the original filename, the
+number of it, and a dot on any video whose crop you have already changed by
+hand. Any row can be picked at any time, in any order, and **next unjudged**
+jumps to the first one still plain. The batch is submitted once, at the end, for
+all of them. A single video gets no rail, because one row is a title bar.
+
 A single video is never split into two passes -- there is nothing to batch, and
 a second pass would cost a full walk over the cache to arrive at the same place.
 The first pass's working files are deliberately **not** swept: the normalise,

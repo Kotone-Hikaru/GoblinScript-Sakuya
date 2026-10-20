@@ -109,6 +109,11 @@ fn is_whole(r: Rect) -> bool {
     r.2 >= 1.0 - 1e-6 && r.3 >= 1.0 - 1e-6
 }
 
+/// `Clone`, because the crop page keeps the plan the probe drew beside the one
+/// a person is editing. A batch holds one of each per video, and `finish` needs
+/// the original to carry forward the grid it was read on and the escape share
+/// the probe measured -- neither of which a drawn rect re-measures.
+#[derive(Clone, Debug)]
 pub struct Plan {
     /// (first frame, rect) per segment, consecutive equal rects merged.
     pub segs: Vec<(usize, Rect)>,

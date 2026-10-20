@@ -1364,7 +1364,38 @@ enum Outcome {
     /// Everything up to and including the crop decision is done and cached;
     /// the expensive stage was NOT run. Only [`CropAsk::Defer`] produces this,
     /// and the second pass of a batch-crop run picks it up from the cache.
-    Prepared,
+    ///
+    /// It carries what the batch page needs to SHOW this video -- the plan the
+    /// probe drew, the normalized copy to play it on, and the numbers to draw a
+    /// rect on top of it -- because the page is opened once for the whole batch,
+    /// after every video has been prepared, rather than once per video.
+    Prepared(Box<PreparedCrop>),
+}
+
+/// One video, ready for the batch crop page and not a frame further.
+///
+/// This is the currency between the first pass and the page: everything the
+/// first pass computed that the person needs to see, and everything the answer
+/// needs to be written back against.
+struct PreparedCrop {
+    /// What the page's list calls this video: the ORIGINAL file's name.
+    title: String,
+    /// The normalized copy the crop is applied to.
+    norm: PathBuf,
+    /// The plan the probe drew (or the identity, when it wants the whole frame).
+    plan: autocrop::Plan,
+    dur_ms: f64,
+    fps: f64,
+    aspect: f64,
+    /// Where the answer goes: `autocrop::write_cached` reads this back in the
+    /// second pass, so the correction survives the trip through the page.
+    cache_dir: PathBuf,
+    gamma: f64,
+    /// Whether this video has anything to JUDGE. `--no-autocrop` says the
+    /// attention is not asked at all, so such a video is prepared (the second
+    /// pass still needs it) but has no place on the page -- putting it there
+    /// would offer a crop the run was told not to make.
+    askable: bool,
 }
 
 /// Which passes over the batch, and what each may ask about the crop.
@@ -2779,7 +2810,12 @@ fn draft(
         // would re-encode the whole video. It opens on the identity plan too
         // -- "the attention wants the whole frame" is exactly the answer
         // someone may want to overrule.
-        let may_ask = !matches!(ask, CropAsk::Done);
+        // A batch-crop FIRST pass does NOT open a page here. It prepares the
+        // video -- normalize, cuts, probe -- and leaves; the page opens once,
+        // after every video has reached this point, with all of them on it at
+        // once. Opening one here is exactly the "queue up and wait" that the
+        // batch page exists to replace.
+        let may_ask = matches!(ask, CropAsk::Now);
         let p = match crop_page(&cli, &live, &norm, &p, probed, dur_ms, man, may_ask)? {
             Some(edited) => {
                 autocrop::write_cached(&cache.dir, man, &edited, gamma)?;
@@ -2826,7 +2862,41 @@ fn draft(
             "console.stage.cropedit",
             t!("console.cropedit.prepared"),
         );
-        return Ok(Outcome::Prepared);
+        // Everything the batch page needs, handed to the batch loop: the page
+        // is opened ONCE, after every video has reached this point, so this is
+        // the only chance to say what this video looks like.
+        let (w, h) = ffmpeg::dims(&norm)?;
+        return Ok(Outcome::Prepared(Box::new(PreparedCrop {
+            title: video
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| nice(video)),
+            norm: norm.to_path_buf(),
+            // `None` is the uncropped identity: the page shows the whole frame,
+            // which is exactly the plan the probe's "the attention wants all of
+            // it" would hand over, so a person sees the same thing either way.
+            plan: plan.clone().unwrap_or_else(|| {
+                let identity = autocrop::IDENTITY;
+                autocrop::Plan {
+                    segs: vec![(0, identity)],
+                    auto: vec![(0, identity)],
+                    manual: false,
+                    grid: man.grid,
+                    escape_share: 0.0,
+                    placed: 0,
+                }
+            }),
+            dur_ms,
+            fps: man.grid_fps,
+            aspect: w as f64 / h.max(1) as f64,
+            cache_dir: cache.dir.clone(),
+            gamma,
+            // `--no-autocrop` says the attention is never asked, so this video
+            // has nothing to judge: it is prepared for the second pass and kept
+            // OFF the page. Offering a crop the run was told not to make would
+            // be a question whose answer is already no.
+            askable: want_crop,
+        })));
     }
 
     // The crop's pixel identity: latents from a plan decoded off a taller
@@ -4029,6 +4099,11 @@ fn real_main() -> Result<()> {
         // it again would count it twice in the summary and redo the check for
         // nothing.
         let mut prepared: Vec<usize> = Vec::new();
+        // What those videos look like, for the batch page that opens AFTER the
+        // first pass. This is the whole point of the two-pass arrangement: the
+        // page is opened once, for every video at once, instead of once per
+        // video with a person waiting between them.
+        let mut shelf: Vec<PreparedCrop> = Vec::new();
         for ask in passes.iter() {
             let deferring = matches!(ask, CropAsk::Defer);
             if deferring {
@@ -4109,12 +4184,15 @@ fn real_main() -> Result<()> {
                     // The crop is decided and cached; the expensive stage waits
                     // for the second pass. NOT swept: the working files are
                     // exactly what that pass is coming back for.
-                    Ok(Outcome::Prepared) => {
+                    Ok(Outcome::Prepared(ready)) => {
                         // Remembered by INDEX, not by path: the second pass walks
                         // `cli.videos` and must pick up the same entries.
                         if !prepared.contains(&i) {
                             prepared.push(i);
                         }
+                        // And kept whole, for the page that opens once the whole
+                        // batch has been prepared.
+                        shelf.push(*ready);
                     }
                     Ok(Outcome::Skipped) => skipped += 1,
                     // The user stopped this one, so they have stopped the
@@ -4144,6 +4222,64 @@ fn real_main() -> Result<()> {
                 let _ = std::fs::remove_dir_all(&d);
             }
         }
+        }
+        // ---- the batch page: ONE page, every prepared video on it -----------
+        //
+        // This is where a batch-crop run stops for its person, and the whole
+        // reason it is here rather than inside the loop: the first pass has
+        // already prepared every video (normalize, cuts, probe) and decided
+        // nothing, so the page opens once with all of them listed, in any order,
+        // and is submitted once when the person is done with all of them.
+        //
+        // Nothing about the DECISION moved: it is still made before the
+        // expensive stage, which is what keeps a correction free. Only the
+        // number of sittings changed -- one for the batch instead of one per
+        // video.
+        //
+        // A single video never reaches here with a `shelf`: `crop_passes` gives
+        // it `CropAsk::Now`, its page opened inline, and its answer is already in
+        // the cache. So this block is the batch path and only that.
+        //
+        // ⚠️ The SAME policy that decides whether the inline page opens decides
+        // this one: `--no-crop-edit`, or nobody able to answer (a piped run, no
+        // browser), means there is no page at all. Opening one anyway would
+        // block a headless batch on a window nobody can see -- the exact failure
+        // this stage has produced before. The first pass already left every
+        // probe's own answer in the cache, so skipping the page is not a
+        // missing decision: it is "leave all of them as the probe drew them".
+        let someone = std::io::stdout().is_terminal();
+        let may_ask_crop = !cli.no_crop_edit && someone;
+        // Asked about, or not at all: a video prepared under `--no-autocrop` is
+        // not a question with an obvious answer, it is no question.
+        let askable: Vec<&PreparedCrop> = shelf.iter().filter(|p| p.askable).collect();
+        if passes.len() > 1 && !askable.is_empty() && may_ask_crop {
+            let items: Vec<cropedit::BatchItem> = askable
+                .iter()
+                .map(|p| cropedit::BatchItem {
+                    title: p.title.clone(),
+                    video: p.norm.clone(),
+                    plan: p.plan.clone(),
+                    dur_ms: p.dur_ms,
+                    fps: p.fps,
+                    aspect: p.aspect,
+                })
+                .collect();
+            let answers = cropedit::edit_batch(&items, !cli.no_browser, &|url| {
+                println!(
+                    "  {} {}  {}",
+                    t!("console.cropedit.label"),
+                    style(url).cyan().bold(),
+                    style(t!("console.cropedit.hint")).dim()
+                );
+            })?;
+            // Every answer that CHANGED something is written back where the
+            // second pass reads it. `None` means "left exactly as the probe drew
+            // it", and the cache entry already there is the right answer.
+            for (p, answer) in askable.iter().zip(answers) {
+                if let Some(edited) = answer {
+                    autocrop::write_cached(&p.cache_dir, &b.manifest, &edited, p.gamma)?;
+                }
+            }
         }
         // The batch is over, so the screen goes back: the summary, the review
         // and the picker that follows it all want the whole of it.

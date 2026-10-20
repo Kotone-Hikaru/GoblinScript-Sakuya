@@ -25,6 +25,42 @@
   #bar { background: var(--hi); color: #0e130c; font-weight: 700;
          padding: 3px 10px; display: flex; justify-content: space-between; }
   #wrap { flex: 1; display: flex; min-height: 0; }
+  /* ---- the batch rail ---------------------------------------------------
+     The list of videos this batch prepared, at the far left, and only when
+     there is more than one: a single video is not a batch and gets no rail.
+
+     This is the whole point of the batch page. The old arrangement opened one
+     page per video and waited for each, so judging ten crops meant ten
+     sittings in a fixed order. Here every prepared video is listed, any row
+     can be picked at any time, and the batch is submitted once at the end --
+     the same freedom the review page gives over pieces.
+
+     `flex: 0 0 240px` rather than a drag handle: the rail's width is a
+     property of the batch page, not a preference worth remembering, and 240px
+     is enough for a filename plus the marker that says it has been edited. */
+  #rail { flex: 0 0 240px; border-right: 2px solid var(--edge); background: var(--panel);
+          display: flex; flex-direction: column; min-height: 0; }
+  #rail.hidden { display: none; }
+  #railhead { padding: 6px 10px; border-bottom: 2px solid var(--edge);
+              color: var(--hi-dim); font-size: 12px; letter-spacing: .04em;
+              text-transform: uppercase; display: flex; justify-content: space-between; }
+  #railcount { color: var(--hi-bright); }
+  #railList { flex: 1; overflow-y: auto; min-height: 0; padding: 4px; }
+  .vrow { display: flex; align-items: baseline; gap: 6px; width: 100%;
+          padding: 6px 8px; border: 2px solid transparent; border-radius: 0;
+          background: var(--panel-2); color: var(--ink-soft); font: inherit;
+          text-align: left; cursor: pointer; margin-bottom: 3px; }
+  .vrow:hover { border-color: var(--edge); }
+  /* The row being edited. Bright border, NOT a background swap: the edited
+     marker below is also a colour, and one of them has to stay legible. */
+  .vrow.cur { border-color: var(--hi-bright); color: var(--ink); }
+  .vrow .n { flex: 0 0 auto; color: var(--hi-dim); font-size: 12px; }
+  .vrow .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* A video whose crop was changed by hand. `·` is deliberately quiet: an
+     untouched video is the normal case and must not look like a task. */
+  .vrow .ed { flex: 0 0 auto; color: var(--hi-bright); font-weight: 700; }
+  #railfoot { padding: 6px; border-top: 2px solid var(--edge); display: flex;
+              flex-direction: column; gap: 4px; }
   #left { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 10px; gap: 8px; }
   #side { width: 260px; border-left: 2px solid var(--edge); background: var(--panel);
           display: flex; flex-direction: column; min-height: 0; }
@@ -128,6 +164,18 @@
 <body>
 <div id="bar"><span data-t="cpage.title">crop</span><span id="count"></span></div>
 <div id="wrap">
+  <!-- The batch rail. Hidden for a single video, which is not a batch: one
+       page for one clip should look exactly as it always did. -->
+  <aside id="rail" class="hidden">
+    <div id="railhead">
+      <span data-t="cpage.rail.title">videos</span>
+      <span id="railcount"></span>
+    </div>
+    <div id="railList"></div>
+    <div id="railfoot">
+      <button id="railNext" data-t="cpage.rail.next">next unjudged</button>
+    </div>
+  </aside>
   <div id="left">
     <div id="stage">
       <video id="vid" src="/video" preload="metadata"></video>
@@ -215,6 +263,17 @@ function applyLang() {
 // FRACTION of the frame, which is what the plan on disk carries too.
 let segs = [], dur = 1, fps = 30, aspect = 16 / 9, cap = 0.6667, cur = 0, lock = true;
 let gview = false;
+// Which VIDEO of the batch this page is showing, and the list of them.
+//
+// Two indices, deliberately named apart: `vidIx` picks a video, `cur` picks a
+// segment OF that video. Collapsing them into one would make "shot 3 of video 5"
+// unaddressable.
+//
+// `vidIx` rides the QUERY STRING (`?v=N`) on every request. The server keeps one
+// state per video and the query is what says which -- a path segment would have
+// to be special-cased inside every route, and `/video?v=3` keeps the route table
+// flat so an index can never be mistaken for a route name.
+let vidIx = 0, items = [], batch = false;
 const $ = id => document.getElementById(id);
 const vid = $('vid');
 
@@ -226,19 +285,92 @@ async function load() {
   applyLang();
   await pull();
 }
+/** The current video's address suffix, on every state-carrying request. */
+const qv = () => '?v=' + vidIx;
 async function pull(body, path) {
   const r = body
-    ? await fetch(path || '/api/rects', { method: 'POST', body: JSON.stringify(body) })
-    : await fetch('/api/state');
+    ? await fetch((path || '/api/rects') + qv(), { method: 'POST', body: JSON.stringify(body) })
+    : await fetch('/api/state' + qv());
   const s = await r.json();
   if (!s.segs) return;
   segs = s.segs; dur = s.dur_ms || 1; fps = s.fps || 30;
   aspect = s.aspect || 16 / 9; cap = s.cap || 0.6667;
+  // The batch list comes back with every state: "this one is edited" is a
+  // property of the video that just changed, and a page asking twice would show
+  // it one round trip behind the edit the person just made.
+  items = s.items || [];
+  batch = !!s.batch;
+  if (typeof s.v === 'number') vidIx = s.v;
   // The list can now SHRINK -- a boundary can be taken back out -- so the
   // selected shot has to be brought back inside it. Every read of `segs[cur]`
   // below depends on this, and a dangling index throws on the next repaint.
   cur = Math.min(Math.max(cur, 0), Math.max(0, segs.length - 1));
+  drawRail();
   drawAll();
+}
+
+/** The batch rail: one row per prepared video, the current one lit. */
+function drawRail() {
+  const rail = $('rail'), list = $('railList');
+  if (!rail || !list) return;
+  // One video is not a batch, and a rail with a single row is a title bar.
+  rail.classList.toggle('hidden', !batch);
+  if (!batch) return;
+  list.innerHTML = '';
+  items.forEach((it, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'vrow' + (i === vidIx ? ' cur' : '');
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = (i + 1) + '/' + items.length;
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    // The ORIGINAL file's name: a person recognizes their own video, and
+    // nobody recognizes a cache path.
+    nm.textContent = it.name || '';
+    nm.title = it.name || '';
+    b.append(n, nm);
+    // A video whose crop was changed by hand. Absent rather than "unjudged":
+    // untouched is the normal outcome and must not read as a task.
+    if (it.edited) {
+      const ed = document.createElement('span');
+      ed.className = 'ed';
+      ed.textContent = '\u2022';
+      ed.title = T('cpage.rail.edited');
+      b.append(ed);
+    }
+    b.onclick = () => goVideo(i);
+    list.append(b);
+  });
+  const c = $('railcount');
+  if (c) c.textContent = items.filter(x => x.edited).length + '/' + items.length;
+}
+
+/** Switch the page to another video of the batch. */
+async function goVideo(i) {
+  if (i === vidIx || i < 0 || i >= items.length) return;
+  vidIx = i;
+  // The playhead is per video and the picture changes under it: a seek left at
+  // 4:12 would land past the end of a 30-second clip. Zero BEFORE the new state
+  // arrives, so the repaint never shows the old clock over the new picture.
+  try { vid.pause(); } catch (e) {}
+  cur = 0;
+  await pull();
+  // `src` last: the state above is already this video's, so the frame that
+  // arrives is drawn with the right rect and the right ladder of shots.
+  vid.src = '/video' + qv();
+  try { vid.currentTime = 0; } catch (e) {}
+  drawAll();
+}
+
+/** The next video nobody has touched yet -- what "next unjudged" means. */
+function nextUnjudged() {
+  for (let k = 1; k <= items.length; k++) {
+    const i = (vidIx + k) % items.length;
+    if (!items[i].edited) return i;
+  }
+  return -1;
 }
 
 // ---- geometry ------------------------------------------------------------
@@ -553,11 +685,21 @@ $('lock').onclick = () => { lock = !lock; $('lock').classList.toggle('on', lock)
 $('auto').onclick = () => post({ i: cur, rect: null });
 $('autoall').onclick = () => post({ i: -1, rect: null });
 $('all').onclick = () => post({ i: -1, rect: segs[cur].rect });
+// The whole BATCH is submitted, not this video: every video on the rail has had
+// whatever attention the person chose to give it, and the run goes on to the
+// expensive stage for all of them. That is the point of judging them together.
 $('done').onclick = async () => {
   await fetch('/api/done', { method: 'POST', body: '{}' });
   $('done').disabled = true;
   $('hint').textContent = T('cpage.wait');
   follow();
+};
+// Jump to the next video nobody has touched. Skipping videos that are already
+// done is the whole use: on a batch of ten, the interesting ones are the ones
+// still plain.
+$('railNext').onclick = () => {
+  const i = nextUnjudged();
+  if (i >= 0) goVideo(i);
 };
 
 // This PAGE is finished; the window is not. The run continues -- the next

@@ -89,20 +89,6 @@ struct Session {
     /// The frame's own aspect (w/h), so the page can keep a drawn rect the
     /// shape of the source -- the shape the encoder's square squash expects.
     aspect: f64,
-    done: bool,
-    /// The page itself was asked for at least once. A run nobody is watching
-    /// (`--no-browser`, no one at the address) has no window to steer, so it
-    /// must not leave a finished server parked behind it.
-    seen: bool,
-    /// When the page last said ANYTHING. See [`ALIVE`] and
-    /// [`Session::window_gone`].
-    heard: Instant,
-    /// When the page said GOODBYE, if it has and has not come back since.
-    ///
-    /// Kept apart from `heard` because a goodbye is not silence: it arrives at
-    /// the moment of closing, and it also arrives for a RELOAD. Recording it
-    /// and deciding later is what tells the two apart -- see [`GONE_GRACE`].
-    gone_at: Option<Instant>,
 }
 
 impl Session {
@@ -128,26 +114,6 @@ impl Session {
             return None;
         }
         Some(frame.round().clamp(lo, hi) as usize)
-    }
-    /// Has the page said it is leaving, or gone quiet for too long?
-    ///
-    /// Only meaningful once the page has been seen at all: a run with no window
-    /// (`--no-browser`, a piped run that may never connect) must never be
-    /// judged gone, or a headless run would cancel itself before anyone could
-    /// reach it.
-    fn window_gone(&self) -> bool {
-        if !self.seen {
-            return false;
-        }
-        // The page said goodbye and has not come back: believed, but only once
-        // the grace is up (a reload says goodbye too and returns in a blink).
-        if let Some(at) = self.gone_at {
-            if at.elapsed() > GONE_GRACE {
-                return true;
-            }
-        }
-        // Or it has simply gone quiet for far too long.
-        self.heard.elapsed() > ALIVE
     }
     fn json(&self) -> serde_json::Value {
         let segs: Vec<serde_json::Value> = self
@@ -180,14 +146,137 @@ impl Session {
     }
 }
 
-/// Show `plan` for `video`, let the person correct it, and hand back what they
-/// settled on. `None` when they left it exactly as the probe drew it -- the
-/// caller then keeps the automatic plan, cache stamp and all.
+/// One video's place on a batch page: what to play, the plan the probe drew for
+/// it, and the numbers the page needs to draw that plan on top of it.
+///
+/// A batch is a LIST of these; one video is a list of one. The page does not
+/// know the difference -- it asks for `?v=0` either way -- so there is one code
+/// path for both, and the only thing `batch` turns on is the rail.
+pub struct BatchItem {
+    /// What the list calls this one: the ORIGINAL file's name. A person
+    /// recognizes their own video; nobody recognizes a cache hash.
+    pub title: String,
+    /// The normalized copy -- the picture the crop is actually applied to, so
+    /// a rect drawn on it is a rect of the frames the encoder will read.
+    pub video: PathBuf,
+    pub plan: Plan,
+    pub dur_ms: f64,
+    pub fps: f64,
+    /// The frame's own aspect (w/h), per item: a batch may mix portrait and
+    /// landscape, and a rect kept "the shape of the source" needs the right one.
+    pub aspect: f64,
+}
+
+/// Every video's session at once, plus the state that belongs to the batch
+/// rather than to any one video.
+///
+/// ⚠️ `items` and `plans` are parallel and MUST stay so. [`finish`] reads the
+/// plan that went IN for the grid it was drawn on and the escape share the
+/// probe measured -- a drawn rect re-measures neither -- so pairing them wrong
+/// would silently stamp one video's numbers onto another video's answer.
+///
+/// The two indices are deliberately separate names: `v` (in the query string)
+/// picks a VIDEO, `i` (in the body) picks a SEGMENT of that video. Merging them
+/// would make the existing per-video routes impossible to reuse.
+struct Shelf {
+    items: Vec<Arc<Mutex<Session>>>,
+    plans: Vec<Plan>,
+    videos: Vec<PathBuf>,
+    titles: Vec<String>,
+    cur: usize,
+    /// The batch as a whole was submitted -- NOT "this video was looked at".
+    done: bool,
+    seen: bool,
+    heard: Instant,
+    gone_at: Option<Instant>,
+}
+
+impl Shelf {
+    /// Which video a request means. Absent, or nonsense, is the current one:
+    /// a page that predates the rail (and every existing test) sends no `v`.
+    fn at(&self, v: Option<i64>) -> usize {
+        let n = self.items.len();
+        if n == 0 {
+            return 0;
+        }
+        match v {
+            Some(x) if x >= 0 => (x as usize).min(n - 1),
+            _ => self.cur.min(n - 1),
+        }
+    }
+
+    fn session(&self, v: Option<i64>) -> Arc<Mutex<Session>> {
+        Arc::clone(&self.items[self.at(v)])
+    }
+
+    /// Has the page said it is leaving, or gone quiet for too long?
+    ///
+    /// Judged for the shelf as a whole, not per video: there is one window, and
+    /// a person who closes it has walked away from the batch -- not merely from
+    /// whichever row happened to be selected when they did.
+    fn window_gone(&self) -> bool {
+        if !self.seen {
+            return false;
+        }
+        if let Some(at) = self.gone_at {
+            if at.elapsed() > GONE_GRACE {
+                return true;
+            }
+        }
+        self.heard.elapsed() > ALIVE
+    }
+
+    /// One video's state with the rail riding along.
+    ///
+    /// The rail is on every state response rather than on a route of its own
+    /// because it is what changes when a video does: a page that had to ask
+    /// twice would show "this one is edited" one round trip behind the edit.
+    fn json(&self, v: Option<i64>) -> serde_json::Value {
+        let i = self.at(v);
+        let mut val = self.items[i].lock().unwrap().json();
+        let rows: Vec<serde_json::Value> = self
+            .items
+            .iter()
+            .zip(&self.titles)
+            .map(|(s, t)| {
+                let s = s.lock().unwrap();
+                serde_json::json!({
+                    "name": t,
+                    "edited": s.moved || s.hand.iter().any(|&h| h),
+                })
+            })
+            .collect();
+        if let Some(o) = val.as_object_mut() {
+            o.insert("v".into(), serde_json::json!(i));
+            o.insert("total".into(), serde_json::json!(self.items.len()));
+            o.insert("items".into(), serde_json::json!(rows));
+            // One video is not a batch and gets no rail: the page hides it.
+            o.insert("batch".into(), serde_json::json!(self.items.len() > 1));
+            o.insert("done".into(), serde_json::json!(self.done));
+        }
+        val
+    }
+
+    /// What the batch settled on, in item order: `None` where the person left
+    /// the probe's own plan exactly as it was.
+    fn finish_all(&self) -> Vec<Option<Plan>> {
+        (0..self.items.len())
+            .map(|i| finish(&self.items[i], &self.plans[i]))
+            .collect()
+    }
+}
+
+/// One video, kept as its own entry point.
+///
+/// This is [`edit_batch`] with a list of one. It exists because most runs ARE
+/// one video, and because the tests drive this module through it: a page for a
+/// single clip should not have to know it is standing in for a batch of one.
 ///
 /// `video` is the normalized copy: the picture the crop is actually applied
 /// to, so a rect drawn here is a rect of the frames the encoder will read.
 /// `page` hears the URL once the page is up; `open` also opens it in the
 /// browser here.
+#[allow(clippy::too_many_arguments)]
 pub fn edit(
     video: &Path,
     plan: &Plan,
@@ -197,6 +286,37 @@ pub fn edit(
     open: bool,
     page: &dyn Fn(&str),
 ) -> Result<Option<Plan>> {
+    let title = video
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "video".into());
+    let items = vec![BatchItem {
+        title,
+        video: video.to_path_buf(),
+        plan: plan.clone(),
+        dur_ms,
+        fps,
+        aspect,
+    }];
+    Ok(edit_batch(&items, open, page)?.into_iter().next().flatten())
+}
+
+/// Show `items`, let the person correct any of them in any order, and hand back
+/// what they settled on -- one entry per item, `None` where they changed
+/// nothing.
+///
+/// This is what the batch page is FOR. Nothing about the decision changed: it
+/// is still made before the expensive stage, which is what keeps a correction
+/// free. What changed is how often the person has to come back for it -- once
+/// for the batch instead of once per video.
+pub fn edit_batch(
+    items: &[BatchItem],
+    open: bool,
+    page: &dyn Fn(&str),
+) -> Result<Vec<Option<Plan>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
     // `Arc`, because a finished page outlives this call: it is parked in the
     // browser window until the next stage gives it somewhere to go (see
     // `pagewin`). The socket closes when the last holder lets go, which is
@@ -212,18 +332,31 @@ pub fn edit(
         .port();
     let url = format!("http://127.0.0.1:{port}/");
 
-    let state = Arc::new(Mutex::new(Session {
-        segs: plan.segs.clone(),
-        auto: if plan.auto.len() == plan.segs.len() {
-            plan.auto.clone()
-        } else {
-            plan.segs.clone()
-        },
-        hand: vec![false; plan.segs.len()],
-        moved: false,
-        fps,
-        dur_ms,
-        aspect,
+    let sessions: Vec<Arc<Mutex<Session>>> = items
+        .iter()
+        .map(|it| {
+            Arc::new(Mutex::new(Session {
+                segs: it.plan.segs.clone(),
+                auto: if it.plan.auto.len() == it.plan.segs.len() {
+                    it.plan.auto.clone()
+                } else {
+                    it.plan.segs.clone()
+                },
+                hand: vec![false; it.plan.segs.len()],
+                moved: false,
+                fps: it.fps,
+                dur_ms: it.dur_ms,
+                aspect: it.aspect,
+            }))
+        })
+        .collect();
+
+    let shelf = Arc::new(Mutex::new(Shelf {
+        items: sessions,
+        plans: items.iter().map(|it| it.plan.clone()).collect(),
+        videos: items.iter().map(|it| it.video.clone()).collect(),
+        titles: items.iter().map(|it| it.title.clone()).collect(),
+        cur: 0,
         done: false,
         seen: false,
         heard: Instant::now(),
@@ -231,16 +364,15 @@ pub fn edit(
     }));
 
     page(&url);
-    // The window may already be up: the previous video's crop page is parked
-    // in it waiting for exactly this address, and a batch should turn a page
-    // rather than open a window per video. `deliver` hands it over when there
-    // is one to hand over, and opens a browser when there is not.
+    // The window may already be up: the previous stage's page is parked in it
+    // waiting for exactly this address, and a batch should turn a page rather
+    // than open a window per video. `deliver` hands it over when there is one
+    // to hand over, and opens a browser when there is not.
     crate::pagewin::deliver(&url, open);
 
     // No console reading here: the draft's own display already owns the
     // keyboard (Ctrl-C included), so this stage waits on the page and on the
     // cancel flag that display sets.
-    let path = video.to_path_buf();
     loop {
         crate::cancel::check()?;
         let Some(req) = server.recv_timeout(Duration::from_millis(100))? else {
@@ -250,7 +382,7 @@ pub fn edit(
             // forever on a page nobody could answer, the console still claiming
             // to work. The page now says when it leaves (a beacon on `pagehide`)
             // and pings while it stays, so silence can be read.
-            if state.lock().unwrap().window_gone() {
+            if shelf.lock().unwrap().window_gone() {
                 // `Cancelled`, not a plain failure: the person closed the page,
                 // and `main` treats this as "the user stopped", which unwinds
                 // the batch and keeps the cache for a resumed run.
@@ -258,20 +390,27 @@ pub fn edit(
             }
             continue;
         };
-        handle(req, &state, &path)?;
-        if state.lock().unwrap().done {
-            let out = finish(&state, plan);
+        handle(req, &shelf)?;
+        // Re-read under one lock: the page may have submitted between the
+        // handle above and this line, and taking the lock twice would let a
+        // `done` that arrived in that window be missed and the loop keep
+        // waiting for a page that has already gone.
+        let (done, seen) = {
+            let s = shelf.lock().unwrap();
+            (s.done, s.seen)
+        };
+        if done {
+            let out = shelf.lock().unwrap().finish_all();
             // This PAGE is finished; the WINDOW is not. Park it so the next
-            // stage navigates it -- a crop page per video and a review at the
-            // end should be one window turning pages, not a window opening,
-            // closing and opening again. Only when someone actually opened the
-            // page: a run with no window has nothing to hand over.
-            if state.lock().unwrap().seen {
+            // stage navigates it -- the crop page and a review at the end
+            // should be one window turning pages, not a window opening, closing
+            // and opening again. Only when someone actually opened the page: a
+            // run with no window has nothing to hand over.
+            if seen {
                 crate::pagewin::park();
                 let held = Arc::clone(&server);
-                let state = Arc::clone(&state);
-                let path = path.clone();
-                std::thread::spawn(move || hold(held, state, path));
+                let shelf = Arc::clone(&shelf);
+                std::thread::spawn(move || hold(held, shelf));
             }
             return Ok(out);
         }
@@ -282,7 +421,7 @@ pub fn edit(
 ///
 /// It serves the same routes: the picture is still on screen and a scrub after
 /// Done is harmless. The one question that still matters is `/api/next`.
-fn hold(server: Arc<tiny_http::Server>, state: Arc<Mutex<Session>>, video: PathBuf) {
+fn hold(server: Arc<tiny_http::Server>, shelf: Arc<Mutex<Shelf>>) {
     let deadline = Instant::now() + crate::pagewin::PATIENCE;
     while Instant::now() < deadline && crate::pagewin::parked() {
         let req = match server.recv_timeout(Duration::from_millis(200)) {
@@ -291,7 +430,7 @@ fn hold(server: Arc<tiny_http::Server>, state: Arc<Mutex<Session>>, video: PathB
             Err(_) => return,
         };
         let leaving = req.url().starts_with("/api/left");
-        if handle(req, &state, &video).is_err() || leaving {
+        if handle(req, &shelf).is_err() || leaving {
             return;
         }
     }
@@ -349,22 +488,47 @@ fn same(a: Rect, b: Rect) -> bool {
         && (a.3 - b.3).abs() < 1e-9
 }
 
-fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &PathBuf) -> Result<()> {
+/// Which video a URL means: `?v=3`, or nothing.
+///
+/// Absent is the CURRENT one, not an error: a page that predates the rail (and
+/// every test that drives this module directly) sends no `v` at all, and it is
+/// looking at exactly the video it was opened on.
+fn asked_v(url: &str) -> Option<i64> {
+    let q = url.split_once('?')?.1;
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("v=") {
+            return v.parse::<i64>().ok();
+        }
+    }
+    None
+}
+
+fn handle(mut req: tiny_http::Request, shelf: &Arc<Mutex<Shelf>>) -> Result<()> {
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+    let v = asked_v(&url);
     // ANY request proves the page is still there. Stamp it before routing, so a
     // route added later cannot forget to -- the liveness signal is a property of
     // "the page spoke", not of which URL it spoke to.
+    //
+    // Remembered for the whole batch, not per video: there is ONE window, and
+    // its heartbeat says a person is there, not which row they are on.
     {
-        let mut s = state.lock().unwrap();
+        let mut s = shelf.lock().unwrap();
         s.heard = Instant::now();
         // Speaking again retracts a goodbye: this is what makes a reload (or a
         // window restored from the taskbar) harmless.
         s.gone_at = None;
+        // A route without `v` means "the one I am on", so record it as such --
+        // otherwise a page that only ever sends bare routes (an older page, a
+        // test) would leave `cur` pinned at whatever the last indexed route said.
+        if v.is_some() {
+            s.cur = s.at(v);
+        }
     }
     match (req.method().clone(), path.as_str()) {
         (Method::Get, "/") | (Method::Get, "/index.html") => {
-            state.lock().unwrap().seen = true;
+            shelf.lock().unwrap().seen = true;
             let _ = req.respond(
                 // No caching: this page is the program, and a stored copy would
                 // outlive the version that wrote it.
@@ -385,7 +549,7 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
         // record (every request below does). A real close stays silent and is
         // therefore still gone a moment later.
         (Method::Post, "/api/gone") => {
-            state.lock().unwrap().gone_at = Some(Instant::now());
+            shelf.lock().unwrap().gone_at = Some(Instant::now());
             let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
         }
         // The page's heartbeat. It carries no question and no answer -- the fact
@@ -409,29 +573,51 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
             let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
         }
         (Method::Get, "/api/state") => {
-            let v = state.lock().unwrap().json();
-            let _ = req.respond(json_response(&v));
+            let out = shelf.lock().unwrap().json(v);
+            let _ = req.respond(json_response(&out));
         }
         (Method::Get, "/api/lang") => {
             let _ = req.respond(json_response(&crate::lang::catalog_json()));
         }
+        // ⚠️ The video is chosen by the QUERY, not by a path segment: a batch
+        // serves N files from one address, and `/video?v=3` keeps the route
+        // table flat so an index can never be mistaken for a route name.
         (Method::Get, "/video") => {
-            serve_file_threaded(req, video.clone(), video_ctype(video));
+            let file = {
+                let s = shelf.lock().unwrap();
+                s.videos[s.at(v)].clone()
+            };
+            serve_file_threaded(req, file.clone(), video_ctype(&file));
         }
         (Method::Post, "/api/rects") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
-            let v = apply(state, &body);
-            let _ = req.respond(json_response(&v));
+            let out = {
+                let state = { shelf.lock().unwrap().session(v) };
+                // `apply` takes and releases the item's lock; the shelf's own
+                // JSON then re-locks every item to build the rail, which would
+                // deadlock if these two overlapped.
+                let _ = apply(&state, &body);
+                shelf.lock().unwrap().json(v)
+            };
+            let _ = req.respond(json_response(&out));
         }
         (Method::Post, "/api/cuts") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
-            let v = apply_cuts(state, &body);
-            let _ = req.respond(json_response(&v));
+            let out = {
+                let state = { shelf.lock().unwrap().session(v) };
+                let _ = apply_cuts(&state, &body);
+                shelf.lock().unwrap().json(v)
+            };
+            let _ = req.respond(json_response(&out));
         }
+        // The BATCH is submitted, not this video. Every video has had whatever
+        // attention its person chose to give it, and the run goes on to the
+        // expensive stage for all of them -- which is the whole point of
+        // judging them together.
         (Method::Post, "/api/done") => {
-            state.lock().unwrap().done = true;
+            shelf.lock().unwrap().done = true;
             let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
         }
         _ => {
@@ -447,14 +633,19 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
 /// Everything about a posted rect is checked here rather than trusted: the
 /// page is a page, and a rect that left the frame or shrank past the zoom cap
 /// would reach ffmpeg as a crop filter.
+///
+/// `v` names the VIDEO (from the query string) and `i` the segment (from the
+/// body). Two different questions on two different videos' worth of state --
+/// keeping them apart is what lets the same route serve one video and a batch
+/// of them.
 fn apply(state: &Arc<Mutex<Session>>, body: &str) -> serde_json::Value {
     let mut s = state.lock().unwrap();
-    let v: serde_json::Value = match serde_json::from_str(body) {
+    let msg: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return serde_json::json!({"ok": false}),
     };
-    let i = v.get("i").and_then(|x| x.as_i64()).unwrap_or(-1);
-    let want: Option<Rect> = v.get("rect").and_then(|r| {
+    let i = msg.get("i").and_then(|x| x.as_i64()).unwrap_or(-1);
+    let want: Option<Rect> = msg.get("rect").and_then(|r| {
         let a = r.as_array()?;
         (a.len() == 4).then(|| {
             let n = |k: usize| a[k].as_f64().unwrap_or(f64::NAN);
@@ -476,9 +667,7 @@ fn apply(state: &Arc<Mutex<Session>>, body: &str) -> serde_json::Value {
             }
         }
     }
-    let v = s.json();
-    drop(s);
-    v
+    s.json()
 }
 
 /// One posted change to the segment STARTS -- the boundaries between the rects,
@@ -496,91 +685,89 @@ fn apply(state: &Arc<Mutex<Session>>, body: &str) -> serde_json::Value {
 /// is never a change to the picture on its own. Moving the boundary is.
 fn apply_cuts(state: &Arc<Mutex<Session>>, body: &str) -> serde_json::Value {
     let mut s = state.lock().unwrap();
-    let v: serde_json::Value = match serde_json::from_str(body) {
+    let msg: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return serde_json::json!({"ok": false}),
     };
-    let frame = v.get("frame").and_then(|x| x.as_f64());
-    let i = v.get("i").and_then(|x| x.as_i64()).unwrap_or(-1);
-    match v.get("op").and_then(|x| x.as_str()) {
-        Some("add") => {
-            let Some(frame) = frame else {
-                return serde_json::json!({"ok": false});
-            };
-            // which segment is this frame in? the last one that starts at or
-            // before it -- the page's own rule, so the two agree
-            let mut at = 0usize;
-            for (k, &(f, _)) in s.segs.iter().enumerate() {
-                if f as f64 <= frame {
-                    at = k;
+    let frame = msg.get("frame").and_then(|x| x.as_f64());
+    let i = msg.get("i").and_then(|x| x.as_i64()).unwrap_or(-1);
+    match msg.get("op").and_then(|x| x.as_str()) {
+            Some("add") => {
+                let Some(frame) = frame else {
+                    return serde_json::json!({"ok": false});
+                };
+                // which segment is this frame in? the last one that starts at or
+                // before it -- the page's own rule, so the two agree
+                let mut at = 0usize;
+                for (k, &(f, _)) in s.segs.iter().enumerate() {
+                    if f as f64 <= frame {
+                        at = k;
+                    }
                 }
+                let last = s.frames() - 1.0;
+                if at == 0 && frame.round() <= 0.0 {
+                    return s.json(); // the clip's own start is not a split
+                }
+                if frame.round() >= last {
+                    return s.json();
+                }
+                if at + 1 < s.segs.len() && s.segs[at + 1].0 as f64 <= frame.round() {
+                    return s.json(); // a boundary is already there
+                }
+                // the split takes the frame the pointer named, so the new shot
+                // begins exactly where the person pointed
+                let f = frame.round().clamp(1.0, last) as usize;
+                if s.segs.iter().any(|&(g, _)| g == f) {
+                    return s.json();
+                }
+                let (start, rect) = s.segs[at];
+                let auto = s.auto.get(at).copied().unwrap_or((start, rect));
+                let hand = s.hand.get(at).copied().unwrap_or(false);
+                s.segs.insert(at + 1, (f, rect));
+                s.auto.insert(at + 1, (f, auto.1));
+                s.hand.insert(at + 1, hand);
+                s.moved = true;
             }
-            let last = s.frames() - 1.0;
-            if at == 0 && frame.round() <= 0.0 {
-                return s.json(); // the clip's own start is not a split
+            Some("move") => {
+                let Some(frame) = frame else {
+                    return serde_json::json!({"ok": false});
+                };
+                if i <= 0 || i as usize >= s.segs.len() {
+                    return s.json();
+                }
+                let k = i as usize;
+                let Some(f) = s.clamp_frame(k, frame) else {
+                    return s.json();
+                };
+                if f == s.segs[k].0 {
+                    return s.json();
+                }
+                s.segs[k].0 = f;
+                // the probe's own rect for a boundary it never drew is the one
+                // beside it: "auto" for a shot the person invented is the rect
+                // the shot it came out of would get
+                if let Some(a) = s.auto.get_mut(k) {
+                    a.0 = f;
+                }
+                s.moved = true;
             }
-            if frame.round() >= last {
-                return s.json();
+            Some("del") => {
+                if i <= 0 || i as usize >= s.segs.len() {
+                    return s.json();
+                }
+                let k = i as usize;
+                s.segs.remove(k);
+                if k < s.auto.len() {
+                    s.auto.remove(k);
+                }
+                if k < s.hand.len() {
+                    s.hand.remove(k);
+                }
+                s.moved = true;
             }
-            if at + 1 < s.segs.len() && s.segs[at + 1].0 as f64 <= frame.round() {
-                return s.json(); // a boundary is already there
-            }
-            // the split takes the frame the pointer named, so the new shot
-            // begins exactly where the person pointed
-            let f = frame.round().clamp(1.0, last) as usize;
-            if s.segs.iter().any(|&(g, _)| g == f) {
-                return s.json();
-            }
-            let (start, rect) = s.segs[at];
-            let auto = s.auto.get(at).copied().unwrap_or((start, rect));
-            let hand = s.hand.get(at).copied().unwrap_or(false);
-            s.segs.insert(at + 1, (f, rect));
-            s.auto.insert(at + 1, (f, auto.1));
-            s.hand.insert(at + 1, hand);
-            s.moved = true;
-        }
-        Some("move") => {
-            let Some(frame) = frame else {
-                return serde_json::json!({"ok": false});
-            };
-            if i <= 0 || i as usize >= s.segs.len() {
-                return s.json();
-            }
-            let k = i as usize;
-            let Some(f) = s.clamp_frame(k, frame) else {
-                return s.json();
-            };
-            if f == s.segs[k].0 {
-                return s.json();
-            }
-            s.segs[k].0 = f;
-            // the probe's own rect for a boundary it never drew is the one
-            // beside it: "auto" for a shot the person invented is the rect the
-            // shot it came out of would get
-            if let Some(a) = s.auto.get_mut(k) {
-                a.0 = f;
-            }
-            s.moved = true;
-        }
-        Some("del") => {
-            if i <= 0 || i as usize >= s.segs.len() {
-                return s.json();
-            }
-            let k = i as usize;
-            s.segs.remove(k);
-            if k < s.auto.len() {
-                s.auto.remove(k);
-            }
-            if k < s.hand.len() {
-                s.hand.remove(k);
-            }
-            s.moved = true;
-        }
         _ => return serde_json::json!({"ok": false}),
     }
-    let v = s.json();
-    drop(s);
-    v
+    s.json()
 }
 
 /// A rect the decode can be handed: inside the frame, no smaller than the zoom
@@ -604,7 +791,11 @@ mod tests {
 
     /// A probe's plan and the page that opens on it -- one shot per rect,
     /// each starting 900 frames after the one before.
-    fn opened(rects: &[Rect]) -> (Plan, Arc<Mutex<Session>>) {
+    ///
+    /// A shelf of ONE, because that is what a single video is: the same
+    /// container the batch page uses, so these tests exercise the code that
+    /// actually runs rather than a simplified twin of it.
+    fn shelf_of(rects: &[Rect]) -> (Plan, Arc<Mutex<Shelf>>) {
         let segs: Vec<(usize, Rect)> =
             rects.iter().enumerate().map(|(i, &r)| (i * 900, r)).collect();
         let plan = Plan {
@@ -615,7 +806,7 @@ mod tests {
             escape_share: 0.03,
             placed: 0,
         };
-        let page = Arc::new(Mutex::new(Session {
+        let item = Arc::new(Mutex::new(Session {
             auto: segs.clone(),
             hand: vec![false; segs.len()],
             segs,
@@ -623,31 +814,43 @@ mod tests {
             fps: 30.0,
             dur_ms: 60_000.0,
             aspect: 16.0 / 9.0,
+        }));
+        let shelf = Arc::new(Mutex::new(Shelf {
+            items: vec![item],
+            plans: vec![plan.clone()],
+            videos: vec![PathBuf::from("no-such-video.mp4")],
+            titles: vec!["no-such-video.mp4".to_string()],
+            cur: 0,
             done: false,
             seen: false,
             heard: Instant::now(),
             gone_at: None,
         }));
-        (plan, page)
+        (plan, shelf)
+    }
+
+    /// The one video a single-item shelf holds, for the per-video assertions.
+    fn only(shelf: &Arc<Mutex<Shelf>>) -> Arc<Mutex<Session>> {
+        Arc::clone(&shelf.lock().unwrap().items[0])
     }
 
     /// A page that posts nothing leaves the probe's plan exactly as it was --
     /// including its cache stamp, which a manual plan would have replaced.
     #[test]
     fn an_untouched_page_hands_back_no_plan() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
-        assert!(finish(&s, &src).is_none());
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        assert!(finish(&only(&s), &src).is_none());
     }
 
     /// THE BUG THIS FIXES, from both sides.
     ///
     /// Before this, `edit`'s loop had no exit but "Done" or Ctrl-C: closing the
     /// tab left the process waiting on a page that would never answer, with the
-    /// console still claiming to work. The judgement now comes from the session,
+    /// console still claiming to work. The judgement now comes from the shelf,
     /// so it can be tested without a browser.
     #[test]
     fn a_closed_window_is_noticed_and_an_open_one_is_not() {
-        let (_p, s) = opened(&[(0.1, 0.1, 0.7, 0.7)]);
+        let (_p, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7)]);
 
         // A run nobody is watching has no window to lose. Judging it gone would
         // make a headless run cancel itself before anyone could reach it.
@@ -677,7 +880,7 @@ mod tests {
     /// with no page coming back -- and coming back is what retracts it.
     #[test]
     fn a_reload_says_goodbye_and_is_forgiven() {
-        let (_p, s) = opened(&[(0.1, 0.1, 0.7, 0.7)]);
+        let (_p, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7)]);
         {
             let mut g = s.lock().unwrap();
             g.seen = true;
@@ -706,9 +909,9 @@ mod tests {
 
     #[test]
     fn a_drawn_rect_replaces_one_shot_and_survives_the_merge() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), (0.1, 0.1, 0.7, 0.7), IDENTITY]);
-        apply(&s, r#"{"i":1,"rect":[0.2,0.05,0.75,0.75]}"#);
-        let p = finish(&s, &src).expect("a hand-drawn rect is a plan");
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), (0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        apply(&only(&s), r#"{"i":1,"rect":[0.2,0.05,0.75,0.75]}"#);
+        let p = finish(&only(&s), &src).expect("a hand-drawn rect is a plan");
         assert!(p.manual);
         // three shots, three rects, none of them equal to its neighbour now
         assert_eq!(p.segs.len(), 3);
@@ -720,9 +923,9 @@ mod tests {
 
     #[test]
     fn one_rect_for_every_shot_merges_into_one_segment() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY, (0.2, 0.2, 0.7, 0.7)]);
-        apply(&s, r#"{"i":-1,"rect":[0.15,0.15,0.7,0.7]}"#);
-        let p = finish(&s, &src).expect("a hand-drawn rect is a plan");
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY, (0.2, 0.2, 0.7, 0.7)]);
+        apply(&only(&s), r#"{"i":-1,"rect":[0.15,0.15,0.7,0.7]}"#);
+        let p = finish(&only(&s), &src).expect("a hand-drawn rect is a plan");
         assert_eq!(p.segs.len(), 1, "one rect throughout is one decode segment");
         assert_eq!(p.segs[0].0, 0);
     }
@@ -731,12 +934,12 @@ mod tests {
     /// counting as hand-drawn, so a page fully reset hands back nothing.
     #[test]
     fn auto_puts_a_shot_back_and_a_full_reset_hands_back_nothing() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
-        apply(&s, r#"{"i":0,"rect":[0.2,0.2,0.7,0.7]}"#);
-        assert!(finish(&s, &src).is_some());
-        apply(&s, r#"{"i":0,"rect":null}"#);
-        assert!(finish(&s, &src).is_none());
-        assert!((s.lock().unwrap().segs[0].1 .0 - 0.1).abs() < 1e-12);
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        apply(&only(&s), r#"{"i":0,"rect":[0.2,0.2,0.7,0.7]}"#);
+        assert!(finish(&only(&s), &src).is_some());
+        apply(&only(&s), r#"{"i":0,"rect":null}"#);
+        assert!(finish(&only(&s), &src).is_none());
+        assert!((only(&s).lock().unwrap().segs[0].1 .0 - 0.1).abs() < 1e-12);
     }
 
     /// The page end to end, over its own socket: the state it publishes, a
@@ -750,7 +953,7 @@ mod tests {
         // sets it may run beside this one
         let _guard = crate::cancel::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::cancel::reset();
-        let (plan, _) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        let (plan, _) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let worker = std::thread::spawn(move || {
             edit(Path::new("no-such-video.mp4"), &plan, 60_000.0, 30.0, 16.0 / 9.0, false, &|url| {
@@ -848,9 +1051,9 @@ mod tests {
     /// does not change on its own; only the boundary does.
     #[test]
     fn a_split_inherits_the_shot_it_came_out_of() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
-        apply(&s, r#"{"i":0,"rect":[0.2,0.2,0.7,0.7]}"#);
-        let after = apply_cuts(&s, r#"{"op":"add","frame":300}"#);
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        apply(&only(&s), r#"{"i":0,"rect":[0.2,0.2,0.7,0.7]}"#);
+        let after = apply_cuts(&only(&s), r#"{"op":"add","frame":300}"#);
         assert_eq!(after["segs"].as_array().unwrap().len(), 3);
         // frames 300 and 900, the new one exactly where it was asked for
         assert_eq!(after["segs"][1]["t_ms"].as_f64().unwrap(), 10_000.0);
@@ -860,7 +1063,7 @@ mod tests {
         assert!((after["segs"][1]["rect"][0].as_f64().unwrap() - 0.2).abs() < 1e-9);
         assert!(after["segs"][1]["hand"].as_bool().unwrap());
         // the plan that comes back is the page's, and runnable
-        let p = finish(&s, &src).expect("a placed boundary is a plan");
+        let p = finish(&only(&s), &src).expect("a placed boundary is a plan");
         assert!(p.manual);
         assert!(p.is_runnable());
     }
@@ -870,18 +1073,18 @@ mod tests {
     /// would refuse, whatever it posts.
     #[test]
     fn a_moved_boundary_stays_on_the_grid_and_between_its_neighbours() {
-        let (_, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY, (0.2, 0.2, 0.7, 0.7)]);
+        let (_, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY, (0.2, 0.2, 0.7, 0.7)]);
         // 900 -> 1200, the last frame before the next boundary at 1800
-        let a = apply_cuts(&s, r#"{"op":"move","i":1,"frame":1200.4}"#);
+        let a = apply_cuts(&only(&s), r#"{"op":"move","i":1,"frame":1200.4}"#);
         assert_eq!(a["segs"][1]["t_ms"].as_f64().unwrap(), 40_000.0);
         // dragged past its right neighbour: pinned to one frame short of it
-        let b = apply_cuts(&s, r#"{"op":"move","i":1,"frame":999999}"#);
+        let b = apply_cuts(&only(&s), r#"{"op":"move","i":1,"frame":999999}"#);
         assert_eq!(b["segs"][1]["t_ms"].as_f64().unwrap(), 1799.0 / 30.0 * 1000.0);
         // ...and past its left neighbour, likewise
-        let c = apply_cuts(&s, r#"{"op":"move","i":1,"frame":-50}"#);
+        let c = apply_cuts(&only(&s), r#"{"op":"move","i":1,"frame":-50}"#);
         assert_eq!(c["segs"][1]["t_ms"].as_f64().unwrap(), 1.0 / 30.0 * 1000.0);
         // the clip's own start is not a boundary and never moves
-        let d = apply_cuts(&s, r#"{"op":"move","i":0,"frame":500}"#);
+        let d = apply_cuts(&only(&s), r#"{"op":"move","i":0,"frame":500}"#);
         assert_eq!(d["segs"][0]["t_ms"].as_f64().unwrap(), 0.0);
     }
 
@@ -890,13 +1093,13 @@ mod tests {
     /// own, so splitting is not "one more segment" for its own sake.
     #[test]
     fn a_split_between_two_equal_rects_does_not_survive_the_merge() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
-        apply_cuts(&s, r#"{"op":"add","frame":300}"#);
-        let p = finish(&s, &src).expect("a placed boundary is a plan on its own");
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        apply_cuts(&only(&s), r#"{"op":"add","frame":300}"#);
+        let p = finish(&only(&s), &src).expect("a placed boundary is a plan on its own");
         assert_eq!(p.segs.len(), 2, "the two halves still share one rect");
         // ...but give one of them its own rect and the split is real
-        apply(&s, r#"{"i":1,"rect":[0.35,0.1,0.7,0.7]}"#);
-        let p = finish(&s, &src).unwrap();
+        apply(&only(&s), r#"{"i":1,"rect":[0.35,0.1,0.7,0.7]}"#);
+        let p = finish(&only(&s), &src).unwrap();
         assert_eq!(p.segs.len(), 3);
         assert_eq!(p.segs[1].0, 300);
     }
@@ -905,17 +1108,17 @@ mod tests {
     /// nothing else about the plan changes.
     #[test]
     fn a_removed_boundary_hands_its_frames_back() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), (0.2, 0.2, 0.7, 0.7), IDENTITY]);
-        let a = apply_cuts(&s, r#"{"op":"del","i":1}"#);
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), (0.2, 0.2, 0.7, 0.7), IDENTITY]);
+        let a = apply_cuts(&only(&s), r#"{"op":"del","i":1}"#);
         assert_eq!(a["segs"].as_array().unwrap().len(), 2);
         // what was the third shot is now the second, at its own frame
         assert_eq!(a["segs"][1]["t_ms"].as_f64().unwrap(), 60_000.0);
         assert!((a["segs"][0]["rect"][0].as_f64().unwrap() - 0.1).abs() < 1e-9);
         // the clip's own start is not removable: the list is unchanged
-        let b = apply_cuts(&s, r#"{"op":"del","i":0}"#);
+        let b = apply_cuts(&only(&s), r#"{"op":"del","i":0}"#);
         assert_eq!(b["segs"].as_array().unwrap().len(), 2);
         // and a boundary the page placed survives into the plan it hands over
-        let p = finish(&s, &src).expect("a removed boundary is a plan too");
+        let p = finish(&only(&s), &src).expect("a removed boundary is a plan too");
         assert_eq!(p.segs.len(), 2);
         assert_eq!(p.segs[1].0, 1800);
     }
@@ -928,7 +1131,7 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         let _guard = crate::cancel::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::cancel::reset();
-        let (plan, _) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        let (plan, _) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let worker = std::thread::spawn(move || {
             edit(Path::new("no-such-video.mp4"), &plan, 60_000.0, 30.0, 16.0 / 9.0, false, &|url| {
@@ -1005,14 +1208,141 @@ mod tests {
     /// refuses, so the page's own answer is never allowed to be one.
     #[test]
     fn the_handed_back_plan_always_starts_at_frame_zero() {
-        let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
+        let (src, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
         {
-            let mut g = s.lock().unwrap();
+            let item = only(&s);
+            let mut g = item.lock().unwrap();
             g.segs[0].0 = 12;   // as if something upstream had moved the start
             g.moved = true;
         }
-        let p = finish(&s, &src).expect("a moved boundary is a plan");
+        let p = finish(&only(&s), &src).expect("a moved boundary is a plan");
         assert_eq!(p.segs[0].0, 0);
         assert!(p.is_runnable());
+    }
+
+    // ---- the batch, which is the reason any of this has a list --------------
+    //
+    // One video per page meant one sitting per video: judging ten crops was
+    // ten separate waits, in a fixed order. The batch page lists every prepared
+    // video at once, any of them can be picked at any time, and the batch is
+    // submitted once. These tests hold that shape.
+
+    /// Two videos on one shelf, each with its own state.
+    fn shelf_pair() -> Arc<Mutex<Shelf>> {
+        let session = |rects: &[Rect]| {
+            let segs: Vec<(usize, Rect)> =
+                rects.iter().enumerate().map(|(i, &r)| (i * 900, r)).collect();
+            Arc::new(Mutex::new(Session {
+                auto: segs.clone(),
+                hand: vec![false; segs.len()],
+                segs,
+                moved: false,
+                fps: 30.0,
+                dur_ms: 60_000.0,
+                aspect: 16.0 / 9.0,
+            }))
+        };
+        let plan = |a: Rect| Plan {
+            auto: vec![(0, a)],
+            segs: vec![(0, a)],
+            manual: false,
+            grid: 24,
+            escape_share: 0.0,
+            placed: 0,
+        };
+        Arc::new(Mutex::new(Shelf {
+            items: vec![
+                session(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]),
+                session(&[(0.2, 0.2, 0.6, 0.6)]),
+            ],
+            plans: vec![plan((0.1, 0.1, 0.7, 0.7)), plan((0.2, 0.2, 0.6, 0.6))],
+            videos: vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")],
+            titles: vec!["a.mp4".into(), "b.mp4".into()],
+            cur: 0,
+            done: false,
+            seen: false,
+            heard: Instant::now(),
+            gone_at: None,
+        }))
+    }
+
+    /// THE POINT OF THE CHANGES: an edit on the SECOND video lands on the
+    /// second video, and the first is untouched.
+    ///
+    /// A one-video page cannot get this wrong, and a two-video page gets it
+    /// wrong by default: `?v=1` is what says which state the posted rect
+    /// belongs to, and dropping it would apply every edit to whatever row was
+    /// saved last.
+    #[test]
+    fn an_edit_lands_on_the_video_it_names_and_no_other() {
+        let s = shelf_pair();
+        // one rect over every shot of video 1
+        let after = {
+            let state = s.lock().unwrap().session(Some(1));
+            apply(&state, r#"{"i":-1,"rect":[0.3,0.3,0.5,0.5]}"#);
+            s.lock().unwrap().json(Some(1))
+        };
+        // the rail says so, on that row and only that row
+        assert!(after["items"][1]["edited"].as_bool().unwrap());
+        assert!(!after["items"][0]["edited"].as_bool().unwrap());
+        // and video 0's own state is still exactly what the probe drew
+        let zero = s.lock().unwrap().json(Some(0));
+        assert!(!zero["edited"].as_bool().unwrap());
+        assert!((zero["segs"][0]["rect"][0].as_f64().unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    /// The batch is submitted ONCE, and the answers come back in the order the
+    /// items went in -- `plans` is read alongside `items` by index, so a
+    /// reordering here would stamp one video's grid onto another's plan.
+    #[test]
+    fn the_batch_hands_back_one_answer_per_video_in_order() {
+        let s = shelf_pair();
+        // Change only the second, and only its first shot. The rect is over the
+        // zoom cap on purpose: `legal` LIFTS anything smaller to it, so a
+        // too-small one here would test the clamp instead of the routing.
+        {
+            let state = s.lock().unwrap().session(Some(1));
+            apply(&state, r#"{"i":0,"rect":[0.3,0.3,0.7,0.7]}"#);
+        }
+        let out = s.lock().unwrap().finish_all();
+        assert_eq!(out.len(), 2, "one entry per video");
+        assert!(out[0].is_none(), "video 0 was never touched");
+        let second = out[1].clone().expect("video 1 was edited");
+        assert!(second.manual);
+        assert!((second.segs[0].1 .0 - 0.3).abs() < 1e-9);
+    }
+
+    /// A `v` the page invented -- a stale index from a tab that outlived an
+    /// edit -- must not panic the batch loop. It lands on the last video, which
+    /// is the only neighbour a stale index has.
+    #[test]
+    fn an_index_past_the_end_is_brought_back_inside_the_list() {
+        let s = shelf_pair();
+        let n = s.lock().unwrap().items.len();
+        assert_eq!(s.lock().unwrap().at(Some(99)), n - 1);
+        assert_eq!(s.lock().unwrap().at(Some(-1)), 0, "negative = the current one");
+        assert_eq!(s.lock().unwrap().at(None), 0, "absent = the current one");
+    }
+
+    /// One video is not a batch: the page hides the rail, and `batch` is what
+    /// it hides it on. A single-video run must look exactly as it always did.
+    #[test]
+    fn a_single_video_is_not_a_batch() {
+        let (_p, s) = shelf_of(&[(0.1, 0.1, 0.7, 0.7)]);
+        let j = s.lock().unwrap().json(None);
+        assert!(!j["batch"].as_bool().unwrap(), "one video gets no rail");
+        assert_eq!(j["total"].as_u64().unwrap(), 1);
+        // and a batch of two does
+        assert!(shelf_pair().lock().unwrap().json(None)["batch"].as_bool().unwrap());
+    }
+
+    /// The page is told the index it is on, so a reload of a batch page lands
+    /// back on the same video rather than silently jumping to the first.
+    #[test]
+    fn the_state_says_which_video_it_is() {
+        let s = shelf_pair();
+        let j = s.lock().unwrap().json(Some(1));
+        assert_eq!(j["v"].as_u64().unwrap(), 1);
+        assert_eq!(j["items"][1]["name"].as_str().unwrap(), "b.mp4");
     }
 }

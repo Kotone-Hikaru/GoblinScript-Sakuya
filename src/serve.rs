@@ -863,7 +863,7 @@ fn work(
                         // Unreachable by construction: `CropAsk::Now` above
                         // never defers. Says so rather than pretending a
                         // prepared draft is a finished one.
-                        Outcome::Prepared => {
+                        Outcome::Prepared(_) => {
                             anyhow::bail!("a crop decision cannot defer here (CropAsk::Now)")
                         }
                     }
