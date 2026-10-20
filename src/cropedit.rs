@@ -43,6 +43,34 @@ use tiny_http::{Method, Response};
 use crate::autocrop::{Plan, Rect, IDENTITY};
 use crate::review::{header, json_response, serve_file_threaded, video_ctype};
 
+/// How long the page may be silent before its window counts as GONE.
+///
+/// ⚠️ This is a BACKSTOP, not the main signal -- and the value looks absurd
+/// until you know why. A browser throttles a HIDDEN tab's timers, and after
+/// five minutes of hiding Chrome's "intensive throttling" drops them to about
+/// once a minute. So silence does NOT mean "closed": it means "closed, or in
+/// the background behind a timer the browser chose to slow down", and those two
+/// must not be confused. Judging on a few seconds of quiet would cancel a batch
+/// under someone who was simply looking at something else.
+///
+/// The real signal is the page SAYING it is leaving: `pagehide` plus
+/// `sendBeacon('/api/gone')`, which the browser delivers even as the tab dies.
+/// That covers the ordinary "I closed the window" case immediately. This
+/// timeout only catches what no beacon can report -- a browser killed, a
+/// machine asleep, a tab frozen -- and three minutes is long enough to survive a
+/// throttled-but-alive tab (sixty-second pings) with a wide margin.
+const ALIVE: Duration = Duration::from_secs(180);
+
+/// How long after a goodbye the page has to come BACK before the goodbye is
+/// believed.
+///
+/// `pagehide` fires for a reload exactly as it does for a close, so acting on it
+/// at once would cancel the batch under anyone pressing F5. A reload comes back
+/// in a fraction of a second and clears the record; a close never does. Two
+/// seconds is far longer than a reload needs and far shorter than anyone
+/// notices.
+const GONE_GRACE: Duration = Duration::from_secs(2);
+
 /// What the page edits and what the caller gets back.
 struct Session {
     /// One entry per shot, in plan order: where it starts (frame), and the
@@ -66,6 +94,15 @@ struct Session {
     /// (`--no-browser`, no one at the address) has no window to steer, so it
     /// must not leave a finished server parked behind it.
     seen: bool,
+    /// When the page last said ANYTHING. See [`ALIVE`] and
+    /// [`Session::window_gone`].
+    heard: Instant,
+    /// When the page said GOODBYE, if it has and has not come back since.
+    ///
+    /// Kept apart from `heard` because a goodbye is not silence: it arrives at
+    /// the moment of closing, and it also arrives for a RELOAD. Recording it
+    /// and deciding later is what tells the two apart -- see [`GONE_GRACE`].
+    gone_at: Option<Instant>,
 }
 
 impl Session {
@@ -91,6 +128,26 @@ impl Session {
             return None;
         }
         Some(frame.round().clamp(lo, hi) as usize)
+    }
+    /// Has the page said it is leaving, or gone quiet for too long?
+    ///
+    /// Only meaningful once the page has been seen at all: a run with no window
+    /// (`--no-browser`, a piped run that may never connect) must never be
+    /// judged gone, or a headless run would cancel itself before anyone could
+    /// reach it.
+    fn window_gone(&self) -> bool {
+        if !self.seen {
+            return false;
+        }
+        // The page said goodbye and has not come back: believed, but only once
+        // the grace is up (a reload says goodbye too and returns in a blink).
+        if let Some(at) = self.gone_at {
+            if at.elapsed() > GONE_GRACE {
+                return true;
+            }
+        }
+        // Or it has simply gone quiet for far too long.
+        self.heard.elapsed() > ALIVE
     }
     fn json(&self) -> serde_json::Value {
         let segs: Vec<serde_json::Value> = self
@@ -169,6 +226,8 @@ pub fn edit(
         aspect,
         done: false,
         seen: false,
+        heard: Instant::now(),
+        gone_at: None,
     }));
 
     page(&url);
@@ -185,6 +244,18 @@ pub fn edit(
     loop {
         crate::cancel::check()?;
         let Some(req) = server.recv_timeout(Duration::from_millis(100))? else {
+            // Nothing arrived. That is NORMAL while a person studies the
+            // picture -- but it is also what a closed window looks like, and
+            // this loop used to have no way to tell them apart: it waited
+            // forever on a page nobody could answer, the console still claiming
+            // to work. The page now says when it leaves (a beacon on `pagehide`)
+            // and pings while it stays, so silence can be read.
+            if state.lock().unwrap().window_gone() {
+                // `Cancelled`, not a plain failure: the person closed the page,
+                // and `main` treats this as "the user stopped", which unwinds
+                // the batch and keeps the cache for a resumed run.
+                anyhow::bail!(crate::cancel::Cancelled);
+            }
             continue;
         };
         handle(req, &state, &path)?;
@@ -281,6 +352,16 @@ fn same(a: Rect, b: Rect) -> bool {
 fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &PathBuf) -> Result<()> {
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+    // ANY request proves the page is still there. Stamp it before routing, so a
+    // route added later cannot forget to -- the liveness signal is a property of
+    // "the page spoke", not of which URL it spoke to.
+    {
+        let mut s = state.lock().unwrap();
+        s.heard = Instant::now();
+        // Speaking again retracts a goodbye: this is what makes a reload (or a
+        // window restored from the taskbar) harmless.
+        s.gone_at = None;
+    }
     match (req.method().clone(), path.as_str()) {
         (Method::Get, "/") | (Method::Get, "/index.html") => {
             state.lock().unwrap().seen = true;
@@ -291,6 +372,29 @@ fn handle(mut req: tiny_http::Request, state: &Arc<Mutex<Session>>, video: &Path
                     .with_header(header("Content-Type", "text/html; charset=utf-8"))
                     .with_header(header("Cache-Control", "no-store")),
             );
+        }
+        // The page is being torn down: the tab was closed, the window went, or
+        // it navigated away. Sent as a `sendBeacon` on `pagehide`, which the
+        // browser delivers even as the document dies -- this is the only signal
+        // that arrives at the moment of closing rather than after a timeout.
+        //
+        // ⚠️ NOT acted on directly. `pagehide` also fires for a RELOAD, and
+        // killing the batch because somebody pressed F5 would be its own bug.
+        // So this only records when the goodbye came; the decision waits for
+        // [`GONE_GRACE`], and a page that comes back in that window clears the
+        // record (every request below does). A real close stays silent and is
+        // therefore still gone a moment later.
+        (Method::Post, "/api/gone") => {
+            state.lock().unwrap().gone_at = Some(Instant::now());
+            let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
+        }
+        // The page's heartbeat. It carries no question and no answer -- the fact
+        // that it ARRIVED is the whole message, and the stamp at the top of this
+        // function has already recorded it. A separate route from `/api/state`
+        // so the ping stays cheap: a heartbeat that rebuilt the segment list
+        // would be work paid for every second, whether or not anyone is looking.
+        (Method::Get, "/api/ping") => {
+            let _ = req.respond(json_response(&serde_json::json!({"ok": true})));
         }
         // The page has done its job and asks where the run goes next; the next
         // stage leaves the address here. `null` means "not yet, keep asking".
@@ -521,6 +625,8 @@ mod tests {
             aspect: 16.0 / 9.0,
             done: false,
             seen: false,
+            heard: Instant::now(),
+            gone_at: None,
         }));
         (plan, page)
     }
@@ -531,6 +637,71 @@ mod tests {
     fn an_untouched_page_hands_back_no_plan() {
         let (src, s) = opened(&[(0.1, 0.1, 0.7, 0.7), IDENTITY]);
         assert!(finish(&s, &src).is_none());
+    }
+
+    /// THE BUG THIS FIXES, from both sides.
+    ///
+    /// Before this, `edit`'s loop had no exit but "Done" or Ctrl-C: closing the
+    /// tab left the process waiting on a page that would never answer, with the
+    /// console still claiming to work. The judgement now comes from the session,
+    /// so it can be tested without a browser.
+    #[test]
+    fn a_closed_window_is_noticed_and_an_open_one_is_not() {
+        let (_p, s) = opened(&[(0.1, 0.1, 0.7, 0.7)]);
+
+        // A run nobody is watching has no window to lose. Judging it gone would
+        // make a headless run cancel itself before anyone could reach it.
+        assert!(!s.lock().unwrap().window_gone(), "never seen = not gone");
+
+        // The page was served: now it is a real window, and it is alive.
+        {
+            let mut g = s.lock().unwrap();
+            g.seen = true;
+            g.heard = Instant::now();
+        }
+        assert!(!s.lock().unwrap().window_gone(), "a page that just spoke is alive");
+
+        // Silence past the backstop is the only evidence a beacon could not
+        // deliver (a killed browser, a sleeping machine).
+        {
+            let mut g = s.lock().unwrap();
+            g.heard = Instant::now() - ALIVE - Duration::from_millis(1);
+        }
+        assert!(s.lock().unwrap().window_gone(), "long silence is gone");
+    }
+
+    /// A RELOAD must not kill the batch.
+    ///
+    /// `pagehide` fires for F5 exactly as it does for a close, so a goodbye on
+    /// its own is not enough to act on. It only counts once the grace has passed
+    /// with no page coming back -- and coming back is what retracts it.
+    #[test]
+    fn a_reload_says_goodbye_and_is_forgiven() {
+        let (_p, s) = opened(&[(0.1, 0.1, 0.7, 0.7)]);
+        {
+            let mut g = s.lock().unwrap();
+            g.seen = true;
+            g.heard = Instant::now();
+            g.gone_at = Some(Instant::now());
+        }
+        // The goodbye just arrived: a reload may still be in flight, so nothing
+        // is decided yet.
+        assert!(
+            !s.lock().unwrap().window_gone(),
+            "a goodbye inside the grace must not be believed"
+        );
+
+        // The page comes back -- which every request does, at the top of
+        // `handle` -- and the goodbye is retracted.
+        s.lock().unwrap().gone_at = None;
+        assert!(!s.lock().unwrap().window_gone(), "a returning page is alive");
+
+        // Without that return, the same goodbye becomes an ending.
+        s.lock().unwrap().gone_at = Some(Instant::now() - GONE_GRACE - Duration::from_millis(1));
+        assert!(
+            s.lock().unwrap().window_gone(),
+            "a goodbye nobody retracted is gone"
+        );
     }
 
     #[test]

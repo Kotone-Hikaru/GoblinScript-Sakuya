@@ -640,6 +640,30 @@ addEventListener('keydown', e => {
 });
 function nudge(r) { segs[cur].rect = fix(r); drawRect(); post({ i: cur, rect: segs[cur].rect }); }
 
+// ---- is anybody there? ---------------------------------------------------
+//
+// This page is the only thing that can tell the run "a person is still
+// deciding" from "the tab is gone": the server cannot see a screen. Both halves
+// matter, and they answer different questions.
+//
+// A PING says the window is alive. It runs on a timer, and a HIDDEN tab's timer
+// is throttled by the browser (down to about once a minute after five minutes),
+// so the server treats silence as weak evidence only -- see ALIVE in
+// cropedit.rs. The ping deliberately does not repaint or refetch anything: it is
+// a heartbeat, not a poll, so a slow one costs nothing and a dropped one is
+// invisible.
+//
+// A GOODBYE says the window is going and arrives AT THE MOMENT of closing rather
+// than a timeout later: `pagehide` plus `sendBeacon`, which the browser delivers
+// even as the document is torn down. It fires for a reload too, which is why the
+// server waits a moment and lets a returning page retract it.
+setInterval(() => { fetch('/api/ping', { cache: 'no-store' }).catch(() => {}); }, 1000);
+addEventListener('pagehide', () => {
+  // `sendBeacon` is what makes this survive the document; a plain `fetch` here
+  // is cancelled with the tab and never reaches the server.
+  try { navigator.sendBeacon('/api/gone'); } catch (e) { /* nothing to do */ }
+});
+
 load();
 </script>
 </body>
