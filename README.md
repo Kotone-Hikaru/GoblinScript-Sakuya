@@ -361,13 +361,13 @@ spend a wait or rewrite pieces, it only decides whether a window is visible.
   by the page coming back, so **F5 cannot kill a batch**. Working files are kept,
   so re-running a video resumes it.
 * The **version has four parts**, and the fourth is a **commit count**, not a
-  build id: `0.6.3.45` is the 45th commit on this fork's own baseline. Rebuilding
-  one commit ten times says the same thing ten times -- which is the point, since
-  a number that moves without the code moving tells you nothing. Every surface
-  reads that one string (`--version`, the boot banner, the picker's wordmark, the
-  error log, the `--serve` handshake), so they cannot disagree. A build with no
-  repository -- a source tarball, no `spans-base` tag -- falls back to `.0` with a
-  build warning rather than failing.
+  build id: the last number is how many commits this fork has made since its own
+  baseline tag. Rebuilding one commit ten times says the same thing ten times --
+  which is the point, since a number that moves without the code moving tells you
+  nothing. Every surface reads that one string (`--version`, the boot banner, the
+  picker's wordmark, the error log, the `--serve` handshake), so they cannot
+  disagree. A build with no repository -- a source tarball, no baseline tag --
+  falls back to `.0` with a build warning rather than failing.
 * Every new string ships in both English and Chinese (147 keys added on top of
   the fork's base, counted from `languages/en-US.json`).
 
