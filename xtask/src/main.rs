@@ -96,6 +96,36 @@ fn crate_version(root: &Path) -> Result<String> {
     bail!("no [package] version in {}", root.join("Cargo.toml").display());
 }
 
+/// The four-part version the zips are named after.
+///
+/// Cargo's `version` holds exactly three numbers, so the fourth lives in
+/// `build.rs`, which counts commits since `spans-base` and bakes the result in
+/// as `GS_VERSION` -- for the main crate only. xtask is a crate of its own and
+/// never sees that, which is why every zip came out named
+/// `goblinscript-0.6.3-windows-dml.zip` while the exe inside said
+/// `0.6.3.65`. The count is taken again here, from the same tag by the same
+/// rule, so the name on the outside and the banner on the inside agree.
+fn dist_version(root: &Path) -> Result<String> {
+    let base = crate_version(root)?;
+    let n = std::process::Command::new("git")
+        // Same guards as `build.rs`: never let a prompt or a pager hang a pack.
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .args(["rev-list", "--count", "spans-base..HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    // A source tree with no git behind it still has to produce a name; the
+    // binary it packs falls back to `.0` for the same reason, so they match.
+    match n {
+        Some(n) => Ok(format!("{base}.{n}")),
+        None => Ok(base),
+    }
+}
+
 /// One cargo build, against one ONNX Runtime.
 ///
 /// `ort` is the runtime to link: `Some` for the Linux build, which links
@@ -692,7 +722,7 @@ fn main() -> Result<()> {
     }
 
     let root = root();
-    let ver = crate_version(&root)?;
+    let ver = dist_version(&root)?;
     // Where cargo put the binary: CARGO_TARGET_DIR when set, else target/.
     let rel = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -1068,6 +1098,30 @@ mod bundle_tests {
         std::fs::write(&exe, good).unwrap();
 
         guard_cuda_provider(&exe).unwrap();
+    }
+
+    /// The zip name and the banner inside it come from two different places:
+    /// the name from here, the banner from `build.rs`. 0.6.3.65 shipped a zip
+    /// called `goblinscript-0.6.3-windows-cuda.zip` holding an exe that says
+    /// `0.6.3.65`. Whatever git says, this has to keep four parts when git can
+    /// answer at all.
+    #[test]
+    fn the_dist_version_carries_the_commit_count() {
+        use super::dist_version;
+        let root = super::root();
+        let have_git = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let v = dist_version(&root).unwrap();
+        assert!(v.starts_with("0.6.3"), "{v}");
+        if have_git {
+            let parts: Vec<&str> = v.split('.').collect();
+            assert_eq!(parts.len(), 4, "{v}");
+            assert!(parts[3].parse::<u32>().is_ok(), "{v}");
+        }
     }
 
     #[test]
