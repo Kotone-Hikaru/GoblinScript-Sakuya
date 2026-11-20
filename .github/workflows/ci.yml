@@ -102,6 +102,28 @@ jobs:
           unzip -q ort/a.nupkg 'runtimes/linux-x64/native/*' -d ort
           lib=$(cd ort/runtimes/linux-x64/native && pwd)
           test -f "$lib/libonnxruntime.so"
+          # The tarball this used to come from carried both names --
+          # `libonnxruntime.so` and the `libonnxruntime.so.1` its SONAME asks
+          # for. The NuGet package carries only the first, so a binary linked
+          # against it records `libonnxruntime.so.1` in its DT_NEEDED and every
+          # run then dies with "cannot open shared object file" although the
+          # library is right there under a different name. Give every object its
+          # SONAME as a second name, read from the object rather than guessed --
+          # with a pinned fallback, so this does not depend on binutils being on
+          # the image. The extra names matter twice over: `ort-sys` symlinks
+          # everything here into `target/debug{,/deps}`, which is the search path
+          # cargo hands the test binary.
+          have_readelf=0
+          if command -v readelf >/dev/null 2>&1; then have_readelf=1; fi
+          for f in "$lib"/*.so; do
+            soname=""
+            if [ "$have_readelf" = 1 ]; then
+              soname=$(readelf -d "$f" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p' || true)
+            fi
+            if [ -z "$soname" ]; then soname=$(basename "$f").1; fi
+            if [ ! -e "$lib/$soname" ]; then ln -s "$(basename "$f")" "$lib/$soname"; fi
+          done
+          ls -l "$lib"
           echo "ORT_LIB_LOCATION=$lib" >> "$GITHUB_ENV"
           # The package ships no static or import library for Linux, only the
           # .so, and ort-sys links a lib folder statically unless it is told
