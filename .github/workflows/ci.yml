@@ -3,8 +3,8 @@
 # checked on every push rather than only on the machine that ships. Both
 # platforms the release packs are built here, so a Linux-only link error is
 # found on a push and not on a tag. Each one links the ONNX Runtime its own
-# packages carry -- the `ort` crate's prebuilt on Windows, Microsoft's
-# `gpu_cuda12` on Linux -- because that is which build is being checked.
+# packages carry -- the `ort` crate's prebuilt on Windows, Microsoft's NuGet
+# `gpu.linux` package on Linux -- because that is which build is being checked.
 name: CI
 
 on:
@@ -50,7 +50,14 @@ jobs:
     # anywhere near this: the slowest step is the first dependency build.
     timeout-minutes: 60
     steps:
+      # Full history and the tags, not the depth-1 slice checkout defaults to.
+      # The version this build would show has a fourth part counted from
+      # `spans-base`, so a shallow clone cannot name the build it just made.
+      # The whole repository is ~1 MB, so there is nothing to save here.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       # The audio crate links ALSA on Linux; the runner image carries the
       # headers only when asked.
@@ -67,28 +74,39 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
-      # Off Windows there is ONE runtime a build can link: Microsoft's own
-      # `gpu_cuda12` package, which is also what every Linux zip carries. The
-      # `ort` crate publishes no Linux prebuilt for this feature set, and its
-      # own CUDA provider reaches no Blackwell card, so a bare `cargo build`
-      # here would check a build that nobody ships. The version is PAIRED to
-      # the crate: ort-sys rc.13 carries the bindings for 1.28.
+      # Off Windows there is ONE runtime a build can link, and until 2026-11-08
+      # this step fetched it from a GitHub release. That release is gone: the
+      # whole `microsoft/onnxruntime` repository answers 404 now, on this machine
+      # and through the proxy, while `microsoft/vscode` and `pykeio/ort` answer
+      # 200 -- so every Linux job died here with `curl: (22)` before reaching the
+      # compiler, which is the red half of a two-platform matrix.
+      #
+      # The same binaries are still published, as NuGet packages, from Microsoft.
+      # `gpu.linux` carries `runtimes/linux-x64/native/`: libonnxruntime.so, the
+      # CUDA and TensorRT providers, and the shared provider stub -- the same
+      # file set the old tarball held, so the link is unchanged (dynamic, which
+      # is what a Linux release does too). 1.28.0 rather than 1.28.1: NuGet went
+      # from 1.28.0 straight to 1.29.0, and the ONNX Runtime C API is stable
+      # across a patch -- ort-sys rc.13 is built against api-28 either way.
       - name: Fetch Microsoft's ONNX Runtime
         if: runner.os == 'Linux'
         shell: bash
         env:
-          ORT_VER: 1.28.1
+          ORT_VER: 1.28.0
         run: |
           set -eu
           mkdir -p ort
-          base=https://github.com/microsoft/onnxruntime/releases/download
-          curl -fsSL -o ort/a.tgz "$base/v$ORT_VER/onnxruntime-linux-x64-gpu_cuda12-$ORT_VER.tgz"
-          tar -xzf ort/a.tgz -C ort
-          echo "ORT_LIB_LOCATION=$(cd ort/onnxruntime-*/lib && pwd)" >> "$GITHUB_ENV"
-          # Microsoft ships no static or import library for Linux, only the
-          # .so the zip carries, and ort-sys links a lib folder statically
-          # unless it is told otherwise -- it looks for libonnxruntime.a,
-          # finds none, and says it "could not link".
+          pkg=microsoft.ml.onnxruntime.gpu.linux
+          curl -fsSL -o ort/a.nupkg \
+            "https://api.nuget.org/v3-flatcontainer/$pkg/$ORT_VER/$pkg.$ORT_VER.nupkg"
+          unzip -q ort/a.nupkg 'runtimes/linux-x64/native/*' -d ort
+          lib=$(cd ort/runtimes/linux-x64/native && pwd)
+          test -f "$lib/libonnxruntime.so"
+          echo "ORT_LIB_LOCATION=$lib" >> "$GITHUB_ENV"
+          # The package ships no static or import library for Linux, only the
+          # .so, and ort-sys links a lib folder statically unless it is told
+          # otherwise -- it looks for libonnxruntime.a, finds none, and says it
+          # "could not link".
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
 
       # The workspace, so xtask is built too -- it is what packs a release, and

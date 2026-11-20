@@ -1105,22 +1105,36 @@ mod bundle_tests {
     /// called `goblinscript-0.6.3-windows-cuda.zip` holding an exe that says
     /// `0.6.3.65`. Whatever git says, this has to keep four parts when git can
     /// answer at all.
+    ///
+    /// "When git can answer" is the whole of it, and it is not the same as "a
+    /// `.git` directory exists". CI checks out at depth 1, so `.git` is there
+    /// while `spans-base` is not, and `rev-list` fails exactly the way it fails
+    /// outside a repository. Asking `rev-parse --git-dir` alone called that a
+    /// repository and then demanded four parts, which is how this test went red
+    /// on `main` on 2026-11-19 while every other test passed. The question to
+    /// ask is the one `dist_version` itself asks: can the range be counted.
     #[test]
     fn the_dist_version_carries_the_commit_count() {
         use super::dist_version;
         let root = super::root();
-        let have_git = std::process::Command::new("git")
+        let counts = std::process::Command::new("git")
             .current_dir(&root)
-            .args(["rev-parse", "--git-dir"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat")
+            .args(["rev-list", "--count", "spans-base..HEAD"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         let v = dist_version(&root).unwrap();
         assert!(v.starts_with("0.6.3"), "{v}");
-        if have_git {
+        if counts {
             let parts: Vec<&str> = v.split('.').collect();
             assert_eq!(parts.len(), 4, "{v}");
             assert!(parts[3].parse::<u32>().is_ok(), "{v}");
+        } else {
+            // A shallow checkout, or no repository at all: three parts is the
+            // honest answer, and `dist_version` must not invent a fourth.
+            assert_eq!(v, "0.6.3", "{v}");
         }
     }
 

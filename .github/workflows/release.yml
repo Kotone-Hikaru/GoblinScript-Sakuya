@@ -73,7 +73,14 @@ jobs:
             bundle: bundle.zip
     runs-on: ${{ matrix.os }}
     steps:
+      # `build.rs` counts commits from `spans-base` to name the fourth part of
+      # the version, and `xtask` counts them again to name the zips; a depth-1
+      # checkout has neither the tag nor the history and would ship a zip whose
+      # name disagrees with the binary inside it.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Linux build packages
         if: runner.os == 'Linux'
@@ -210,6 +217,24 @@ jobs:
       # ORT_LIB_LOCATION is the variable cargo itself reads, and `xtask` packs
       # what it points at, so a zip can only carry the runtime its binary was
       # built against.
+      #
+      # ---------------------------------------------------------------------
+      # THIS ADDRESS IS DEAD. `github.com/microsoft/onnxruntime` answers 404 as
+      # of 2026-11-08 -- the whole repository, not one file -- so this step has
+      # not been able to run since, and the 0.6.3.66 zips were packed on the
+      # maintainer's machine from a copy of the runtime fetched before that.
+      #
+      # It is not swapped for NuGet here the way `ci.yml` was, and the reason is
+      # that the two halves of the CUDA story have to move together: NuGet's
+      # `gpu.windows` carriers are built against CUDA 13 (their
+      # `onnxruntime_providers_cuda.dll` imports `cublas64_13.dll`,
+      # `cublasLt64_13.dll`), while the runtime this workflow downloads from
+      # NVIDIA two steps above is pinned to `CUDART_VER 12.9.79` /
+      # `CUBLAS_VER 12.9.2.10` and the zip ships the matching `*_12.dll`. Taking
+      # the provider from NuGet without moving the redist to 13.x packs a zip
+      # whose provider cannot load; that swap is a change to what ships, not a
+      # repair of a broken link, so it is not made blind here.
+      # ---------------------------------------------------------------------
       - name: Fetch Microsoft's ONNX Runtime
         shell: bash
         env:
