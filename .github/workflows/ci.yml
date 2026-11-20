@@ -108,6 +108,15 @@ jobs:
           # otherwise -- it looks for libonnxruntime.a, finds none, and says it
           # "could not link".
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          # With dynamic linking `ort-sys` then symlinks every shared object it
+          # found into three places beside the binary: `target/<profile>`, and
+          # `examples` and `deps` under it. On unix that symlink has no copy
+          # fallback and no `create_dir_all` -- `dynamic_link.rs:45` unwraps it
+          # -- so a directory that is not there is a panic from the build
+          # script, reported as `Os { code: 2, kind: NotFound }` with no file
+          # named. `deps` cargo makes by itself; `examples` only exists when the
+          # package has examples, and this one has none. Make the holes first.
+          mkdir -p target/debug/examples target/debug/deps
 
       # The workspace, so xtask is built too -- it is what packs a release, and
       # a dist run that does not compile is found at the worst moment.
