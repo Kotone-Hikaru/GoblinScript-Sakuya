@@ -88,6 +88,25 @@ jobs:
       # is what a Linux release does too). 1.28.0 rather than 1.28.1: NuGet went
       # from 1.28.0 straight to 1.29.0, and the ONNX Runtime C API is stable
       # across a patch -- ort-sys rc.13 is built against api-28 either way.
+      #
+      # Two directories, because the two consumers want different things:
+      #
+      #   `native/`  is what `ORT_LIB_LOCATION` points at. `ort-sys` symlinks
+      #              every file here whose name contains ".so" into the cargo
+      #              output dirs, and on unix that symlink has no copy fallback
+      #              and no `create_dir_all` (`dynamic_link.rs:45` unwraps it),
+      #              so this directory must hold nothing but the four real
+      #              objects, and `examples/` has to exist first.
+      #
+      #   `run/`     is what `LD_LIBRARY_PATH` points at, and it is the only
+      #              place the SONAME aliases live. The old tarball carried both
+      #              `libonnxruntime.so` and the `libonnxruntime.so.1` its SONAME
+      #              asks for; NuGet carries only the first, so a binary linked
+      #              against it records `libonnxruntime.so.1` in DT_NEEDED and
+      #              then cannot open it at run time even though the library is
+      #              sitting right there under another name. Putting the aliases
+      #              in `native/` instead feeds them back to `ort-sys` as extra
+      #              libraries to link, which is how this step failed before.
       - name: Fetch Microsoft's ONNX Runtime
         if: runner.os == 'Linux'
         shell: bash
@@ -102,43 +121,37 @@ jobs:
           unzip -q ort/a.nupkg 'runtimes/linux-x64/native/*' -d ort
           lib=$(cd ort/runtimes/linux-x64/native && pwd)
           test -f "$lib/libonnxruntime.so"
-          # The tarball this used to come from carried both names --
-          # `libonnxruntime.so` and the `libonnxruntime.so.1` its SONAME asks
-          # for. The NuGet package carries only the first, so a binary linked
-          # against it records `libonnxruntime.so.1` in its DT_NEEDED and every
-          # run then dies with "cannot open shared object file" although the
-          # library is right there under a different name. Give every object its
-          # SONAME as a second name, read from the object rather than guessed --
-          # with a pinned fallback, so this does not depend on binutils being on
-          # the image. The extra names matter twice over: `ort-sys` symlinks
-          # everything here into `target/debug{,/deps}`, which is the search path
-          # cargo hands the test binary.
+
+          # `ort-sys` symlinks what it finds into `target/<profile>` and the
+          # `examples` and `deps` under it. `deps` cargo makes by itself;
+          # `examples` only exists when the package has examples, and this one
+          # has none. Make the holes first -- the panic names no file otherwise.
+          mkdir -p target/debug/examples target/debug/deps
+
+          # The run-time copy: the four real objects plus one SONAME alias each.
+          run="$lib/run"
+          mkdir -p "$run"
           have_readelf=0
           if command -v readelf >/dev/null 2>&1; then have_readelf=1; fi
           for f in "$lib"/*.so; do
+            base=$(basename "$f")
+            ln -sf "$f" "$run/$base"
             soname=""
             if [ "$have_readelf" = 1 ]; then
               soname=$(readelf -d "$f" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p' || true)
             fi
-            if [ -z "$soname" ]; then soname=$(basename "$f").1; fi
-            if [ ! -e "$lib/$soname" ]; then ln -s "$(basename "$f")" "$lib/$soname"; fi
+            if [ -z "$soname" ]; then soname="$base.1"; fi
+            if [ "$soname" != "$base" ]; then ln -sf "$f" "$run/$soname"; fi
           done
-          ls -l "$lib"
+          ls -l "$lib" "$run"
+
           echo "ORT_LIB_LOCATION=$lib" >> "$GITHUB_ENV"
           # The package ships no static or import library for Linux, only the
           # .so, and ort-sys links a lib folder statically unless it is told
           # otherwise -- it looks for libonnxruntime.a, finds none, and says it
           # "could not link".
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          # With dynamic linking `ort-sys` then symlinks every shared object it
-          # found into three places beside the binary: `target/<profile>`, and
-          # `examples` and `deps` under it. On unix that symlink has no copy
-          # fallback and no `create_dir_all` -- `dynamic_link.rs:45` unwraps it
-          # -- so a directory that is not there is a panic from the build
-          # script, reported as `Os { code: 2, kind: NotFound }` with no file
-          # named. `deps` cargo makes by itself; `examples` only exists when the
-          # package has examples, and this one has none. Make the holes first.
-          mkdir -p target/debug/examples target/debug/deps
+          echo "LD_LIBRARY_PATH=$run" >> "$GITHUB_ENV"
 
       # The workspace, so xtask is built too -- it is what packs a release, and
       # a dist run that does not compile is found at the worst moment.
