@@ -1126,15 +1126,21 @@ mod bundle_tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         let v = dist_version(&root).unwrap();
-        assert!(v.starts_with("0.6.3"), "{v}");
+        // The three-part prefix is whatever `Cargo.toml` says. Asking for the
+        // literal "0.6.3" made this test a tripwire across a minor bump: the
+        // line moved to 0.6.4 and the assertion, not the code, went red. Only
+        // the FOURTH part is this test's business.
+        let base = super::crate_version(&root).unwrap();
+        assert!(v.starts_with(&base), "{v} does not start with {base}");
         if counts {
             let parts: Vec<&str> = v.split('.').collect();
             assert_eq!(parts.len(), 4, "{v}");
             assert!(parts[3].parse::<u32>().is_ok(), "{v}");
+            assert_eq!(&v[..base.len()], base.as_str(), "{v} vs {base}");
         } else {
             // A shallow checkout, or no repository at all: three parts is the
             // honest answer, and `dist_version` must not invent a fourth.
-            assert_eq!(v, "0.6.3", "{v}");
+            assert_eq!(v, base, "{v} vs {base}");
         }
     }
 
