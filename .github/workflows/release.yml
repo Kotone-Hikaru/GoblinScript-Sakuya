@@ -235,6 +235,14 @@ jobs:
       # whose provider cannot load; that swap is a change to what ships, not a
       # repair of a broken link, so it is not made blind here.
       # ---------------------------------------------------------------------
+      # `ort-sys` copies the runtime into three directories beside the
+      # artefacts and creates none of them; see the note in `ci.yml`. `deps/`
+      # cargo opens, `examples/` nothing does. Cheap insurance, and it is the
+      # Linux runner that needs it, which is also the runner that links here.
+      - name: Make room for the runtime copies
+        shell: bash
+        run: mkdir -p target/release/examples target/release/deps
+
       - name: Fetch Microsoft's ONNX Runtime
         shell: bash
         env:

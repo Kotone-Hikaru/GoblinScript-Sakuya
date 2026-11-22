@@ -74,6 +74,26 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
+      # `ort-sys`'s build script copies the runtime it links into three places
+      # beside the artefacts: the profile dir, `examples/` and `deps/`. It
+      # computes the profile dir as `OUT_DIR.ancestors().nth(3)`, which is
+      # `target/<profile>`, and then joins the other two onto it without
+      # creating either -- on unix the symlink there panics on ENOENT, on
+      # Windows the symlink fails (no Developer Mode), the copy fallback runs,
+      # and THAT panics on the same missing parent with `code 3`.
+      #
+      # `deps/` cargo opens by itself before any build script runs. `examples/`
+      # it only opens when some package has an example, and none here does. So
+      # make both, on both platforms, before anything is compiled.
+      #
+      # This was latent for a while: the target dir came back from the cache
+      # with a successful `ort-sys` output in it, so the script never ran
+      # again. Any change to `Cargo.lock` changes the cache key, and the very
+      # next cold build failed on both runners at once.
+      - name: Make room for the runtime copies
+        shell: bash
+        run: mkdir -p target/debug/examples target/debug/deps
+
       # Off Windows there is ONE runtime a build can link, and until 2026-11-08
       # this step fetched it from a GitHub release. That release is gone: the
       # whole `microsoft/onnxruntime` repository answers 404 now, on this machine
