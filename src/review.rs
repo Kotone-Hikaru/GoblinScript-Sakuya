@@ -180,8 +180,9 @@ pub struct Span {
     /// The stretch after the piece, frozen the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_after: Option<(f64, f64)>,
-    /// How much of the borrowed motion to take, 0..1, where 1 replaces the
-    /// piece outright. Absent means 1.
+    /// How much of the borrowed motion to take. 0 keeps the piece as it was, 1
+    /// replaces it outright, and above 1 the difference between the two is
+    /// extrapolated (see `style::MAX_BORROW_AMOUNT`). Absent means 1.
     #[serde(default = "one")]
     pub amount: f64,
     /// Multiplies the borrowed velocity, leaving its carrier alone: the
@@ -205,10 +206,10 @@ pub const MAX_PIECE_SCALE: f64 = 5.0;
 /// holds a page to. Clamped rather than refused: these are sliders, and a
 /// slider that reports a number outside its own track is a page bug, not a
 /// reason to throw away the whole edit.
-pub const MIN_BORROW_TRAVEL: f64 = 0.25;
+pub const MIN_BORROW_TRAVEL: f64 = 0.2;
 pub const MAX_BORROW_TRAVEL: f64 = 3.0;
-pub const MIN_BORROW_FREQ: f64 = 0.25;
-pub const MAX_BORROW_FREQ: f64 = 4.0;
+pub const MIN_BORROW_FREQ: f64 = 0.2;
+pub const MAX_BORROW_FREQ: f64 = 3.0;
 
 fn yes() -> bool {
     true
@@ -1425,7 +1426,7 @@ fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
             if !s.amount.is_finite() {
                 s.amount = 1.0;
             }
-            s.amount = s.amount.clamp(0.0, 1.0);
+            s.amount = s.amount.clamp(0.0, crate::style::MAX_BORROW_AMOUNT);
             for v in [&mut s.travel, &mut s.freq] {
                 if !v.is_finite() || *v <= 0.0 {
                     *v = 1.0;

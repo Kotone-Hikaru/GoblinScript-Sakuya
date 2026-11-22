@@ -558,6 +558,17 @@ impl Tracks {
 /// enough that no single row carries the whole discontinuity.
 pub const BORROW_RAMP: usize = 3;
 
+/// The top of the `amount` knob, in multiples of "be the neighbour".
+///
+/// 1 is a straight replacement and is what the panel starts on, so the common
+/// case is unchanged. Above 1 the difference between the piece's own motion and
+/// the neighbour's is extrapolated -- 2 means the stroke travels twice as far
+/// from the piece's own as the neighbour's does. It exists because a neighbour
+/// can be the right SHAPE and the wrong SIZE, and the honest way to say "the
+/// same gesture, stronger" is a number past one rather than a second knob that
+/// secretly multiplies something else.
+pub const MAX_BORROW_AMOUNT: f64 = 2.0;
+
 /// Where a borrowed piece reads its motion from, resolved to rows.
 ///
 /// The ranges are half-open `[a, b)` on the same row clock as the tracks being
@@ -569,7 +580,9 @@ pub struct BorrowPlan {
     pub before: Option<(usize, usize)>,
     /// Rows to read when the piece wants the stretch AFTER it.
     pub after: Option<(usize, usize)>,
-    /// How much of the borrowed motion to take, 0..1. 1 replaces the piece.
+    /// How much of the borrowed motion to take. 0 keeps the piece as it was, 1
+    /// replaces it, and above 1 the difference is extrapolated (see
+    /// `MAX_BORROW_AMOUNT`).
     pub amount: f64,
     /// Multiplies the borrowed VELOCITY and leaves the carrier where it is. The
     /// neighbour may have moved a little further per stroke than this passage
@@ -584,18 +597,26 @@ pub struct BorrowPlan {
 impl Tracks {
     /// Rewrite rows `[lo, hi)` from a neighbour's rows.
     ///
-    /// Only `vmarg`, `level` and `env` move. Those three are the motion: the
-    /// carrier the level head drew and the strokes the marginal head measured.
-    /// `band`, `plat`, `rev` and `period` are left alone on purpose -- they are
-    /// positional and statistical locks, each with its own clock and its own
-    /// alignment problem, and rewriting the motion already changes what the
-    /// author sees. `conf` is never touched: it is the frozen trunk's opinion
-    /// of the SOURCE FOOTAGE, so copying a neighbour's score onto these rows
-    /// would make the readout lie about a passage nobody measured.
+    /// Only `vmarg` and `env` move. Those two are the STROKES: the marginal head
+    /// measured them and the envelope head sized them, and a passage the trunk
+    /// misread is wrong in exactly those two. `band`, `plat`, `rev` and `period`
+    /// are left alone on purpose -- they are positional and statistical locks,
+    /// each with its own clock and its own alignment problem, and rewriting the
+    /// motion already changes what the author sees. `conf` is never touched: it
+    /// is the frozen trunk's opinion of the SOURCE FOOTAGE, so copying a
+    /// neighbour's score onto these rows would make the readout lie about a
+    /// passage nobody measured.
     ///
-    /// `level` is offset-aligned before it is blended, so the piece starts at
-    /// exactly the height it already had: positions are what the user sees, and
-    /// an unaligned splice would teleport the pen.
+    /// `level` is NOT touched, and that is load-bearing rather than timid.
+    /// `compose_level` low-passes the whole level track with `box_same(level,
+    /// kd)` (kd = 31 rows at 30 fps) so that a row's carrier is a local mean of
+    /// its neighbours, and taking that mean inside a shot instead measurably
+    /// loses. A rewrite of the level rows therefore reaches 15 rows past each
+    /// seam -- 0.5 s of somebody else's piece. Two pieces a couple of seconds
+    /// apart rewrite the correct stretch between them, which is what the
+    /// workbench showed on a real clip. Leaving the carrier alone costs nothing:
+    /// the piece keeps the height the level head gave this passage, which is the
+    /// height its own footage calls for, and only the strokes are replaced.
     ///
     /// Returns false when there is nothing to do -- no source rows, an empty or
     /// inverted piece, or `amount` at or below zero -- so a caller can tell a
@@ -626,7 +647,6 @@ impl Tracks {
         // Read the source rows first, write the piece in a second pass: a window
         // that overlaps the piece (a short neighbour, or a `freq` above 1) must
         // see the rows as they were, not rows this borrow has already rewritten.
-        let mut lv = vec![0.0f64; len];
         let mut vm = vec![0.0f64; len];
         let mut ev = vec![0.0f64; len];
         for i in 0..len {
@@ -637,7 +657,6 @@ impl Tracks {
             } else {
                 0.0
             };
-            let mut acc_l = 0.0;
             let mut acc_v = 0.0;
             let mut acc_e = 0.0;
             let mut wsum = 0.0;
@@ -648,7 +667,6 @@ impl Tracks {
                 let k = (b - a) as f64;
                 let pos = (i as f64 * freq) % k;
                 let j = a + (pos as usize).min(b - a - 1);
-                acc_l += w * self.level[j];
                 acc_v += w * self.vmarg[j];
                 acc_e += w * self.env[j];
                 wsum += w;
@@ -662,23 +680,21 @@ impl Tracks {
             if wsum <= 0.0 {
                 return false;
             }
-            lv[i] = acc_l / wsum;
             vm[i] = acc_v / wsum * travel;
             ev[i] = acc_e / wsum * travel;
         }
-        // Put the borrowed carrier at the height the piece already had, so the
-        // first borrowed row is continuous with the row before it and no seam
-        // can teleport the pen.
-        let lift = self.level[lo] - lv[0];
-        let amount = plan.amount.clamp(0.0, 1.0);
+        // 0 = the piece keeps the motion it had, 1 = the neighbour's motion, and
+        // above 1 the difference is EXTRAPOLATED: at 2 the stroke travels twice
+        // as far from the piece's own as the neighbour's does. That is the only
+        // reading of "amount 150%" that is not a clamp pretending to be a knob.
+        let amount = plan.amount.clamp(0.0, MAX_BORROW_AMOUNT);
         for i in 0..len {
             // Full strength in the middle, easing to nothing at each seam.
             let edge = i.min(len - 1 - i);
             let t = amount * ((edge + 1) as f64 / (BORROW_RAMP + 1) as f64).min(1.0);
             let r = lo + i;
-            self.level[r] = self.level[r] * (1.0 - t) + (lv[i] + lift) * t;
-            self.vmarg[r] = self.vmarg[r] * (1.0 - t) + vm[i] * t;
-            self.env[r] = self.env[r] * (1.0 - t) + ev[i] * t;
+            self.vmarg[r] += t * (vm[i] - self.vmarg[r]);
+            self.env[r] += t * (ev[i] - self.env[r]);
         }
         true
     }
@@ -3846,6 +3862,69 @@ mod tests {
         }
     }
 
+    /// A borrowed piece must not move the rows BESIDE it.
+    ///
+    /// `compose_level` low-passes the level track across the whole clip
+    /// (`box_same(level, kd)`, kd = 31 rows), so a rewrite inside one piece
+    /// reaches 15 rows past each of its seams. Two pieces a few seconds apart
+    /// therefore rewrite the correct stretch between them -- which is what the
+    /// workbench showed on a real clip, and why this is a test rather than a
+    /// comment: on its own each piece looked perfect.
+    #[test]
+    fn a_borrowed_piece_does_not_move_the_rows_beside_it() {
+        let n = 300;
+        let times: Vec<f64> = (0..n).map(|i| i as f64 * 1000.0 / 30.0).collect();
+        // a level that actually varies, so a leak has something to leak
+        let level: Vec<f64> = (0..n)
+            .map(|i| 40.0 + 20.0 * (i as f64 / 7.0).sin())
+            .collect();
+        let vm: Vec<f64> = (0..n).map(|i| if i % 6 < 3 { 4.0 } else { -4.0 }).collect();
+        let t = Tracks {
+            vmarg: vm,
+            level: level.clone(),
+            env: vec![1.0; n],
+            band: None,
+            plat: None,
+            rev: None,
+            period: Vec::new(),
+            conf: Vec::new(),
+        };
+        let cfg = filler_cfg();
+        let (base, _) = compose_level_full(&t, &[0, n], &cfg, &times);
+
+        // Two pieces two seconds apart, the shape the workbench was handed:
+        // 1 s and 2 s of rewritten rows with 1 s of untouched rows between
+        // them. Every row of that gap sits under a seam's reach.
+        let mut b = t.clone();
+        let p1 = super::BorrowPlan {
+            before: Some((30, 45)),
+            after: Some((75, 90)),
+            amount: 1.0,
+            travel: 1.0,
+            freq: 1.0,
+        };
+        let p2 = super::BorrowPlan {
+            before: Some((90, 105)),
+            after: Some((150, 165)),
+            amount: 1.0,
+            travel: 1.0,
+            freq: 1.0,
+        };
+        assert!(b.borrow_rows(60, 75, &p1));
+        assert!(b.borrow_rows(105, 120, &p2));
+        let (after, _) = compose_level_full(&b, &[0, n], &cfg, &times);
+
+        // the rows between the two pieces, which nothing asked to change
+        for r in 75..105 {
+            assert!(
+                (after[r] - base[r]).abs() < 1e-9,
+                "row {r} moved: {} -> {}",
+                base[r],
+                after[r]
+            );
+        }
+    }
+
     fn filler_cfg() -> StyleCfg {
         StyleCfg {
             fps: 30.0,
@@ -4600,18 +4679,18 @@ mod borrow_tests {
         assert_eq!(t.conf, before);
     }
 
-    /// The seam: whatever the piece used to start at, it still starts there.
-    /// An unaligned splice teleports the pen, which is the one thing a borrowed
-    /// piece must never do.
+    /// The seam: the carrier is the piece's own, and a borrow never moves it.
+    /// Touching the level rows would also reach past the seam through
+    /// `compose_level`'s whole-clip low-pass, which is the neighbouring-piece
+    /// bug this guards.
     #[test]
     fn the_seam_keeps_its_height() {
         let mut t = mk((0..20).map(|i| i as f64).collect(),
                        (0..20).map(|i| if i < 10 { 5.0 } else { 37.0 }).collect(),
                        vec![0.0; 20]);
+        let before = t.level.clone();
         assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
-        assert!((t.level[10] - 37.0).abs() < 1e-9, "level {}", t.level[10]);
-        // and the source's own height came along with a constant offset
-        assert!((t.level[13] - 37.0).abs() < 1e-9, "level {}", t.level[13]);
+        assert_eq!(t.level, before);
     }
 
     #[test]

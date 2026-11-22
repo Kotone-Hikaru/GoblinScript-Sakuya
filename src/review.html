@@ -519,6 +519,21 @@
   .wprow > label { flex: 0 0 auto; color: var(--ink-soft); }
   /* NOT `.fine`: that class is taken (and hidden) elsewhere on this page */
   .wpnum { width: 54px; font-size: 11px; }
+  /* A number box and the slider that moves it, side by side on one line: the box
+     is the value the author can type, the slider is the same value they can
+     feel. Both write the same field, so neither is a second source of truth. */
+  .wpslider { flex: 1 1 60px; min-width: 40px; height: 14px; margin: 0;
+              accent-color: var(--hi-bright); cursor: pointer; }
+  /* The side block: three radios that are one choice, laid out like the
+     intensity unlock row so "pick exactly one" reads the same way twice. */
+  .wprow.bbsides { gap: 10px; }
+  .wprow .bbsideh { flex: 0 0 auto; color: var(--ink-soft); }
+  .wprow .unlockopt { display: inline-flex; align-items: center; gap: 4px; }
+  .wprow .unlockopt label { display: inline; font-size: 11px; color: inherit;
+                            cursor: pointer; }
+  .wprow input[type=radio] { width: 14px; height: 14px; margin: 0;
+                             accent-color: var(--hi-bright); cursor: pointer; }
+  .wprow.bbsides:has(input:checked) { color: var(--ink); }
   .wprow select { flex: 1 1 0; min-width: 0; font-size: 11px; }
   .wpsp { flex: 1 1 auto; }
   /* The slider a number box opens: it spans the whole row rather than sitting
@@ -775,34 +790,47 @@
              when "freeze the windows" is pressed, or when this piece is
              switched to borrow in the first place. -->
         <div id="borrowPanel" class="wavepanel" hidden>
-          <div class="wphead" data-t="page.borrow.head">borrow from a neighbour</div>
-          <div class="wprow">
-            <label data-t="page.borrow.from">read</label>
-            <select id="bbSide">
-              <option value="0" data-t="page.borrow.before">the stretch before</option>
-              <option value="1" data-t="page.borrow.after">the stretch after</option>
-              <option value="2" data-t="page.borrow.both">both, crossfaded</option>
-            </select>
+          <div class="wphead" data-t="page.borrow.head">generate from the neighbours</div>
+          <!-- Which side(s) to read. Radios, not a dropdown: the three answers
+               are one choice, all three are worth seeing at once, and the block
+               wears the same chrome as the intensity unlock row so "pick one of
+               these" reads the same way twice on this page. -->
+          <div class="wprow bbsides">
+            <span class="bbsideh" data-t="page.borrow.from">read</span>
+            <span class="unlockopt"><input type="radio" name="bbSide" id="bbSide0">
+              <label for="bbSide0" data-t="page.borrow.before">the stretch before</label></span>
+            <span class="unlockopt"><input type="radio" name="bbSide" id="bbSide1">
+              <label for="bbSide1" data-t="page.borrow.after">the stretch after</label></span>
+            <span class="unlockopt"><input type="radio" name="bbSide" id="bbSide2">
+              <label for="bbSide2" data-t="page.borrow.both">both, crossfaded</label></span>
           </div>
           <div class="wprow">
-            <label data-t="page.borrow.len">take</label>
-            <input id="bbBefore" class="wpnum" type="number" min="0.25" max="60" step="0.25">
-            <span data-t="page.borrow.sec">s before</span>
-            <span class="wpsp"></span>
-            <input id="bbAfter" class="wpnum" type="number" min="0.25" max="60" step="0.25">
-            <span data-t="page.borrow.sec2">s after</span>
+            <label for="bbBefore" data-t="page.borrow.sec">s before</label>
+            <input id="bbBefore" class="wpnum" type="number" min="0" max="5" step="0.05">
+            <input id="bbBeforeS" class="wpslider" type="range" min="0" max="5" step="0.05">
           </div>
           <div class="wprow">
-            <label data-t="page.borrow.amount">amount</label>
-            <input id="bbAmount" class="wpnum" type="number" min="0" max="100" step="5">
+            <label for="bbAfter" data-t="page.borrow.sec2">s after</label>
+            <input id="bbAfter" class="wpnum" type="number" min="0" max="5" step="0.05">
+            <input id="bbAfterS" class="wpslider" type="range" min="0" max="5" step="0.05">
+          </div>
+          <div class="wprow">
+            <label for="bbAmount" data-t="page.borrow.amount">amount</label>
+            <input id="bbAmount" class="wpnum" type="number" min="0" max="200" step="5">
             <span data-t="page.borrow.pct">%</span>
-            <span class="wpsp"></span>
-            <label data-t="page.borrow.travel">reach</label>
-            <input id="bbTravel" class="wpnum" type="number" min="0.25" max="3" step="0.05">
+            <input id="bbAmountS" class="wpslider" type="range" min="0" max="200" step="5">
+          </div>
+          <div class="wprow">
+            <label for="bbTravel" data-t="page.borrow.travel">reach</label>
+            <input id="bbTravel" class="wpnum" type="number" min="0.2" max="3" step="0.05">
             <span data-t="page.borrow.times">x</span>
-            <label data-t="page.borrow.freq">speed</label>
-            <input id="bbFreq" class="wpnum" type="number" min="0.25" max="4" step="0.05">
+            <input id="bbTravelS" class="wpslider" type="range" min="0.2" max="3" step="0.05">
+          </div>
+          <div class="wprow">
+            <label for="bbFreq" data-t="page.borrow.freq">speed</label>
+            <input id="bbFreq" class="wpnum" type="number" min="0.2" max="3" step="0.05">
             <span data-t="page.borrow.times2">x</span>
+            <input id="bbFreqS" class="wpslider" type="range" min="0.2" max="3" step="0.05">
           </div>
           <div class="wprow">
             <span id="bbAt" class="wpnote"></span>
@@ -3892,9 +3920,9 @@ function spansPayload() {
                  o.side = borrowSide(s);
                  if (s.refBefore) o.ref_before = [s.refBefore[0], s.refBefore[1]];
                  if (s.refAfter) o.ref_after = [s.refAfter[0], s.refAfter[1]];
-                 o.amount = borrowNum(s.amount, 1, 0, 1);
-                 o.travel = borrowNum(s.travel, 1, 0.25, 3);
-                 o.freq = borrowNum(s.freq, 1, 0.25, 4);
+                 o.amount = borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT);
+                 o.travel = borrowNum(s.travel, 1, 0.2, 3);
+                 o.freq = borrowNum(s.freq, 1, 0.2, 3);
                } else if (pieceScale(s) !== 1) {
                  // 1 is the model's own answer, and absent means 1
                  o.scale = pieceScale(s);
@@ -4068,14 +4096,29 @@ function setSegModel(i, model) {
   // drops a borrow with nothing to read. Switching to it is the one moment the
   // windows are measured without being asked, because until they exist there
   // is no piece to look at. From then on they are frozen -- see borrowGenerate.
-  if (model === BORROW && !s.refBefore && !s.refAfter) freezeBorrow(s);
+  if (model === BORROW && !s.refBefore && !s.refAfter) freezeBorrow(s, false);
   retagGaps();
   commitSegs();
 }
-/** Measure both windows for a piece and store them. Called once when a piece
- *  is switched to borrow, and again only when the author presses the button. */
-function freezeBorrow(s) {
-  const w = borrowWindows(s, borrowCap(s));
+/** Measure both windows for a piece and store them.
+ *
+ *  Called in exactly two places, and they want different lengths. Switching a
+ *  piece to borrow (`fromPanel = false`) measures at the length the piece would
+ *  open on -- the fields still belong to whatever was selected before, and
+ *  reading them here would give the new piece a number it was never shown. The
+ *  button (`fromPanel = true`) means "do this again, at the numbers I am looking
+ *  at", which is the only way to re-anchor after a razor cut moved the piece: the
+ *  stored windows are absolute milliseconds, so they end up pointing at the
+ *  wrong footage, and nothing else in this panel re-measures them. */
+function freezeBorrow(s, fromPanel) {
+  const from = (id, side) => {
+    const box = fromPanel ? $(id) : null;
+    return box ? borrowLenValue(box.value) : borrowLenOf(s, side);
+  };
+  const w = {
+    before: borrowWindow(s, 'before', from('bbBefore', 'before')),
+    after: borrowWindow(s, 'after', from('bbAfter', 'after')),
+  };
   s.refBefore = w.before;
   s.refAfter = w.after;
   return w;
@@ -4581,31 +4624,56 @@ function borrowSide(s) {
   const k = Number(s && s.side);
   return (k === 0 || k === 1 || k === 2) ? k : 2;
 }
-/** The two windows a piece at `lo..hi` would read, measured on the spot.
- *
- *  Each side asks for the same length as the piece (capped at `cap`), sitting
- *  flush against the seam: the stretch before ends where the piece starts, the
- *  stretch after starts where it ends.
+/** How long a window asks to be, in seconds, when nothing says otherwise.
+ *  A piece is usually the stretch the razor cut out, and a second and a half of
+ *  the neighbour either side is enough to carry its rhythm without reaching so
+ *  far back that the footage has nothing to do with it any more. The fields hold
+ *  the number; this is only what they start on. */
+const BORROW_DEF_LEN = 1.5;
+/** The top of the two length fields. Past this the neighbour is a different part
+ *  of the clip and "read the stretch beside this one" stops being true. */
+const BORROW_MAX_LEN = 5;
+/** The top of `amount`, in multiples of "be the neighbour" -- mirrors
+ *  `style::MAX_BORROW_AMOUNT` on the server, which clamps to the same number. */
+const BORROW_MAX_AMOUNT = 2;
+
+/** The window a piece says it wants on one side, in milliseconds, or null when
+ *  that side cannot be read at all: the seam is at the clip's own edge, or the
+ *  neighbour left is under a quarter second (a window that short would make the
+ *  piece a stutter of one stroke, which is worse than not borrowing it).
  *
  *  What it ASKS for and what it GETS are not the same thing. Near the ends of a
- *  clip the neighbour is shorter than the piece, and taking the shorter one is
- *  the whole point -- the first piece of a clip has its entire 10 s neighbour
+ *  clip the neighbour is shorter than the field asks for, and taking the shorter
+ *  one is the whole point -- the first piece of a clip has its entire neighbour
  *  behind it, and refusing it because the piece in front happens to be the same
- *  length would leave the one piece most likely to need a borrow with nothing
- *  to read. So each side takes `min(wanted, available)`.
- *
- *  A side with under 0.25 s available gets no window, which is how the server
- *  learns that side does not exist: a window a few rows wide would make the
- *  piece a stutter of one stroke, which is worse than not borrowing it. */
-function borrowWindows(s, cap) {
+ *  length would leave the one piece most likely to need this with nothing to
+ *  read. So each side takes `min(wanted, available)`. */
+function borrowWindow(s, which, secs) {
   const dur = spanDur(state && state.clips[cur]);
-  const want = Math.min(cap, Math.max(0.25, (s.hi - s.lo) / 1000));
-  const out = { before: null, after: null };
-  const back = Math.min(want * 1000, s.lo);
-  if (back >= 250) out.before = [s.lo - back, s.lo];
-  const fwd = Math.min(want * 1000, dur - s.hi);
-  if (fwd >= 250) out.after = [s.hi, s.hi + fwd];
-  return out;
+  const want = Math.min(BORROW_MAX_LEN, Math.max(0, Number(secs) || 0)) * 1000;
+  if (which === 'before') {
+    const back = Math.min(want, s.lo);
+    return (back >= 250) ? [s.lo - back, s.lo] : null;
+  }
+  const fwd = Math.min(want, dur - s.hi);
+  return (fwd >= 250) ? [s.hi, s.hi + fwd] : null;
+}
+/** The length in force on one side: the frozen window's own span, or the value
+ *  the field would open on. After a razor cut the piece is a different length,
+ *  so a stored number is the only thing that can honestly say what is being
+ *  read -- and it is what the field shows. */
+function borrowLenOf(s, which) {
+  const r = which === 'before' ? s.refBefore : s.refAfter;
+  return r ? (r[1] - r[0]) / 1000 : BORROW_DEF_LEN;
+}
+/** The two windows this piece would read right now, at the lengths the panel
+ *  shows. Used for the readout and for the peek overlay -- never for the value
+ *  the server sees, which is the pair stored on the span. */
+function borrowWindows(s) {
+  return {
+    before: borrowWindow(s, 'before', borrowLenOf(s, 'before')),
+    after: borrowWindow(s, 'after', borrowLenOf(s, 'after')),
+  };
 }
 function editBorrow(fn, label) {
   const s = borrowSeg();
@@ -4646,37 +4714,36 @@ function renderWavePanel() {
   renderWaveParams();
   drawWaveThumb();
 }
-/** How long a window may be, in seconds: as long as the piece itself, and never
- *  more than four seconds. A piece is usually the bad stretch the razor cut out,
- *  so "as long as the piece" is the natural answer; the cap keeps a piece that
- *  happens to be a minute long from reaching back across half the clip, where
- *  the footage has nothing to do with it any more. */
-function borrowCap(s) {
-  return Math.min(60, Math.max(0.25, (s.hi - s.lo) / 1000 || 1));
-}
-/** Put the panel in front of the selected piece, or hide it. */
+/** Put the panel in front of the selected piece, or hide it. Every control here
+ *  shows the value IN FORCE -- what is stored on the span -- never the value the
+ *  box was last left on, because the two diverge the moment a neighbour moves. */
 function renderBorrowPanel() {
   const el = borrowPanel();
   if (!el) return;
   const s = borrowSeg();
   el.hidden = !s;
   if (!s) return;
-  // absent reads as the defaults the server also assumes
-  $('bbSide').value = String(borrowSide(s));
-  const w = borrowWindows(s, borrowCap(s));
-  // Show the length in force, not a remembered number: after a razor cut the
-  // piece is a different length and "as long as the piece" is a different
-  // number of seconds, so a stored field would lie about what is being read.
-  const before = s.refBefore ? (s.refBefore[1] - s.refBefore[0]) / 1000
-                             : (w.before ? (w.before[1] - w.before[0]) / 1000 : 0);
-  const after = s.refAfter ? (s.refAfter[1] - s.refAfter[0]) / 1000
-                           : (w.after ? (w.after[1] - w.after[0]) / 1000 : 0);
-  $('bbBefore').value = before.toFixed(2);
-  $('bbAfter').value = after.toFixed(2);
-  $('bbAmount').value = Math.round(borrowNum(s.amount, 1, 0, 1) * 100);
-  $('bbTravel').value = borrowNum(s.travel, 1, 0.25, 3).toFixed(2);
-  $('bbFreq').value = borrowNum(s.freq, 1, 0.25, 4).toFixed(2);
+  const side = borrowSide(s);
+  $('bbSide0').checked = side === 0;
+  $('bbSide1').checked = side === 1;
+  $('bbSide2').checked = side === 2;
+  const before = borrowLenOf(s, 'before');
+  const after = borrowLenOf(s, 'after');
+  setBorrowField('bbBefore', before.toFixed(2));
+  setBorrowField('bbAfter', after.toFixed(2));
+  setBorrowField('bbAmount', String(Math.round(borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT) * 100)));
+  setBorrowField('bbTravel', borrowNum(s.travel, 1, 0.2, 3).toFixed(2));
+  setBorrowField('bbFreq', borrowNum(s.freq, 1, 0.2, 3).toFixed(2));
   labelBorrowAt(s);
+}
+/** Write one knob's number box AND its slider together. They are one value with
+ *  two handles, so a repaint that moved only one of them would leave the panel
+ *  showing two different answers to the same question. */
+function setBorrowField(id, text) {
+  const box = $(id);
+  if (box) box.value = text;
+  const sl = $(id + 'S');
+  if (sl) sl.value = text;
 }
 /** Where the two frozen windows actually sit, in the clip's own clock. The
  *  author's question is "what is it reading", and the answer is two stretches
@@ -4697,7 +4764,7 @@ function labelBorrowAt(s) {
   const note = $('bbNote');
   if (!note) return;
   const dur = spanDur(state && state.clips[cur]);
-  const w = borrowWindows(s, borrowCap(s));
+  const w = borrowWindows(s);
   const bad = [];
   if (!s.refBefore && !w.before && s.lo < 250) bad.push(T('page.borrow.none'));
   if (!s.refAfter && !w.after && dur - s.hi < 250) bad.push(T('page.borrow.none'));
@@ -5147,85 +5214,133 @@ if ($('wpNoCuts')) $('wpNoCuts').onchange = () => editPiece(s => {
 
 // ---- the borrow panel's wiring ---------------------------------------------
 // Same bargain as the wave panel above: every control commits one undo step and
-// one post, and none of them touches the frozen windows. `bbBefore`/`bbAfter`
+// one post, and none of them touches the frozen windows. The two LENGTH fields
 // are the exception -- they say how long a window to TAKE, so changing one
 // re-measures that side on the spot (there is no other honest reading: a length
 // that does not match the window it describes is a field that lies).
-if ($('bbSide')) $('bbSide').onchange = () => editBorrow(s => {
-  s.side = borrowSide({ side: Number($('bbSide').value) });
-  // Switching sides is a request for a different stretch of footage, and a
-  // window from the wrong side is not a window this piece can read.
-  const want = s.side;
-  if ((want === 0 || want === 2) && !s.refBefore) s.refBefore = borrowWindows(s, borrowCap(s)).before;
-  if ((want === 1 || want === 2) && !s.refAfter) s.refAfter = borrowWindows(s, borrowCap(s)).after;
+
+/** The side radios. Three answers to one question, so picking any of them is
+ *  the same edit: store which, and make sure the windows it names exist. A side
+ *  that is switched away keeps nothing -- a window from the wrong side is not a
+ *  window this piece can read. */
+for (const [id, want] of [['bbSide0', 0], ['bbSide1', 1], ['bbSide2', 2]]) {
+  const el = $(id);
+  if (!el) continue;
+  el.onchange = () => { if (el.checked) editBorrow(s => setBorrowSide(s, want)); };
+}
+function setBorrowSide(s, want) {
+  s.side = borrowSide({ side: want });
+  if ((want === 0 || want === 2) && !s.refBefore) {
+    s.refBefore = borrowWindow(s, 'before', borrowLenOf(s, 'before'));
+  }
+  if ((want === 1 || want === 2) && !s.refAfter) {
+    s.refAfter = borrowWindow(s, 'after', borrowLenOf(s, 'after'));
+  }
   if (want === 0) s.refAfter = null;
   if (want === 1) s.refBefore = null;
-});
-/** Re-measure one side to a stated length, and leave the other alone. */
+}
+
+/** Read one length field, in seconds, held to what the slider can reach. */
+function borrowLenValue(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return BORROW_DEF_LEN;
+  return Math.max(0, Math.min(BORROW_MAX_LEN, n));
+}
+/** Wire one side's number box and slider to the same field.
+ *
+ *  Both write the frozen window, and both write it the same way, so there is one
+ *  answer to "how long is it reading" no matter which of the two was used. The
+ *  peek overlay follows the value being chosen rather than the value in force --
+ *  that is the whole point of showing it while a hand is on the control -- and it
+ *  is cleared when the control is let go, so it never sits over the script.
+ */
 function borrowLen(id, which) {
-  const el = $(id);
-  if (!el) return;
-  // While the field has focus, the bar shows the stretch this length would
-  // read -- measured from the box's current value, not from the frozen window,
-  // so the overlay tracks the number being typed rather than lagging a commit
-  // behind it. Cleared on blur: an overlay that stayed would cover the script
-  // for as long as the piece was selected.
-  el.oninput = () => {
+  const box = $(id);
+  const sl = $(id + 'S');
+  if (!box && !sl) return;
+  const peek = v => {
     const s = borrowSeg();
     if (!s) return;
-    const sec = Math.max(0.25, Math.min(60, Number(el.value) || 0));
-    const len = sec * 1000;
-    const dur = spanDur(state && state.clips[cur]);
-    borrowPeek = [];
-    if (which === 'before') {
-      const b0 = Math.max(0, s.lo - len);
-      if (s.lo - b0 >= 250) borrowPeek = [[b0, s.lo]];
-    } else {
-      const a1 = Math.min(dur, s.hi + len);
-      if (a1 - s.hi >= 250) borrowPeek = [[s.hi, a1]];
-    }
+    const w = borrowWindow(s, which, borrowLenValue(v));
+    borrowPeek = w ? [w] : [];
     invalidate();
   };
-  el.onblur = () => { if (borrowPeek.length) { borrowPeek = []; invalidate(); } };
-  el.onfocus = () => {
-    // Focusing the field is what opens the preview: the author is about to
-    // choose a length, so show what is currently in force before they change it.
+  const clearPeek = () => { if (borrowPeek.length) { borrowPeek = []; invalidate(); } };
+  const showInForce = () => {
     const s = borrowSeg();
     if (!s) return;
     const r = which === 'before' ? s.refBefore : s.refAfter;
     borrowPeek = r ? [[r[0], r[1]]] : [];
     invalidate();
   };
-  el.onchange = () => editBorrow(s => {
-    const sec = Math.max(0.25, Math.min(60, Number(el.value) || 0));
-    const len = sec * 1000;
-    const dur = spanDur(state && state.clips[cur]);
-    if (which === 'before') {
-      const b0 = Math.max(0, s.lo - len);
-      s.refBefore = (s.lo - b0 >= 250) ? [b0, s.lo] : null;
-      if (!s.refBefore && s.refAfter) s.side = 1;
-      else if (s.refBefore && s.refAfter) s.side = 2;
-      else if (s.refBefore) s.side = 0;
-    } else {
-      const a1 = Math.min(dur, s.hi + len);
-      s.refAfter = (a1 - s.hi >= 250) ? [s.hi, a1] : null;
-      if (!s.refAfter && s.refBefore) s.side = 0;
-      else if (s.refBefore && s.refAfter) s.side = 2;
-      else if (s.refAfter) s.side = 1;
-    }
-  });
+  // Drag: the overlay tracks the number, no commit -- a slider that posted on
+  // every pixel would rewrite the script a hundred times for one gesture.
+  for (const el of [box, sl]) {
+    if (!el) continue;
+    el.oninput = () => {
+      const v = borrowLenValue(el.value);
+      if (box && box !== el) box.value = v.toFixed(2);
+      if (sl && sl !== el) sl.value = String(v);
+      peek(v);
+    };
+    el.onfocus = showInForce;
+    el.onpointerdown = showInForce;
+    el.onblur = clearPeek;
+    el.onpointerup = clearPeek;
+    // Release: one commit, one post, and the side is whatever the windows now are.
+    el.onchange = () => {
+      const v = borrowLenValue(el.value);
+      editBorrow(s => {
+        const w = borrowWindow(s, which, v);
+        if (which === 'before') s.refBefore = w; else s.refAfter = w;
+        if (s.refBefore && s.refAfter) s.side = 2;
+        else if (s.refBefore) s.side = 0;
+        else if (s.refAfter) s.side = 1;
+        else s.side = 2;
+      });
+      clearPeek();
+    };
+  }
 }
 borrowLen('bbBefore', 'before');
 borrowLen('bbAfter', 'after');
-if ($('bbAmount')) $('bbAmount').onchange = () => editBorrow(s => {
-  s.amount = Math.max(0, Math.min(100, Number($('bbAmount').value) || 0)) / 100;
-});
-if ($('bbTravel')) $('bbTravel').onchange = () => editBorrow(s => {
-  s.travel = borrowNum($('bbTravel').value, 1, 0.25, 3);
-});
-if ($('bbFreq')) $('bbFreq').onchange = () => editBorrow(s => {
-  s.freq = borrowNum($('bbFreq').value, 1, 0.25, 4);
-});
+
+/** The three one-number knobs, each a box and a slider on the same value. */
+function borrowKnob(id, lo, hi, apply, asPercent) {
+  const box = $(id);
+  const sl = $(id + 'S');
+  const read = v => {
+    const n = Number(v);
+    const d = asPercent ? 100 : 1;
+    return Math.max(lo, Math.min(hi, isFinite(n) ? n : d));
+  };
+  const put = v => {
+    const text = asPercent ? String(Math.round(v)) : v.toFixed(2);
+    if (box) box.value = text;
+    if (sl) sl.value = text;
+  };
+  for (const el of [box, sl]) {
+    if (!el) continue;
+    // Drag moves the twin only. The span is not touched until the release: a
+    // slider that posted on every pixel would rewrite the script a hundred times
+    // for one gesture, and each of those is a full re-compose on the server.
+    el.oninput = () => {
+      const v = read(el.value);
+      if (box && box !== el) box.value = asPercent ? String(Math.round(v)) : v.toFixed(2);
+      if (sl && sl !== el) sl.value = String(v);
+    };
+    el.onchange = () => {
+      const v = read(el.value);
+      put(v);
+      editBorrow(s => apply(s, v));
+    };
+  }
+}
+borrowKnob('bbAmount', 0, BORROW_MAX_AMOUNT * 100,
+           (s, v) => { if (s) s.amount = v / 100; }, true);
+borrowKnob('bbTravel', 0.2, 3, (s, v) => { if (s) s.travel = v; }, false);
+borrowKnob('bbFreq', 0.2, 3, (s, v) => { if (s) s.freq = v; }, false);
+
 // The one control that measures again. Everything else in this panel edits what
 // is already frozen, so a neighbour moving afterwards cannot rewrite a piece the
 // author has already looked at and kept -- which is the whole reason the windows
@@ -5233,7 +5348,7 @@ if ($('bbFreq')) $('bbFreq').onchange = () => editBorrow(s => {
 if ($('bbGen')) $('bbGen').onclick = ev => {
   ev.stopPropagation();
   editBorrow(s => {
-    const w = freezeBorrow(s);
+    const w = freezeBorrow(s, true);
     s.side = (w.before && w.after) ? 2 : (w.before ? 0 : (w.after ? 1 : 2));
   }, 'page.hist.borrowGen');
 };

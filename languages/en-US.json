@@ -542,7 +542,7 @@
   "page.wave.noLimit.tip": "write the drawing at its own slopes: the piece is solved from the wave, so no speed cap is run over it. A drawing faster than the device can play is the drawing you asked for.",
   "page.wave.noCuts": "ignore cuts",
   "page.wave.noCuts.tip": "leave the video's shot cuts out of this piece. Off, a cut inside the piece keeps its seam protection like any other piece.",
-  "page.borrow.head": "borrow",
+  "page.borrow.head": "generate from the neighbours",
   "page.borrow.from": "read",
   "page.borrow.before": "the stretch before",
   "page.borrow.after": "the stretch after",
