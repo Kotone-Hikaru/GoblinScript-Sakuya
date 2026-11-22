@@ -573,6 +573,10 @@ fn tracks_of(
         rev: two(rtop, rbot),
         // NaN stays NaN: the decode reads an unforwarded row as a hold
         period: period.to_vec(),
+        // A head pass never borrows: a generated piece is a styling-time edit,
+        // and the source tracks a borrow reads from must not carry one either.
+        borrow_level: Vec::new(),
+        borrow_w: Vec::new(),
     }
 }
 

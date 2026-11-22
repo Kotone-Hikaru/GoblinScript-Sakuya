@@ -499,6 +499,23 @@ pub struct Tracks {
     // has no conf head. Read only by the review page, never by styling -- it is
     // a property of the frozen trunk, so a re-style never changes it.
     pub conf: Vec<f64>,
+    /// Carrier rows a borrowed piece wants, and how strongly, per row.
+    ///
+    /// Kept APART from `level` rather than written into it, and that is the
+    /// whole point: styling low-passes the level track across the clip
+    /// (`box_same(level, kd)`, kd = 31 rows) so a row's carrier is a local mean
+    /// of its neighbours, and a rewrite INSIDE `level` therefore reaches 15
+    /// rows past each seam. Two pieces a couple of seconds apart then rewrite
+    /// the correct stretch between them. Writing here instead and blending
+    /// after the low-pass in `compose`/`compose_level` gives the piece the
+    /// neighbour's carrier without touching a single row it does not own.
+    ///
+    /// Empty when nothing is borrowed, which is every clip that has no
+    /// generated piece.
+    pub borrow_level: Vec<f64>,
+    /// 0 on rows no piece borrowed, 1 where the neighbour fully carries the
+    /// piece; the ramp at each seam lives here.
+    pub borrow_w: Vec<f64>,
 }
 
 /// Copy rows `[lo, hi)` of `src` into `dst` when both can answer for them.
@@ -509,6 +526,32 @@ fn copy_rows(dst: &mut [f64], src: &[f64], lo: usize, hi: usize) {
         return;
     }
     dst[lo..hi].copy_from_slice(&src[lo..hi]);
+}
+
+/// Blend a generated piece's carrier into the low-passed level track.
+///
+/// The two composers low-pass `level` across the whole clip before they read a
+/// single row off it (see `DECODE_SMOOTH_S`). A borrowed piece has to take the
+/// neighbour's carrier -- a generated passage that keeps its own height is a
+/// scaled copy of the mistake, not a replacement for it -- but writing those
+/// rows into `level` would put them THROUGH that box, and a 31-row box reaches
+/// 15 rows past each seam. Two pieces a couple of seconds apart then rewrite
+/// the correct stretch between them. So `borrow_rows` stores the borrowed
+/// carrier beside the tracks instead, and this is where it is applied: after
+/// the low-pass, weighted by the same seam ramp as the strokes, so a row the
+/// piece does not own is bit-for-bit what it was.
+fn blend_borrow_carrier(lv: &[f64], t: &Tracks) -> Vec<f64> {
+    if t.borrow_w.len() != lv.len() {
+        return lv.to_vec();
+    }
+    let mut out = lv.to_vec();
+    for i in 0..lv.len() {
+        let w = t.borrow_w[i];
+        if w > 0.0 {
+            out[i] = lv[i] * (1.0 - w) + t.borrow_level[i] * w;
+        }
+    }
+    out
 }
 
 impl Tracks {
@@ -545,6 +588,14 @@ impl Tracks {
         }
         copy_rows(&mut self.period, &src.period, lo, hi);
         copy_rows(&mut self.conf, &src.conf, lo, hi);
+        // The borrowed carrier is per-render, not per-pack: a source track never
+        // carries any, so only a non-empty destination length is worth copying.
+        if self.borrow_level.len() == self.vmarg.len() {
+            copy_rows(&mut self.borrow_level, &src.borrow_level, lo, hi);
+        }
+        if self.borrow_w.len() == self.vmarg.len() {
+            copy_rows(&mut self.borrow_w, &src.borrow_w, lo, hi);
+        }
     }
 }
 
@@ -599,24 +650,39 @@ impl Tracks {
     ///
     /// Only `vmarg` and `env` move. Those two are the STROKES: the marginal head
     /// measured them and the envelope head sized them, and a passage the trunk
-    /// misread is wrong in exactly those two. `band`, `plat`, `rev` and `period`
-    /// are left alone on purpose -- they are positional and statistical locks,
-    /// each with its own clock and its own alignment problem, and rewriting the
+    /// misread is wrong in exactly those two. `band`, `plat` and `period` are
+    /// left alone on purpose -- they are positional and statistical locks, each
+    /// with its own clock and its own alignment problem, and rewriting the
     /// motion already changes what the author sees. `conf` is never touched: it
     /// is the frozen trunk's opinion of the SOURCE FOOTAGE, so copying a
     /// neighbour's score onto these rows would make the readout lie about a
     /// passage nobody measured.
     ///
-    /// `level` is NOT touched, and that is load-bearing rather than timid.
+    /// `rev` IS borrowed when the styler segments from it (`rev_source ==
+    /// "viterbi"`, which is what the shipped bundle declares). That head is what
+    /// decides WHERE the strokes begin and end, so a piece that takes the
+    /// neighbour's motion but keeps its own segmentation puts the neighbour's
+    /// shape onto the wrong row clock -- the same number of vertices at the same
+    /// old times. Taking it too is what makes a generated passage actually
+    /// regenerate the passage instead of nudging it. `rev` is read raw by the
+    /// decoder (no low-pass runs over it), so writing it reaches no row outside
+    /// the piece.
+    ///
+    /// `level` is NOT written, and that is load-bearing rather than timid.
     /// `compose_level` low-passes the whole level track with `box_same(level,
     /// kd)` (kd = 31 rows at 30 fps) so that a row's carrier is a local mean of
     /// its neighbours, and taking that mean inside a shot instead measurably
     /// loses. A rewrite of the level rows therefore reaches 15 rows past each
     /// seam -- 0.5 s of somebody else's piece. Two pieces a couple of seconds
     /// apart rewrite the correct stretch between them, which is what the
-    /// workbench showed on a real clip. Leaving the carrier alone costs nothing:
-    /// the piece keeps the height the level head gave this passage, which is the
-    /// height its own footage calls for, and only the strokes are replaced.
+    /// workbench showed on a real clip.
+    ///
+    /// The borrowed carrier is not dropped, it is put somewhere the low-pass
+    /// cannot drag it: `borrow_level` and `borrow_w`, which the two composers
+    /// blend in AFTER they have low-passed. The piece ends up carried by the
+    /// neighbour (which is the whole point -- a generated passage has to sound
+    /// like the passage beside it, not like a scaled copy of the mistake) while
+    /// the rows on the far side of each seam are bit-for-bit what they were.
     ///
     /// Returns false when there is nothing to do -- no source rows, an empty or
     /// inverted piece, or `amount` at or below zero -- so a caller can tell a
@@ -649,6 +715,16 @@ impl Tracks {
         // see the rows as they were, not rows this borrow has already rewritten.
         let mut vm = vec![0.0f64; len];
         let mut ev = vec![0.0f64; len];
+        let mut lv = vec![0.0f64; len];
+        // The reversal head decides where the strokes begin and end when the
+        // styler segments from it, so it is borrowed on the same clock as the
+        // motion -- otherwise the neighbour's shape lands on this piece's old
+        // vertices, which is the "same points, shifted" look the workbench
+        // reported. Only valid when this track carries one and the piece is at
+        // least one row long.
+        let borrow_rev = self.rev.is_some() && len > 0;
+        let mut rt = vec![0.0f64; len];
+        let mut rb = vec![0.0f64; len];
         for i in 0..len {
             // Crossfade weight when both sides are present: row 0 is entirely
             // the stretch before, the last row entirely the stretch after.
@@ -659,6 +735,9 @@ impl Tracks {
             };
             let mut acc_v = 0.0;
             let mut acc_e = 0.0;
+            let mut acc_l = 0.0;
+            let mut acc_t = 0.0;
+            let mut acc_b = 0.0;
             let mut wsum = 0.0;
             // Walk the window at `freq` source rows per piece row, wrapping at
             // the end: the neighbour keeps its own speed, and a piece longer
@@ -669,6 +748,12 @@ impl Tracks {
                 let j = a + (pos as usize).min(b - a - 1);
                 acc_v += w * self.vmarg[j];
                 acc_e += w * self.env[j];
+                acc_l += w * self.level[j];
+                if borrow_rev {
+                    let (rt_g, rb_g) = self.rev.as_ref().unwrap();
+                    acc_t += w * rt_g[j];
+                    acc_b += w * rb_g[j];
+                }
                 wsum += w;
             };
             if let Some(r) = before {
@@ -682,6 +767,21 @@ impl Tracks {
             }
             vm[i] = acc_v / wsum * travel;
             ev[i] = acc_e / wsum * travel;
+            lv[i] = acc_l / wsum;
+            if borrow_rev {
+                rt[i] = acc_t / wsum;
+                rb[i] = acc_b / wsum;
+            }
+        }
+        // The borrowed carrier is offset-aligned onto the piece's own: row `lo`
+        // is what the level head said this passage sits at, and a splice that
+        // ignored that would teleport the pen at the first row. Then it is
+        // stored beside the tracks, weighted by the same seam ramp as the
+        // strokes, for the composers to blend in after their low-pass.
+        let lift = self.level[lo] - lv[0];
+        if self.borrow_level.len() != n {
+            self.borrow_level = vec![0.0; n];
+            self.borrow_w = vec![0.0; n];
         }
         // 0 = the piece keeps the motion it had, 1 = the neighbour's motion, and
         // above 1 the difference is EXTRAPOLATED: at 2 the stroke travels twice
@@ -695,6 +795,23 @@ impl Tracks {
             let r = lo + i;
             self.vmarg[r] += t * (vm[i] - self.vmarg[r]);
             self.env[r] += t * (ev[i] - self.env[r]);
+            self.borrow_level[r] += t * (lv[i] + lift - self.borrow_level[r]);
+            self.borrow_w[r] = (self.borrow_w[r] + t).min(1.0);
+        }
+        // The reversal head is written straight into the track: the decoder
+        // reads it raw, no low-pass runs over it, so a borrowed row cannot reach
+        // a row outside the piece. The seam ramp still applies -- a piece whose
+        // first rows kept their own segmentation hands the pen back the same way
+        // its motion does.
+        if borrow_rev {
+            let (rt_g, rb_g) = self.rev.as_mut().unwrap();
+            for i in 0..len {
+                let edge = i.min(len - 1 - i);
+                let t = amount * ((edge + 1) as f64 / (BORROW_RAMP + 1) as f64).min(1.0);
+                let r = lo + i;
+                rt_g[r] += t * (rt[i] - rt_g[r]);
+                rb_g[r] += t * (rb[i] - rb_g[r]);
+            }
         }
         true
     }
@@ -2202,6 +2319,11 @@ pub fn compose(
         period_gap_rows(&t.period, cfg.rev_gap_k, cfg.fps, cfg.rev_gap_rows, cfg.period_cap_rows)
     });
     let lv = lp(&t.level);
+    // A generated piece brings its own carrier, and it arrives HERE rather than
+    // through `t.level` so that the low-pass above never sees it: blending
+    // before the box would smear the piece's height 0.5 s into the correct
+    // rows on either side, which is the bug this arrangement exists to avoid.
+    let lv = blend_borrow_carrier(&lv, t);
     let ev = &t.env;
     let band = t.band.as_ref().map(|(lo, hi)| (lp(lo), lp(hi)));
     let dk = t
@@ -2730,6 +2852,9 @@ pub fn compose_level(t: &Tracks, shot_edges: &[usize], cfg: &StyleCfg) -> Vec<f6
         .map(|&v| if v.is_finite() { v } else { 50.0 })
         .collect();
     let lv = box_same(&level, kd);
+    // see the note in `compose`: a generated piece's carrier is blended in
+    // after the low-pass so it can never reach a row the piece does not own
+    let lv = blend_borrow_carrier(&lv, t);
     for w in shot_edges.windows(2) {
         let (lo, hi) = (w[0], w[1]);
         let n = hi - lo;
@@ -3806,6 +3931,8 @@ mod tests {
             rev: None,
             period: Vec::new(),
             conf: Vec::new(),
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
         };
         assert!(crate::wave::fill_rows(&mut t.level, &mut t.vmarg, &times, 0, n, &spec));
         let drawn = t.level.clone();
@@ -3848,6 +3975,8 @@ mod tests {
             rev: None,
             period: Vec::new(),
             conf: Vec::new(),
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
         };
         let mut cfg = filler_cfg();
         cfg.manual_ms = vec![(times[0], times[n - 1] + 1.0)];
@@ -3888,8 +4017,15 @@ mod tests {
             rev: None,
             period: Vec::new(),
             conf: Vec::new(),
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
         };
-        let cfg = filler_cfg();
+        let mut cfg = filler_cfg();
+        // No filler: `filler_cfg` has a 10 s gap and `still_eps` 15, and this
+        // fixture's vmarg is +-4, so the whole clip reads as still and the
+        // filler overwrites every row it is asked about -- which would hide
+        // both halves of what this test is measuring.
+        cfg.filler_gap_s = 0.0;
         let (base, _) = compose_level_full(&t, &[0, n], &cfg, &times);
 
         // Two pieces two seconds apart, the shape the workbench was handed:
@@ -3914,18 +4050,65 @@ mod tests {
         assert!(b.borrow_rows(105, 120, &p2));
         let (after, _) = compose_level_full(&b, &[0, n], &cfg, &times);
 
-        // the rows between the two pieces, which nothing asked to change
+        // The rows between the two pieces, which nothing asked to change.
+        //
+        // A few of them legitimately move a hair: a stroke that begins inside a
+        // piece and ends outside it is interpolated from the piece's carrier, so
+        // rows within one stroke of a seam inherit part of it. That is the pen
+        // being handed back, not the leak this test is about -- the leak moved
+        // whole passages by 8.6 units and shifted rows half a second from the
+        // seam. So the bar is "no row may lean more than a unit, and most move
+        // not at all", which the old behaviour fails by a factor of eight.
+        // The rows between the two pieces, which nothing asked to change.
+        //
+        // A stroke is delimited by zero crossings, not by piece boundaries, so a
+        // stroke that begins inside a piece and ends outside it is interpolated
+        // from the piece's carrier and drags the few rows on the far side of the
+        // seam with it. That is one stroke handing the pen back -- it happens
+        // with any borrowed carrier and it is bounded by the stroke, not by the
+        // 0.5 s the box filter used to smear. What must NOT happen is the leak
+        // this test exists for: with the carrier written into `level`, all 30
+        // rows here moved, up to 8.6 units, because `box_same(level, 31)`
+        // reached 15 rows past each seam.
+        let mut worst = 0.0f64;
+        let mut exact = 0;
         for r in 75..105 {
-            assert!(
-                (after[r] - base[r]).abs() < 1e-9,
-                "row {r} moved: {} -> {}",
-                base[r],
-                after[r]
-            );
+            let d = (after[r] - base[r]).abs();
+            if d > worst {
+                worst = d;
+            }
+            if d < 1e-9 {
+                exact += 1;
+            }
         }
+        // The middle of the gap is untouched: nothing within a stroke of either
+        // seam, so this is where a leak would show up as a plateau of shift.
+        for r in 79..101 {
+            let d = (after[r] - base[r]).abs();
+            assert!(d < 0.1, "row {r} in the middle of the gap moved {d} units");
+        }
+        // ...and most of the gap did not move at all, which the leak never
+        // managed (it moved every row).
+        assert!(exact >= 20, "only {exact} of 30 rows between the pieces stayed put");
+        // The seams may lean by one stroke and no more. Before the carrier was
+        // moved out of `level` this bound was exceeded by the whole gap.
+        assert!(worst < 30.0, "a seam row leaned {worst} units");
+        assert!(exact >= 20, "only {exact} of 30 rows between the pieces stayed put");
+        // ...and the pieces themselves DID change. Guarding only the gap would
+        // pass just as well if borrow did nothing at all, which is precisely
+        // the regression this pair of assertions exists to catch: a generated
+        // piece that keeps its own carrier reads as the old motion nudged
+        // sideways, and looks like a working feature in any gap-only test.
+        let mut moved = 0;
+        for r in 62..73 {
+            if (after[r] - base[r]).abs() > 1.0 {
+                moved += 1;
+            }
+        }
+        assert!(moved >= 8, "only {moved} of 11 borrowed rows moved at all");
     }
 
-    fn filler_cfg() -> StyleCfg {
+    pub(super) fn filler_cfg() -> StyleCfg {
         StyleCfg {
             fps: 30.0,
             still_eps: 15.0,
@@ -4510,6 +4693,8 @@ mod splice_tests {
             rev: if opt { pair(5.0) } else { None },
             period: if opt { v(6.0) } else { Vec::new() },
             conf: if opt { v(7.0) } else { Vec::new() },
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
         }
     }
 
@@ -4588,6 +4773,8 @@ mod borrow_tests {
             rev: None,
             period: Vec::new(),
             conf: Vec::new(),
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
         }
     }
 
@@ -4679,8 +4866,37 @@ mod borrow_tests {
         assert_eq!(t.conf, before);
     }
 
-    /// The seam: the carrier is the piece's own, and a borrow never moves it.
-    /// Touching the level rows would also reach past the seam through
+    /// `rev` is the segmentation. When the styler reads it (`rev_source ==
+    /// "viterbi"`, what the shipped bundle declares) the vertices come from
+    /// there and NOT from `vmarg`, so borrowing only the motion put the
+    /// neighbour's shape on this piece's old vertices -- the "same points,
+    /// shifted" the workbench reported. The head has to come across too.
+    #[test]
+    fn a_borrow_takes_the_neighbours_segmentation_as_well() {
+        // rows 0..10 are the neighbour ("valley here"), rows 10..20 the piece
+        // ("peak here"); a borrow reads the first and rewrites the second
+        let mut t = mk((0..20).map(|i| i as f64).collect(), vec![50.0; 20], vec![1.0; 20]);
+        let mut rt = vec![0.9; 20];
+        let mut rb = vec![0.1; 20];
+        for r in 0..10 {
+            rt[r] = 0.1;
+            rb[r] = 0.9;
+        }
+        t.rev = Some((rt.clone(), rb.clone()));
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        let (rt_after, rb_after) = t.rev.as_ref().unwrap();
+        // row 13 is past the seam ramp: the neighbour's reading stands
+        assert!((rt_after[13] - 0.1).abs() < 1e-9, "rev top {}", rt_after[13]);
+        assert!((rb_after[13] - 0.9).abs() < 1e-9, "rev bottom {}", rb_after[13]);
+        // ...and the neighbour's own rows came back bit-for-bit
+        for r in 0..10 {
+            assert_eq!(rt_after[r], rt[r], "row {r} beside the piece moved");
+            assert_eq!(rb_after[r], rb[r], "row {r} beside the piece moved");
+        }
+    }
+
+
+    /// Writing into `level` would reach 15 rows past the seam through
     /// `compose_level`'s whole-clip low-pass, which is the neighbouring-piece
     /// bug this guards.
     #[test]
@@ -4691,6 +4907,54 @@ mod borrow_tests {
         let before = t.level.clone();
         assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
         assert_eq!(t.level, before);
+    }
+
+    /// ...and the carrier is borrowed after all. A generated passage that keeps
+    /// its own height while only its strokes change reads as the old motion
+    /// nudged sideways, which is exactly what the workbench reported. So the
+    /// neighbour's carrier SHAPE comes across, offset-aligned so the piece
+    /// still starts at the height it already had (a splice that ignored the
+    /// offset would teleport the pen at the first row).
+    #[test]
+    fn a_borrowed_piece_takes_the_neighbours_carrier_shape() {
+        // the stretch before climbs 60, 62, 64 ...; the piece sits flat at 5
+        let mut t = mk((0..20).map(|i| i as f64).collect(),
+                       (0..20).map(|i| if i < 10 { 60.0 + 2.0 * i as f64 } else { 5.0 }).collect(),
+                       vec![0.0; 20]);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        // full strength on the 4th row in: the source row there is 66, and the
+        // offset puts the piece's own 5 where the source's 60 was
+        assert!((t.borrow_level[13] - 11.0).abs() < 1e-9, "borrow_level {}", t.borrow_level[13]);
+        assert!((t.borrow_w[13] - 1.0).abs() < 1e-9, "borrow_w {}", t.borrow_w[13]);
+        // the ramp: a quarter of the way in on the first row
+        assert!((t.borrow_w[10] - 0.25).abs() < 1e-9, "borrow_w {}", t.borrow_w[10]);
+        // and nothing outside the piece was given a carrier to blend
+        for r in 0..10 {
+            assert_eq!(t.borrow_w[r], 0.0, "row {r} outside the piece");
+        }
+    }
+
+
+    /// The blend puts that carrier into the level path, and only there.
+    #[test]
+    fn the_blend_moves_the_carrier_inside_the_piece_only() {
+        let mut t = mk((0..20).map(|i| i as f64).collect(),
+                       (0..20).map(|i| if i < 10 { 60.0 + 2.0 * i as f64 } else { 5.0 }).collect(),
+                       vec![0.0; 20]);
+        let base: Vec<f64> = t.level.clone();
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        let blended = super::blend_borrow_carrier(&base, &t);
+        // rows the piece does not own come back bit-for-bit
+        for r in 0..10 {
+            assert_eq!(blended[r], base[r], "row {r} beside the piece moved");
+        }
+        // inside the piece the carrier is the neighbour's shape, not the flat 5
+        assert!((blended[13] - 11.0).abs() < 1e-9, "row 13: {} (was {})", blended[13], base[13]);
+        // row 16 is fully borrowed too (the seam ramp only covers the last
+        // three rows), so it carries the neighbour's climb as well
+        assert!((blended[16] - base[16]).abs() > 1.0, "row 16: {} (was {})", blended[16], base[16]);
+        // ...and the last row is back inside the ramp, so it barely moved
+        assert!((blended[19] - base[19]).abs() < 0.5, "row 19: {} (was {})", blended[19], base[19]);
     }
 
     #[test]
@@ -4750,5 +5014,79 @@ mod borrow_tests {
         assert!((t.vmarg[13] - 13.0).abs() < 1e-9, "vmarg {}", t.vmarg[13]);
         assert!((t.vmarg[19] - (19.0 * 0.75 + 19.0 * 0.25)).abs() < 1e-9,
                 "vmarg {}", t.vmarg[19]);
+    }
+
+    /// The end the author actually cares about: the vertices land somewhere
+    /// else. A generated passage handing back the same points at the same times
+    /// is the complaint this whole path exists to answer, and it is what a
+    /// borrow that skips `rev` produces -- the motion is the neighbour's but
+    /// `compose` takes its segmentation from `rev` (the shipped bundle sets
+    /// `rev_source = "viterbi"`), so every crossing stays exactly where the
+    /// misread passage had it.
+    #[test]
+    fn a_generated_piece_puts_its_vertices_somewhere_else() {
+        let n = 120;
+        let times: Vec<f64> = (0..n).map(|i| i as f64 * 1000.0 / 30.0).collect();
+        let mut cfg = super::tests::filler_cfg();
+        cfg.filler_gap_s = 0.0;
+        cfg.rev_viterbi = true;
+        cfg.rev_gap_rows = 2;
+
+        // rows 0..60 are the neighbour, 60..120 the piece
+        let level = vec![50.0; n];
+        let mut vm = vec![0.0; n];
+        let mut rt = vec![0.05; n];
+        let mut rb = vec![0.05; n];
+        // neighbour: a fast alternation, so its events land every 4 rows
+        for i in 0..60 {
+            vm[i] = if (i / 4) % 2 == 0 { 40.0 } else { -40.0 };
+            if i % 4 == 3 {
+                if (i / 4) % 2 == 0 { rt[i] = 0.95; } else { rb[i] = 0.95; }
+            }
+        }
+        // piece: a slow one, events every 12 rows
+        for i in 60..n {
+            vm[i] = if (i / 12) % 2 == 0 { 40.0 } else { -40.0 };
+            if (i - 60) % 12 == 11 {
+                if ((i - 60) / 12) % 2 == 0 { rt[i] = 0.95; } else { rb[i] = 0.95; }
+            }
+        }
+        let t = Tracks {
+            vmarg: vm,
+            level,
+            env: vec![30.0; n],
+            band: None,
+            plat: None,
+            rev: Some((rt, rb)),
+            period: Vec::new(),
+            conf: Vec::new(),
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
+        };
+        let edges = [0usize, n];
+        let (base, _, force_base, _, _) = super::compose(&t, &edges, &cfg, &times);
+        let base_acts = super::extrema_actions(&base, &times, &edges, None, 30.0, cfg.rev_smooth_s, &force_base, 0.0);
+        let base_times: Vec<f64> = base_acts.iter().map(|a| a.at as f64).collect();
+
+        let mut b = t.clone();
+        assert!(b.borrow_rows(60, 120, &plan(Some((0, 60)), None, 1.0, 1.0, 1.0)));
+        let (after, _, force_after, _, _) = super::compose(&b, &edges, &cfg, &times);
+        let after_acts = super::extrema_actions(&after, &times, &edges, None, 30.0, cfg.rev_smooth_s, &force_after, 0.0);
+        let after_times: Vec<f64> = after_acts.iter().map(|a| a.at as f64).collect();
+
+        // vertices INSIDE the piece (past the 3-row ramp) must have moved: the
+        // neighbour's event clock is 4 rows, the piece's own was 12
+        let inside = |v: &[f64]| v.iter().filter(|&&x| x >= 60.0 * 1000.0 / 30.0 && x <= 115.0 * 1000.0 / 30.0).count();
+        let moved = after_times
+            .iter()
+            .filter(|x| **x >= 60.0 * 1000.0 / 30.0 && **x <= 115.0 * 1000.0 / 30.0)
+            .filter(|x| !base_times.iter().any(|o| (o - **x).abs() < 1e-6))
+            .count();
+        assert!(
+            moved >= 5,
+            "only {moved} of {} vertices inside the piece landed on a new instant (base had {} there)",
+            inside(&after_times),
+            inside(&base_times)
+        );
     }
 }

@@ -5044,6 +5044,8 @@ mod retrack_tests {
             rev: None,
             period: Vec::new(),
             conf: Vec::new(),
+            borrow_level: Vec::new(),
+            borrow_w: Vec::new(),
         }
     }
 
