@@ -1238,7 +1238,7 @@ impl Default for Params {
             env_seed: u64::MAX,
             range: (0.0, 100.0),
             max_speed: MAX_POS_RATE,
-            cut_ease: CUT_EASE,
+            cut_ease: CUT_EASE_DEFAULT,
             dwell_ramp: None,
             still_eps: None,
             depth: DepthUniformity::Off,
@@ -2984,9 +2984,23 @@ const RDP_EPS: f64 = 1.0;
 /// two one decode. `--max-speed 0` is the deliberate opt-out.
 pub const MAX_POS_RATE: f64 = 600.0;
 
-/// Default seam ease at shot cuts, pos-units/s -- `jepa_infer.CUT_EASE`,
-/// bound to it by `grid_check`. Artifact layer, like `RDP_EPS`.
+/// The seam ease the artifact layer was trained with, pos-units/s --
+/// `jepa_infer.CUT_EASE`, bound to it by `grid_check`. Artifact layer, like
+/// `RDP_EPS`. This is NOT what a new run starts from: see `CUT_EASE_DEFAULT`.
 pub const CUT_EASE: f64 = 250.0;
+
+/// What a run starts from when nobody said otherwise: off.
+///
+/// The ease exists for one situation -- two clips spliced at a cut, where the
+/// model's motion on either side is a different stroke and the seam reads as a
+/// jump. Anywhere else it is a smoothing pass running over motion that was
+/// already right, and it costs the author the one thing this page is for: the
+/// script they see is the script the model wrote. So it is opt-in.
+///
+/// The trained value stays reachable as `--cut-ease 250` (and `CUT_EASE` above
+/// is still what the artifact was fitted against), which is why the default
+/// moved rather than the constant.
+pub const CUT_EASE_DEFAULT: f64 = 0.0;
 
 /// A vertex placed by a hand wins the model's vertices this close to it,
 /// milliseconds -- `common.PIN_TOL_MS`, bound by `grid_check`. Two rows at

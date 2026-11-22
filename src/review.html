@@ -1734,10 +1734,14 @@ function syncModels() {
   const sel = $('model');
   sel.innerHTML = '';
   for (const m of models) opt(sel, m.name, m.name);
-  // the one entry that is not a model: a hand-drawn piece. It rides this menu
-  // (and the piece list's, and the bar's) so that choosing it needs no new
+  // the two entries that are not models, and they ride every menu that re-tags a
+  // piece (this one, the piece list's, the bar's) so choosing one needs no new
   // gesture -- the razor, the selection, undo and the history all just work.
   opt(sel, MANUAL, '✎ ' + T('page.wave.head'));
+  // A borrowed piece has to be listed here too, or `syncModelSel` would set
+  // `sel.value` to a value with no option and the menu would fall back to
+  // showing whatever happens to be first -- a lie about which piece this is.
+  opt(sel, BORROW, '⇄ ' + T('page.borrow.head'));
   labelModelSel();
   // the script's own model stays listed, so the menu keeps its order
   // through a swap, but a line cannot lie under itself
@@ -2979,6 +2983,20 @@ function openBarMenu(clientX, clientY, ms) {
     mtx.textContent = (cur0 === MANUAL ? '● ' : '· ') + '✎ ' + T('page.wave.head');
     mrow.append(msw, mtx);
     el.append(mrow);
+    // ...and the third answer to "the model got this piece wrong": read the
+    // motion either side of it instead of drawing one. It sits under the
+    // hand-drawn entry because it is the same kind of option -- a way out when
+    // no model fits -- and it belongs in this menu for the same reason the
+    // other one does: the bar is where a piece is picked.
+    const brow = item(() => { setSegModel(i, BORROW); selSeg = i; renderSegs(); },
+                      cur0 === BORROW ? 'on' : '');
+    const bsw = document.createElement('span');
+    bsw.className = 'sw';
+    bsw.style.background = BORROW_HUE;
+    const btx = document.createElement('span');
+    btx.textContent = (cur0 === BORROW ? '● ' : '· ') + '⇄ ' + T('page.borrow.head');
+    brow.append(bsw, btx);
+    el.append(brow);
   }
 
   el.classList.add('on');
@@ -4565,24 +4583,28 @@ function borrowSide(s) {
 }
 /** The two windows a piece at `lo..hi` would read, measured on the spot.
  *
- *  Each side takes the same length as the piece (capped at `cap`), sitting
+ *  Each side asks for the same length as the piece (capped at `cap`), sitting
  *  flush against the seam: the stretch before ends where the piece starts, the
- *  stretch after starts where it ends. A side with nothing behind it -- the
- *  piece starts at 0, or ends at the end of the clip -- gets no window, which
- *  is how the server learns that side does not exist.
+ *  stretch after starts where it ends.
  *
- *  When a side is asked for but the seam has less than 0.25 s behind it, that
- *  side is dropped rather than shrunk: a window a few rows wide would make the
+ *  What it ASKS for and what it GETS are not the same thing. Near the ends of a
+ *  clip the neighbour is shorter than the piece, and taking the shorter one is
+ *  the whole point -- the first piece of a clip has its entire 10 s neighbour
+ *  behind it, and refusing it because the piece in front happens to be the same
+ *  length would leave the one piece most likely to need a borrow with nothing
+ *  to read. So each side takes `min(wanted, available)`.
+ *
+ *  A side with under 0.25 s available gets no window, which is how the server
+ *  learns that side does not exist: a window a few rows wide would make the
  *  piece a stutter of one stroke, which is worse than not borrowing it. */
 function borrowWindows(s, cap) {
   const dur = spanDur(state && state.clips[cur]);
   const want = Math.min(cap, Math.max(0.25, (s.hi - s.lo) / 1000));
-  const len = want * 1000;
   const out = { before: null, after: null };
-  const b0 = s.lo - len, b1 = s.lo;
-  if (b1 - b0 >= 250 && b0 >= 0) out.before = [b0, b1];
-  const a0 = s.hi, a1 = s.hi + len;
-  if (a1 - a0 >= 250 && a1 <= dur) out.after = [a0, a1];
+  const back = Math.min(want * 1000, s.lo);
+  if (back >= 250) out.before = [s.lo - back, s.lo];
+  const fwd = Math.min(want * 1000, dur - s.hi);
+  if (fwd >= 250) out.after = [s.hi, s.hi + fwd];
   return out;
 }
 function editBorrow(fn, label) {

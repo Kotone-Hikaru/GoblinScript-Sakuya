@@ -308,16 +308,22 @@ struct Cli {
     #[arg(long, default_value_t = style::MAX_POS_RATE)]
     max_speed: f64,
 
-    /// Smooth the jolt at a shot cut (pos-units/s, 0 = off). Styling runs
-    /// per shot, so each cut gets two points about one frame apart and the
-    /// device must make the whole level change of the cut in that time. Above
-    /// this speed those points go -- the one before the cut first, then the
-    /// one after it if the move is still too fast -- so the move runs between
-    /// real changes of direction across the cut, which is what a human writer
-    /// does. If that move is also too fast, its depth decreases until its
-    /// speed obeys the limit. Each shot always keeps a point. No time moves,
-    /// and no move across a cut is faster than this limit.
-    #[arg(long, default_value_t = style::CUT_EASE)]
+    /// Smooth the jolt at a shot cut (pos-units/s, 0 = off, and off is the
+    /// default). Styling runs per shot, so each cut gets two points about one
+    /// frame apart and the device must make the whole level change of the cut
+    /// in that time. Above this speed those points go -- the one before the cut
+    /// first, then the one after it if the move is still too fast -- so the
+    /// move runs between real changes of direction across the cut, which is
+    /// what a human writer does. If that move is also too fast, its depth
+    /// decreases until its speed obeys the limit. Each shot always keeps a
+    /// point. No time moves, and no move across a cut is faster than this
+    /// limit.
+    ///
+    /// Reach for it when two clips are spliced and the seam reads as a jump.
+    /// Left on everywhere else it smooths motion that was already right, which
+    /// is why it is no longer the starting point; `--cut-ease 250` is the value
+    /// the artifact layer was fitted against.
+    #[arg(long, default_value_t = style::CUT_EASE_DEFAULT)]
     cut_ease: f64,
 
     /// Replace passages the model calls motion-free with a background

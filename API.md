@@ -250,7 +250,7 @@ The styling fields, all optional:
 | `intensity` | 0.5 .. 2.0, stroke amplitude about mid-range; 1 = the model's own |
 | `range` | `[lo, hi]`, 0 <= lo < hi <= 100, the position range the track maps onto |
 | `max_speed` | >= 0, position units per second, the device cap |
-| `cut_ease` | >= 0 ms, the seam ease at a shot cut |
+| `cut_ease` | >= 0 ms, the seam ease at a shot cut; 0 = off, and 0 is the default |
 | `env_seed` | an integer, or `null` for the bundle's own |
 | `dwell_ramp` | 0 .. 1, or `null` to stand on the `dwells` preset |
 | `still_eps` | 0 .. 60, or `null` to stand on the `stillness` preset |
