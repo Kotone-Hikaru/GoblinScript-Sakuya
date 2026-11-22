@@ -235,13 +235,13 @@ jobs:
       # whose provider cannot load; that swap is a change to what ships, not a
       # repair of a broken link, so it is not made blind here.
       # ---------------------------------------------------------------------
-      # `ort-sys` copies the runtime into three directories beside the
-      # artefacts and creates none of them; see the note in `ci.yml`. `deps/`
-      # cargo opens, `examples/` nothing does. Cheap insurance, and it is the
-      # Linux runner that needs it, which is also the runner that links here.
+      # `ort-sys` copies the runtime into `target/<profile>/build/{examples,deps}`
+      # -- `OUT_DIR.ancestors().nth(3)` is the `build` dir, not the profile dir --
+      # and creates neither; see the note in `ci.yml`. Only the Linux leg links
+      # here, but the mkdir costs nothing on Windows.
       - name: Make room for the runtime copies
         shell: bash
-        run: mkdir -p target/release/examples target/release/deps
+        run: mkdir -p target/release/build/examples target/release/build/deps
 
       - name: Fetch Microsoft's ONNX Runtime
         shell: bash
