@@ -99,6 +99,29 @@ pub struct Choice {
 /// leading `__` keeps it out of every real pack name's way.
 pub const MANUAL: &str = "__manual";
 
+/// The span "model" that is not a model either: a borrowed piece. Its rows are
+/// written from a NEIGHBOUR's rows -- the stretch just before it, just after it,
+/// or both, crossfaded -- instead of from any bundle. This is what the razor is
+/// for when the recognition itself went wrong: the passage either side of the
+/// bad one came out right, so the bad one is re-written from them.
+///
+/// No head pass, no latents, no model: the source rows are already in hand,
+/// because every span of a mixed review is read off the SAME latents. That is
+/// also why it costs nothing to re-run -- it is a few hundred f64 per track --
+/// so the page can update it live.
+///
+/// Leading `__` for the same reason as [`MANUAL`]: it can never collide with a
+/// real pack name.
+pub const BORROW: &str = "__borrow";
+
+/// Which neighbour(s) a borrowed piece reads. Stored as a plain number rather
+/// than an enum so an older page's spans and every session before this existed
+/// still parse, and so an unknown value from a hand-edited file is a value this
+/// code can refuse instead of failing to deserialize.
+pub const BORROW_BEFORE: u8 = 0;
+pub const BORROW_AFTER: u8 = 1;
+pub const BORROW_BOTH: u8 = 2;
+
 /// One stretch of a script written by its own model, in video milliseconds on
 /// the clip's clock (`lo_ms` inclusive, `hi_ms` exclusive). The page edits
 /// these; the styler splices the named model's tracks in over those rows.
@@ -135,6 +158,42 @@ pub struct Span {
     /// session read as "unchanged".
     #[serde(default = "one")]
     pub scale: f64,
+
+    // ---- borrowed pieces ([`BORROW`]) ----------------------------------
+    // Every field below is absent on an ordinary or hand-drawn span, and absent
+    // means "the default", so a page that has never heard of borrowing writes
+    // spans this build reads exactly as before.
+    /// Which side(s) to read: [`BORROW_BEFORE`], [`BORROW_AFTER`],
+    /// [`BORROW_BOTH`]. Absent means both.
+    #[serde(default = "borrow_both")]
+    pub side: u8,
+    /// The stretch before the piece to read from, in clip milliseconds. This is
+    /// ABSOLUTE and FROZEN: the page resolves it once, when the borrow is
+    /// generated, and sends the same numbers back on every later edit. It is
+    /// deliberately not recomputed from the neighbouring span, because a
+    /// neighbour that moves or changes model afterwards must not silently
+    /// rewrite a result the author already accepted -- that is precisely the
+    /// kind of quiet re-derivation that produces a script nobody can explain.
+    /// The author regenerates on purpose, by pressing the button again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_before: Option<(f64, f64)>,
+    /// The stretch after the piece, frozen the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_after: Option<(f64, f64)>,
+    /// How much of the borrowed motion to take, 0..1, where 1 replaces the
+    /// piece outright. Absent means 1.
+    #[serde(default = "one")]
+    pub amount: f64,
+    /// Multiplies the borrowed velocity, leaving its carrier alone: the
+    /// neighbour may move a little further per stroke than this passage should.
+    /// Anchors and rhythm are untouched. Absent means 1.
+    #[serde(default = "one")]
+    pub travel: f64,
+    /// How fast to walk the source window. 1 plays it at its own speed; above 1
+    /// packs it in tighter and it wraps more often, which is what a piece
+    /// longer than its window needs. Absent means 1.
+    #[serde(default = "one")]
+    pub freq: f64,
 }
 
 /// The biggest piece intensity the panel offers. Refused above this rather than
@@ -142,12 +201,25 @@ pub struct Span {
 /// nonsense should hear about it.
 pub const MAX_PIECE_SCALE: f64 = 5.0;
 
+/// The ranges the borrow panel offers, and therefore the ranges the server
+/// holds a page to. Clamped rather than refused: these are sliders, and a
+/// slider that reports a number outside its own track is a page bug, not a
+/// reason to throw away the whole edit.
+pub const MIN_BORROW_TRAVEL: f64 = 0.25;
+pub const MAX_BORROW_TRAVEL: f64 = 3.0;
+pub const MIN_BORROW_FREQ: f64 = 0.25;
+pub const MAX_BORROW_FREQ: f64 = 4.0;
+
 fn yes() -> bool {
     true
 }
 
 fn one() -> f64 {
     1.0
+}
+
+fn borrow_both() -> u8 {
+    BORROW_BOTH
 }
 
 /// The manifest's "normal" values for the two preset axes. The page shows each
@@ -1315,6 +1387,52 @@ fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
                 }
                 None => continue,
             }
+        } else if s.model == BORROW {
+            // A borrowed piece names no bundle either. It needs at least one
+            // frozen window to read, on the side it says it reads -- a borrow
+            // with nothing to borrow from is a piece that would silently come
+            // out as the base model, which is the exact failure this exists to
+            // fix. Windows are clamped and ordered here rather than trusted.
+            let want = match s.side {
+                BORROW_BEFORE => (true, false),
+                BORROW_AFTER => (false, true),
+                _ => (true, true),
+            };
+            s.side = if want.0 && want.1 {
+                BORROW_BOTH
+            } else if want.0 {
+                BORROW_BEFORE
+            } else {
+                BORROW_AFTER
+            };
+            let fix = |r: Option<(f64, f64)>, used: bool| -> Option<(f64, f64)> {
+                let (a, b) = r?;
+                if !used || !a.is_finite() || !b.is_finite() {
+                    return None;
+                }
+                let a = a.clamp(0.0, dur);
+                let b = b.clamp(0.0, dur);
+                if b - a <= 0.0 {
+                    return None;
+                }
+                Some((a, b))
+            };
+            s.ref_before = fix(s.ref_before, want.0);
+            s.ref_after = fix(s.ref_after, want.1);
+            if s.ref_before.is_none() && s.ref_after.is_none() {
+                continue;
+            }
+            if !s.amount.is_finite() {
+                s.amount = 1.0;
+            }
+            s.amount = s.amount.clamp(0.0, 1.0);
+            for v in [&mut s.travel, &mut s.freq] {
+                if !v.is_finite() || *v <= 0.0 {
+                    *v = 1.0;
+                }
+            }
+            s.travel = s.travel.clamp(MIN_BORROW_TRAVEL, MAX_BORROW_TRAVEL);
+            s.freq = s.freq.clamp(MIN_BORROW_FREQ, MAX_BORROW_FREQ);
         } else if !clip.models.iter().any(|m| m.name == s.model) {
             continue;
         }
@@ -2263,7 +2381,7 @@ mod tests {
         let base = Choice {
             model: "a".into(),
             compare: None,
-            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false, scale: 1.0 }],
+            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 }],
             cuts_ms: None,
         };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
@@ -2284,9 +2402,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0 },
-                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0 },
-                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0 },
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 },
             ]
         );
         // an empty list is a real answer: back to one model over the whole clip

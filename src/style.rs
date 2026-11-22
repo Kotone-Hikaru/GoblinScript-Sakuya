@@ -548,6 +548,142 @@ impl Tracks {
     }
 }
 
+/// Rows of ramp at each end of a borrowed piece: ~100 ms at 30 rows/s.
+///
+/// A borrowed piece has to hand the pen back at both seams. Its own rows and
+/// the neighbour's are two different motions, so a hard cut at row `lo` would
+/// step the position and spike the velocity -- visible as a jolt exactly where
+/// the author was trying to hide one. The ramp spends a few rows fading in and
+/// out, which is short enough to stay inside the piece's own shape and long
+/// enough that no single row carries the whole discontinuity.
+pub const BORROW_RAMP: usize = 3;
+
+/// Where a borrowed piece reads its motion from, resolved to rows.
+///
+/// The ranges are half-open `[a, b)` on the same row clock as the tracks being
+/// written -- every span of a mixed review comes off one set of latents, so no
+/// resampling is needed. `None` on a side means that side contributes nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BorrowPlan {
+    /// Rows to read when the piece wants the stretch BEFORE it.
+    pub before: Option<(usize, usize)>,
+    /// Rows to read when the piece wants the stretch AFTER it.
+    pub after: Option<(usize, usize)>,
+    /// How much of the borrowed motion to take, 0..1. 1 replaces the piece.
+    pub amount: f64,
+    /// Multiplies the borrowed VELOCITY and leaves the carrier where it is. The
+    /// neighbour may have moved a little further per stroke than this passage
+    /// should; scaling `vmarg` keeps the same rhythm and the same anchors and
+    /// only changes how far each stroke travels.
+    pub travel: f64,
+    /// How fast to walk the source window. 1 plays it at its own speed; above
+    /// 1 packs it in tighter, so it wraps more often.
+    pub freq: f64,
+}
+
+impl Tracks {
+    /// Rewrite rows `[lo, hi)` from a neighbour's rows.
+    ///
+    /// Only `vmarg`, `level` and `env` move. Those three are the motion: the
+    /// carrier the level head drew and the strokes the marginal head measured.
+    /// `band`, `plat`, `rev` and `period` are left alone on purpose -- they are
+    /// positional and statistical locks, each with its own clock and its own
+    /// alignment problem, and rewriting the motion already changes what the
+    /// author sees. `conf` is never touched: it is the frozen trunk's opinion
+    /// of the SOURCE FOOTAGE, so copying a neighbour's score onto these rows
+    /// would make the readout lie about a passage nobody measured.
+    ///
+    /// `level` is offset-aligned before it is blended, so the piece starts at
+    /// exactly the height it already had: positions are what the user sees, and
+    /// an unaligned splice would teleport the pen.
+    ///
+    /// Returns false when there is nothing to do -- no source rows, an empty or
+    /// inverted piece, or `amount` at or below zero -- so a caller can tell a
+    /// real borrow from a silent no-op.
+    pub fn borrow_rows(&mut self, lo: usize, hi: usize, plan: &BorrowPlan) -> bool {
+        let n = self.vmarg.len().min(self.level.len()).min(self.env.len());
+        let hi = hi.min(n);
+        if hi <= lo + 1 || !(plan.amount > 0.0) {
+            return false;
+        }
+        let before = plan.before.filter(|&(a, b)| b > a && b <= n);
+        let after = plan.after.filter(|&(a, b)| b > a && b <= n);
+        if before.is_none() && after.is_none() {
+            return false;
+        }
+        let len = hi - lo;
+        let both = before.is_some() && after.is_some();
+        let freq = if plan.freq.is_finite() && plan.freq > 0.0 {
+            plan.freq
+        } else {
+            1.0
+        };
+        let travel = if plan.travel.is_finite() && plan.travel > 0.0 {
+            plan.travel
+        } else {
+            1.0
+        };
+        // Read the source rows first, write the piece in a second pass: a window
+        // that overlaps the piece (a short neighbour, or a `freq` above 1) must
+        // see the rows as they were, not rows this borrow has already rewritten.
+        let mut lv = vec![0.0f64; len];
+        let mut vm = vec![0.0f64; len];
+        let mut ev = vec![0.0f64; len];
+        for i in 0..len {
+            // Crossfade weight when both sides are present: row 0 is entirely
+            // the stretch before, the last row entirely the stretch after.
+            let u = if len > 1 {
+                i as f64 / (len - 1) as f64
+            } else {
+                0.0
+            };
+            let mut acc_l = 0.0;
+            let mut acc_v = 0.0;
+            let mut acc_e = 0.0;
+            let mut wsum = 0.0;
+            // Walk the window at `freq` source rows per piece row, wrapping at
+            // the end: the neighbour keeps its own speed, and a piece longer
+            // than the window reuses it rather than being left half-written.
+            let mut take = |w: f64, (a, b): (usize, usize)| {
+                let k = (b - a) as f64;
+                let pos = (i as f64 * freq) % k;
+                let j = a + (pos as usize).min(b - a - 1);
+                acc_l += w * self.level[j];
+                acc_v += w * self.vmarg[j];
+                acc_e += w * self.env[j];
+                wsum += w;
+            };
+            if let Some(r) = before {
+                take(if both { 1.0 - u } else { 1.0 }, r);
+            }
+            if let Some(r) = after {
+                take(if both { u } else { 1.0 }, r);
+            }
+            if wsum <= 0.0 {
+                return false;
+            }
+            lv[i] = acc_l / wsum;
+            vm[i] = acc_v / wsum * travel;
+            ev[i] = acc_e / wsum * travel;
+        }
+        // Put the borrowed carrier at the height the piece already had, so the
+        // first borrowed row is continuous with the row before it and no seam
+        // can teleport the pen.
+        let lift = self.level[lo] - lv[0];
+        let amount = plan.amount.clamp(0.0, 1.0);
+        for i in 0..len {
+            // Full strength in the middle, easing to nothing at each seam.
+            let edge = i.min(len - 1 - i);
+            let t = amount * ((edge + 1) as f64 / (BORROW_RAMP + 1) as f64).min(1.0);
+            let r = lo + i;
+            self.level[r] = self.level[r] * (1.0 - t) + (lv[i] + lift) * t;
+            self.vmarg[r] = self.vmarg[r] * (1.0 - t) + vm[i] * t;
+            self.env[r] = self.env[r] * (1.0 - t) + ev[i] * t;
+        }
+        true
+    }
+}
+
 pub struct StyleCfg {
     pub fps: f64,
     pub still_eps: f64,
@@ -4340,5 +4476,186 @@ mod splice_tests {
         // identical here, but the point is the RANGE: everything outside is
         // still dst's, so a per-row cap array indexed the same way lines up
         assert_eq!(dst.vmarg.len(), 30);
+    }
+}
+
+#[cfg(test)]
+mod borrow_tests {
+    use super::{BorrowPlan, Tracks, BORROW_RAMP};
+
+    /// Bare tracks from raw rows. Only the three fields a borrow touches are
+    /// populated: the numbers below are what a test compares against.
+    fn mk(vm: Vec<f64>, level: Vec<f64>, env: Vec<f64>) -> Tracks {
+        Tracks {
+            vmarg: vm,
+            level,
+            env,
+            band: None,
+            plat: None,
+            rev: None,
+            period: Vec::new(),
+            conf: Vec::new(),
+        }
+    }
+
+    /// `n` rows of plain ramps: vmarg = row, level = 100 flat, env = 0.
+    fn ramp(n: usize) -> Tracks {
+        mk((0..n).map(|i| i as f64).collect(),
+           vec![100.0; n],
+           vec![0.0; n])
+    }
+
+    fn plan(before: Option<(usize, usize)>, after: Option<(usize, usize)>,
+            amount: f64, travel: f64, freq: f64) -> BorrowPlan {
+        BorrowPlan { before, after, amount, travel, freq }
+    }
+
+    /// The ramp is the point: full strength is reached on the 4th row from a
+    /// seam (`BORROW_RAMP` rows of easing), and from there the piece IS the
+    /// source.
+    #[test]
+    fn a_full_borrow_copies_the_source_shape() {
+        let mut t = ramp(20);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        // row 3 into the piece is past the ramp: nothing of the old row is left
+        assert!((t.vmarg[13] - 3.0).abs() < 1e-9, "vmarg {}", t.vmarg[13]);
+        // row 0 is only a quarter of the way in, so it is 3/4 itself
+        assert!((t.vmarg[10] - 7.5).abs() < 1e-9, "vmarg {}", t.vmarg[10]);
+        // ...and rows before the piece are untouched
+        assert!((t.vmarg[9] - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn half_amount_lands_between_the_two_rows() {
+        let mut t = ramp(20);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 0.5, 1.0, 1.0)));
+        // row 13 was 13 and the source says 3; half is halfway
+        assert!((t.vmarg[13] - 8.0).abs() < 1e-9, "vmarg {}", t.vmarg[13]);
+        // the first row is inside the ramp, so its share is a quarter of the
+        // half: 10 * (1 - 0.125) + 0 * 0.125
+        assert!((t.vmarg[10] - 8.75).abs() < 1e-9, "vmarg {}", t.vmarg[10]);
+    }
+
+    /// Reach multiplies the STROKES. The carrier is what the pen's height is
+    /// measured against, so scaling it too would move every anchor and the
+    /// piece would no longer start where it ended.
+    #[test]
+    fn travel_scales_the_strokes_but_not_the_carrier() {
+        let mut t = ramp(20);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 2.0, 1.0)));
+        assert!((t.vmarg[13] - 6.0).abs() < 1e-9, "vmarg {}", t.vmarg[13]);
+        for r in 10..20 {
+            assert!((t.level[r] - 100.0).abs() < 1e-9, "level row {r}: {}", t.level[r]);
+        }
+    }
+
+    /// A piece longer than the stretch it reads runs out of source and starts
+    /// again, which is the whole promise of the panel's "take N s" field.
+    #[test]
+    fn freq_wraps_at_the_end_of_the_window() {
+        let mut t = ramp(20);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 4)), None, 1.0, 1.0, 1.0)));
+        // rows 0..4 walk the window, row 4 starts it over
+        assert!((t.vmarg[13] - 3.0).abs() < 1e-9, "vmarg {}", t.vmarg[13]);
+        assert!((t.vmarg[14] - 0.0).abs() < 1e-9, "vmarg {}", t.vmarg[14]);
+        assert!((t.vmarg[16] - 2.0).abs() < 1e-9, "vmarg {}", t.vmarg[16]);
+    }
+
+    /// Both sides at once: the piece leaves the stretch before and arrives at
+    /// the stretch after, and the middle is the average of the two.
+    #[test]
+    fn both_sides_crossfade() {
+        let mut t = ramp(20);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 4)), Some((16, 20)), 1.0, 1.0, 1.0)));
+        // middle row: u = 4/9, so 5/9 of the before row (4 -> wraps to 0) and
+        // 4/9 of the after row (16)
+        let want = (4.0 / 9.0) * 16.0;
+        assert!((t.vmarg[14] - want).abs() < 1e-9, "vmarg {} want {want}", t.vmarg[14]);
+    }
+
+    /// The confidence is the frozen trunk's opinion of the FOOTAGE. Copying a
+    /// neighbour's score here would make the readout describe rows nobody
+    /// measured, which is the number the author is using to decide the piece
+    /// is bad in the first place.
+    #[test]
+    fn conf_is_never_touched() {
+        let mut t = ramp(20);
+        t.conf = (0..20).map(|i| i as f64 * 10.0).collect();
+        let before = t.conf.clone();
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        assert_eq!(t.conf, before);
+    }
+
+    /// The seam: whatever the piece used to start at, it still starts there.
+    /// An unaligned splice teleports the pen, which is the one thing a borrowed
+    /// piece must never do.
+    #[test]
+    fn the_seam_keeps_its_height() {
+        let mut t = mk((0..20).map(|i| i as f64).collect(),
+                       (0..20).map(|i| if i < 10 { 5.0 } else { 37.0 }).collect(),
+                       vec![0.0; 20]);
+        assert!(t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        assert!((t.level[10] - 37.0).abs() < 1e-9, "level {}", t.level[10]);
+        // and the source's own height came along with a constant offset
+        assert!((t.level[13] - 37.0).abs() < 1e-9, "level {}", t.level[13]);
+    }
+
+    #[test]
+    fn nothing_to_read_is_a_no_op() {
+        let mut t = ramp(20);
+        let before = t.vmarg.clone();
+        // empty, inverted, and past the end of the tracks
+        assert!(!t.borrow_rows(10, 20, &plan(Some((5, 5)), None, 1.0, 1.0, 1.0)));
+        assert!(!t.borrow_rows(10, 20, &plan(Some((9, 3)), None, 1.0, 1.0, 1.0)));
+        assert!(!t.borrow_rows(10, 20, &plan(None, Some((0, 99)), 1.0, 1.0, 1.0)));
+        assert!(!t.borrow_rows(10, 20, &plan(None, None, 1.0, 1.0, 1.0)));
+        assert_eq!(t.vmarg, before);
+    }
+
+    #[test]
+    fn a_piece_of_one_row_is_a_no_op() {
+        let mut t = ramp(20);
+        let before = t.vmarg.clone();
+        assert!(!t.borrow_rows(10, 11, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        assert!(!t.borrow_rows(10, 10, &plan(Some((0, 10)), None, 1.0, 1.0, 1.0)));
+        assert_eq!(t.vmarg, before);
+    }
+
+    /// Amount is a slider and zero is its left end, not a bug: a piece at zero
+    /// is a piece left alone, and the caller is told so.
+    #[test]
+    fn amount_zero_is_a_no_op() {
+        let mut t = ramp(20);
+        let before = t.vmarg.clone();
+        assert!(!t.borrow_rows(10, 20, &plan(Some((0, 10)), None, 0.0, 1.0, 1.0)));
+        assert_eq!(t.vmarg, before);
+    }
+
+    /// The ramp is what keeps the first and last rows from stepping: at full
+    /// amount the innermost row is entirely source and the two seams are not.
+    #[test]
+    fn the_ramp_is_short_and_symmetric() {
+        assert_eq!(BORROW_RAMP, 3);
+        let mut t = ramp(20);
+        assert!(t.borrow_rows(10, 14, &plan(Some((0, 4)), None, 1.0, 1.0, 1.0)));
+        // row 0 of 4: a quarter in. row 3 of 4: the last row, a quarter in.
+        assert!((t.vmarg[10] - 7.5).abs() < 1e-9, "vmarg {}", t.vmarg[10]);
+        assert!((t.vmarg[13] - (13.0 * 0.75 + 3.0 * 0.25)).abs() < 1e-9,
+                "vmarg {}", t.vmarg[13]);
+    }
+
+    /// The windows are read as they WERE. A stretch that overlaps the piece --
+    /// a short neighbour, or a speed above 1 -- must not see half a piece that
+    /// this same call has already rewritten, or the result would depend on the
+    /// order the rows happen to be in.
+    #[test]
+    fn an_overlapping_window_reads_the_untouched_rows() {
+        let mut t = ramp(20);
+        // the window IS the piece: every row would read itself after a rewrite
+        assert!(t.borrow_rows(10, 20, &plan(Some((10, 20)), None, 1.0, 1.0, 1.0)));
+        // so the piece comes back as itself, under the ramp's easing
+        assert!((t.vmarg[13] - 13.0).abs() < 1e-9, "vmarg {}", t.vmarg[13]);
+        assert!((t.vmarg[19] - (19.0 * 0.75 + 19.0 * 0.25)).abs() < 1e-9,
+                "vmarg {}", t.vmarg[19]);
     }
 }

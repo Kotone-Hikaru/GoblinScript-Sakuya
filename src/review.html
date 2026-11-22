@@ -760,6 +760,59 @@
           <div id="wpParams" class="wpparams"></div>
           <div id="wpNote" class="wpnote"></div>
         </div>
+        <!-- Borrow. Shows only while the selected piece is a borrowed one, and
+             rides under its row exactly like the manual panel above: same
+             delivery, same reason (a piece's controls belong beside the piece).
+
+             What it edits is not a drawing but a READING: take the motion from
+             the rows either side of this passage and lay it back down here, so
+             a passage the model could not read comes out moving like its
+             neighbours instead of like noise.
+
+             The windows are frozen, not live. Changing a neighbour afterwards
+             must NOT silently rewrite this piece -- the author already looked
+             at the result and kept it -- so the windows are only re-measured
+             when "freeze the windows" is pressed, or when this piece is
+             switched to borrow in the first place. -->
+        <div id="borrowPanel" class="wavepanel" hidden>
+          <div class="wphead" data-t="page.borrow.head">borrow from a neighbour</div>
+          <div class="wprow">
+            <label data-t="page.borrow.from">read</label>
+            <select id="bbSide">
+              <option value="0" data-t="page.borrow.before">the stretch before</option>
+              <option value="1" data-t="page.borrow.after">the stretch after</option>
+              <option value="2" data-t="page.borrow.both">both, crossfaded</option>
+            </select>
+          </div>
+          <div class="wprow">
+            <label data-t="page.borrow.len">take</label>
+            <input id="bbBefore" class="wpnum" type="number" min="0.25" max="60" step="0.25">
+            <span data-t="page.borrow.sec">s before</span>
+            <span class="wpsp"></span>
+            <input id="bbAfter" class="wpnum" type="number" min="0.25" max="60" step="0.25">
+            <span data-t="page.borrow.sec2">s after</span>
+          </div>
+          <div class="wprow">
+            <label data-t="page.borrow.amount">amount</label>
+            <input id="bbAmount" class="wpnum" type="number" min="0" max="100" step="5">
+            <span data-t="page.borrow.pct">%</span>
+            <span class="wpsp"></span>
+            <label data-t="page.borrow.travel">reach</label>
+            <input id="bbTravel" class="wpnum" type="number" min="0.25" max="3" step="0.05">
+            <span data-t="page.borrow.times">x</span>
+            <label data-t="page.borrow.freq">speed</label>
+            <input id="bbFreq" class="wpnum" type="number" min="0.25" max="4" step="0.05">
+            <span data-t="page.borrow.times2">x</span>
+          </div>
+          <div class="wprow">
+            <span id="bbAt" class="wpnote"></span>
+            <span class="wpsp"></span>
+            <button type="button" id="bbGen" class="tool"
+                    data-t-title="page.borrow.gen.tip"><b>&#x21bb;</b> <span
+                    data-t="page.borrow.gen">freeze the windows</span></button>
+          </div>
+          <div id="bbNote" class="wpnote"></div>
+        </div>
       </div>
       <div class="sec" id="confSec">
         <span class="sec-h" data-t="page.conf.suggest">conf suggestion</span>
@@ -3303,6 +3356,19 @@ function drawStrip(ms) {
       if (x1 > x0) sctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
     }
   }
+  // What a borrow is READING, while the author is still choosing it. Drawn under
+  // the same wash as the speed cut -- a fill and not a mark -- because the thing
+  // being shown is a STRETCH of footage, and it is shown only while a finger is
+  // on one of the borrow length fields. It goes away with the gesture: a
+  // permanent overlay would paint over the script for as long as the piece is
+  // selected, and the script is what the bar is for.
+  if (borrowPeek) {
+    sctx.fillStyle = 'rgba(255,139,176,.30)';
+    for (const [a, b] of borrowPeek) {
+      const x0 = Math.max(0, X(a)), x1 = Math.min(w, X(b));
+      if (x1 > x0) sctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+    }
+  }
   // confidence band -- a cool slate underlay along the bottom; height and alpha
   // both grow with certainty, so an unsure passage reads as a low, faint floor.
   // Drawn before the script line so the line always stays on top of it.
@@ -3723,8 +3789,16 @@ const SPAN_HUES = ['#8bc34a', '#ffb000', '#55c0ff', '#e06ce0', '#ff6b5a',
  *  as the span model `__manual`. */
 const MANUAL = '__manual';
 const MANUAL_HUE = '#cfe3ff';
+/** A borrowed piece is neither a model nor a drawing: it is the rows either
+ *  side of it, laid back down here. Its own hue, outside SPAN_HUES, for the
+ *  same reason the hand-drawn one has one -- a band that borrows a model's
+ *  colour would read as that model having written it. The server knows this
+ *  value as the span model `__borrow`. */
+const BORROW = '__borrow';
+const BORROW_HUE = '#ff8bb0';
 function modelColor(name) {
   if (name === MANUAL) return MANUAL_HUE;
+  if (name === BORROW) return BORROW_HUE;
   const c = state && state.clips[cur];
   const ms = (c && c.models) || [];
   const i = ms.findIndex(m => m.name === name);
@@ -3755,7 +3829,18 @@ function partitionOf(c) {
                noLimit: e.no_limit !== false, noCuts: e.no_cuts !== false,
                // this piece's own intensity, 1 = the model's own output. Absent
                // (every span written before it existed) reads as 1.
-               scale: (e.scale == null ? 1 : e.scale) });
+               scale: (e.scale == null ? 1 : e.scale),
+               // a borrowed piece's frozen windows and its three knobs. Absent
+               // (every span written before borrowing existed) reads as the
+               // defaults the server also assumes: both sides, amount 1, reach
+               // and speed 1. The windows themselves have no default -- a
+               // borrow with nothing to read is dropped by the server rather
+               // than silently becoming the base model.
+               side: (e.side == null ? 2 : e.side),
+               refBefore: e.ref_before || null, refAfter: e.ref_after || null,
+               amount: (e.amount == null ? 1 : e.amount),
+               travel: (e.travel == null ? 1 : e.travel),
+               freq: (e.freq == null ? 1 : e.freq) });
     t = hi;
   }
   if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
@@ -3779,6 +3864,19 @@ function spansPayload() {
                  // model span has no drawing to exempt from anything
                  o.no_limit = s.noLimit !== false;
                  o.no_cuts = s.noCuts !== false;
+               } else if (s.model === BORROW) {
+                 // The windows go out EXACTLY as they were frozen. They are
+                 // never re-derived here: the server must not be handed a
+                 // freshly measured neighbour every time an unrelated knob is
+                 // turned, or a result the author accepted would drift under
+                 // them one post at a time. `borrowGenerate` is the only place
+                 // that measures, and it runs on a click.
+                 o.side = borrowSide(s);
+                 if (s.refBefore) o.ref_before = [s.refBefore[0], s.refBefore[1]];
+                 if (s.refAfter) o.ref_after = [s.refAfter[0], s.refAfter[1]];
+                 o.amount = borrowNum(s.amount, 1, 0, 1);
+                 o.travel = borrowNum(s.travel, 1, 0.25, 3);
+                 o.freq = borrowNum(s.freq, 1, 0.25, 4);
                } else if (pieceScale(s) !== 1) {
                  // 1 is the model's own answer, and absent means 1
                  o.scale = pieceScale(s);
@@ -3948,8 +4046,21 @@ function setSegModel(i, model) {
   // server drops a manual span with no wave (it would have nothing to write
   // the rows with), so an empty one would silently vanish.
   if (model === MANUAL && !s.wave) s.wave = defaultWave();
+  // A piece that becomes borrowed needs windows for the same reason: the server
+  // drops a borrow with nothing to read. Switching to it is the one moment the
+  // windows are measured without being asked, because until they exist there
+  // is no piece to look at. From then on they are frozen -- see borrowGenerate.
+  if (model === BORROW && !s.refBefore && !s.refAfter) freezeBorrow(s);
   retagGaps();
   commitSegs();
+}
+/** Measure both windows for a piece and store them. Called once when a piece
+ *  is switched to borrow, and again only when the author presses the button. */
+function freezeBorrow(s) {
+  const w = borrowWindows(s, borrowCap(s));
+  s.refBefore = w.before;
+  s.refAfter = w.after;
+  return w;
 }
 /** This piece's own intensity, 0-5. Off the model's OUTPUT rather than off an
  *  earlier scaled copy: the server rebuilds the piece's rows on every post, so
@@ -4200,8 +4311,10 @@ function renderSegs() {
   // selected) means every early return below leaves it in the document, where
   // `getElementById` can still find it, instead of detached.
   const wp = wavePanel();
+  const bp = borrowPanel();
   const note = $('segNote');
   if (wp && note && note.parentNode) note.parentNode.insertBefore(wp, note.nextSibling);
+  if (bp && note && note.parentNode) note.parentNode.insertBefore(bp, note.nextSibling);
   list.innerHTML = '';
   if (!state) return;
   const c = state.clips[cur];
@@ -4232,6 +4345,13 @@ function renderSegs() {
     om.value = MANUAL;
     om.textContent = '✎ ' + T('page.wave.head');
     sel.append(om);
+    // ...and the borrowed one, for the same reason. Its name is a sentinel the
+    // server knows (`__borrow`), never a bundle, so a real pack can never
+    // collide with it.
+    const ob = document.createElement('option');
+    ob.value = BORROW;
+    ob.textContent = '⇄ ' + T('page.borrow.head');
+    sel.append(ob);
     sel.value = s.model;
     sel.onchange = () => setSegModel(i, sel.value);
     sel.onclick = ev => ev.stopPropagation();
@@ -4246,10 +4366,15 @@ function renderSegs() {
       cf.textContent = '✎';
       cf.title = T('page.wave.head');
     } else {
+      // A borrowed piece keeps the score the model gave its OWN rows: the
+      // borrow rewrites the motion, never the confidence, so the number still
+      // answers "how well did the frozen trunk read this footage" -- which is
+      // exactly the reason the piece is here. Labelled so it does not read as
+      // a verdict on the borrowed motion.
       const v = segConf(s);
-      cf.textContent = v == null ? '–' : Math.round(v * 100) + '%';
+      cf.textContent = (v == null ? '–' : Math.round(v * 100) + '%');
       if (v != null && v < 0.5) cf.classList.add('lo');
-      cf.title = T('page.spans.conf.tip');
+      cf.title = T(s.model === BORROW ? 'page.borrow.conf.tip' : 'page.spans.conf.tip');
     }
     row.append(sw, n, t, sel);
     // This piece's own intensity. A hand-drawn piece is left out: its band is
@@ -4259,7 +4384,7 @@ function renderSegs() {
     // always-on slider there was a 3 px target with its readout in the way; the
     // drag lives in a strip that opens BELOW the row when the box is clicked,
     // which is the same bargain the wave panel's knobs make (see openSlide).
-    if (s.model !== MANUAL) {
+    if (s.model !== MANUAL && s.model !== BORROW) {
       const k = pieceScale(s);
       const box = document.createElement('input');
       box.type = 'number';
@@ -4289,11 +4414,15 @@ function renderSegs() {
     // edit. With a dozen pieces the panel used to sit at the foot of the list,
     // a screen away from the piece it changes.
     if (i === selSeg && s.model === MANUAL && wp) row.after(wp);
+    // ...and the borrowed piece's controls go in the same place, for the same
+    // reason. Two panels, never both: a piece is one of the three kinds.
+    if (i === selSeg && s.model === BORROW && bp) row.after(bp);
   });
   labelHist();
   // the panel follows the selection, and it is rebuilt from the piece every
   // time: a manual piece shows its wave controls, anything else hides them
   renderWavePanel();
+  renderBorrowPanel();
   // ...and the intensity strip, if one is open, is re-hung under its row. It is
   // NOT a row, so the rebuild above left it detached; without this a drag that
   // committed would take the strip away mid-gesture.
@@ -4301,10 +4430,10 @@ function renderSegs() {
   // The strip belongs to the SELECTION, not to whichever number box happens to
   // hold focus: reaching for a slider by first clicking a 3-character number
   // box was a step nobody wanted. Selecting a piece opens its strip; selecting
-  // a hand-drawn piece (which has no such knob) closes it.
+  // a piece with no such knob (hand-drawn, borrowed) closes it.
   const sel = segs[selSeg];
-  if (sel && sel.model !== MANUAL) openPieceSlide(selSeg);
-  else if (!sel || sel.model === MANUAL) closePieceSlide();
+  if (sel && sel.model !== MANUAL && sel.model !== BORROW) openPieceSlide(selSeg);
+  else if (!sel || sel.model === MANUAL || sel.model === BORROW) closePieceSlide();
 }
 /** The mean confidence over one piece's rows, or null when there is none to
  *  read -- a piece is where the split lines are drawn, and this is the only
@@ -4401,6 +4530,68 @@ function editPiece(fn) {
   fn(s);
   commitSegs();
 }
+// ---- borrowing --------------------------------------------------------------
+// A borrowed piece reads the rows either side of it and lays them back down
+// here. Everything below is about keeping that FROZEN: the windows are measured
+// once, stored as absolute clip milliseconds, and only re-measured when the
+// author asks. A neighbour edited afterwards changes nothing here on its own --
+// the piece keeps the result it was accepted with.
+let borrowPanelEl = null;
+/** The stretch a borrow is about to read, while a finger is on one of its length
+ *  fields: `[[a,b]]`, `[[a,b],[c,d]]`, or an empty array. Deliberately NOT state
+ *  the piece carries -- it exists for one gesture and is cleared when the field
+ *  loses focus, so the bar shows it while it is being chosen and never after. */
+let borrowPeek = [];
+function borrowPanel() {
+  if (!borrowPanelEl) borrowPanelEl = $('borrowPanel');
+  return borrowPanelEl;
+}
+/** The piece the borrow panel edits, or null when the selection is not one. */
+function borrowSeg() {
+  const s = (selSeg >= 0 && selSeg < segs.length) ? segs[selSeg] : null;
+  return (s && s.model === BORROW) ? s : null;
+}
+/** A number out of a span, with junk read as the given default and the result
+ *  held to the range the panel offers. The server clamps the same values, so
+ *  this is only here to keep the page's own display honest. */
+function borrowNum(v, def, lo, hi) {
+  const n = Number(v);
+  if (!isFinite(n)) return def;
+  return Math.max(lo, Math.min(hi, n));
+}
+function borrowSide(s) {
+  const k = Number(s && s.side);
+  return (k === 0 || k === 1 || k === 2) ? k : 2;
+}
+/** The two windows a piece at `lo..hi` would read, measured on the spot.
+ *
+ *  Each side takes the same length as the piece (capped at `cap`), sitting
+ *  flush against the seam: the stretch before ends where the piece starts, the
+ *  stretch after starts where it ends. A side with nothing behind it -- the
+ *  piece starts at 0, or ends at the end of the clip -- gets no window, which
+ *  is how the server learns that side does not exist.
+ *
+ *  When a side is asked for but the seam has less than 0.25 s behind it, that
+ *  side is dropped rather than shrunk: a window a few rows wide would make the
+ *  piece a stutter of one stroke, which is worse than not borrowing it. */
+function borrowWindows(s, cap) {
+  const dur = spanDur(state && state.clips[cur]);
+  const want = Math.min(cap, Math.max(0.25, (s.hi - s.lo) / 1000));
+  const len = want * 1000;
+  const out = { before: null, after: null };
+  const b0 = s.lo - len, b1 = s.lo;
+  if (b1 - b0 >= 250 && b0 >= 0) out.before = [b0, b1];
+  const a0 = s.hi, a1 = s.hi + len;
+  if (a1 - a0 >= 250 && a1 <= dur) out.after = [a0, a1];
+  return out;
+}
+function editBorrow(fn, label) {
+  const s = borrowSeg();
+  if (!s) return;
+  pushSegUndo(label || 'page.hist.borrow', s.lo);
+  fn(s);
+  commitSegs();
+}
 function renderWavePanel() {
   const el = wavePanel();
   if (!el) return;
@@ -4432,6 +4623,66 @@ function renderWavePanel() {
   $('wpNoCuts').checked = s.noCuts !== false;
   renderWaveParams();
   drawWaveThumb();
+}
+/** How long a window may be, in seconds: as long as the piece itself, and never
+ *  more than four seconds. A piece is usually the bad stretch the razor cut out,
+ *  so "as long as the piece" is the natural answer; the cap keeps a piece that
+ *  happens to be a minute long from reaching back across half the clip, where
+ *  the footage has nothing to do with it any more. */
+function borrowCap(s) {
+  return Math.min(60, Math.max(0.25, (s.hi - s.lo) / 1000 || 1));
+}
+/** Put the panel in front of the selected piece, or hide it. */
+function renderBorrowPanel() {
+  const el = borrowPanel();
+  if (!el) return;
+  const s = borrowSeg();
+  el.hidden = !s;
+  if (!s) return;
+  // absent reads as the defaults the server also assumes
+  $('bbSide').value = String(borrowSide(s));
+  const w = borrowWindows(s, borrowCap(s));
+  // Show the length in force, not a remembered number: after a razor cut the
+  // piece is a different length and "as long as the piece" is a different
+  // number of seconds, so a stored field would lie about what is being read.
+  const before = s.refBefore ? (s.refBefore[1] - s.refBefore[0]) / 1000
+                             : (w.before ? (w.before[1] - w.before[0]) / 1000 : 0);
+  const after = s.refAfter ? (s.refAfter[1] - s.refAfter[0]) / 1000
+                           : (w.after ? (w.after[1] - w.after[0]) / 1000 : 0);
+  $('bbBefore').value = before.toFixed(2);
+  $('bbAfter').value = after.toFixed(2);
+  $('bbAmount').value = Math.round(borrowNum(s.amount, 1, 0, 1) * 100);
+  $('bbTravel').value = borrowNum(s.travel, 1, 0.25, 3).toFixed(2);
+  $('bbFreq').value = borrowNum(s.freq, 1, 0.25, 4).toFixed(2);
+  labelBorrowAt(s);
+}
+/** Where the two frozen windows actually sit, in the clip's own clock. The
+ *  author's question is "what is it reading", and the answer is two stretches
+ *  of footage, not two numbers of seconds. */
+function labelBorrowAt(s) {
+  const el = $('bbAt');
+  if (el) {
+    const bits = [];
+    if (s.refBefore) bits.push('◀ ' + fmtClock(s.refBefore[0]) + '–' + fmtClock(s.refBefore[1]));
+    if (s.refAfter) bits.push(fmtClock(s.refAfter[0]) + '–' + fmtClock(s.refAfter[1]) + ' ▶');
+    el.textContent = bits.join('   ');
+    el.classList.toggle('bad', !bits.length);
+  }
+  // The note says what went wrong, in the author's terms: a side that is not
+  // there because the piece touches the end of the clip, and a side that is not
+  // there because the neighbour is too short to read. They are different
+  // problems and only one of them can be fixed by moving a cut.
+  const note = $('bbNote');
+  if (!note) return;
+  const dur = spanDur(state && state.clips[cur]);
+  const w = borrowWindows(s, borrowCap(s));
+  const bad = [];
+  if (!s.refBefore && !w.before && s.lo < 250) bad.push(T('page.borrow.none'));
+  if (!s.refAfter && !w.after && dur - s.hi < 250) bad.push(T('page.borrow.none'));
+  if (!s.refBefore && s.lo >= 250 && !w.before) bad.push(T('page.borrow.short'));
+  if (!s.refAfter && dur - s.hi >= 250 && !w.after) bad.push(T('page.borrow.short'));
+  note.textContent = bad.join(' · ');
+  note.classList.toggle('bad', bad.length > 0);
 }
 /** This wave's own knobs, built from the file's declaration -- so adding a
  *  knob to waves.json is the entire job and no front-end work exists for it. */
@@ -4871,6 +5122,99 @@ if ($('wpNoLimit')) $('wpNoLimit').onchange = () => editPiece(s => {
 if ($('wpNoCuts')) $('wpNoCuts').onchange = () => editPiece(s => {
   s.noCuts = $('wpNoCuts').checked;
 });
+
+// ---- the borrow panel's wiring ---------------------------------------------
+// Same bargain as the wave panel above: every control commits one undo step and
+// one post, and none of them touches the frozen windows. `bbBefore`/`bbAfter`
+// are the exception -- they say how long a window to TAKE, so changing one
+// re-measures that side on the spot (there is no other honest reading: a length
+// that does not match the window it describes is a field that lies).
+if ($('bbSide')) $('bbSide').onchange = () => editBorrow(s => {
+  s.side = borrowSide({ side: Number($('bbSide').value) });
+  // Switching sides is a request for a different stretch of footage, and a
+  // window from the wrong side is not a window this piece can read.
+  const want = s.side;
+  if ((want === 0 || want === 2) && !s.refBefore) s.refBefore = borrowWindows(s, borrowCap(s)).before;
+  if ((want === 1 || want === 2) && !s.refAfter) s.refAfter = borrowWindows(s, borrowCap(s)).after;
+  if (want === 0) s.refAfter = null;
+  if (want === 1) s.refBefore = null;
+});
+/** Re-measure one side to a stated length, and leave the other alone. */
+function borrowLen(id, which) {
+  const el = $(id);
+  if (!el) return;
+  // While the field has focus, the bar shows the stretch this length would
+  // read -- measured from the box's current value, not from the frozen window,
+  // so the overlay tracks the number being typed rather than lagging a commit
+  // behind it. Cleared on blur: an overlay that stayed would cover the script
+  // for as long as the piece was selected.
+  el.oninput = () => {
+    const s = borrowSeg();
+    if (!s) return;
+    const sec = Math.max(0.25, Math.min(60, Number(el.value) || 0));
+    const len = sec * 1000;
+    const dur = spanDur(state && state.clips[cur]);
+    borrowPeek = [];
+    if (which === 'before') {
+      const b0 = Math.max(0, s.lo - len);
+      if (s.lo - b0 >= 250) borrowPeek = [[b0, s.lo]];
+    } else {
+      const a1 = Math.min(dur, s.hi + len);
+      if (a1 - s.hi >= 250) borrowPeek = [[s.hi, a1]];
+    }
+    invalidate();
+  };
+  el.onblur = () => { if (borrowPeek.length) { borrowPeek = []; invalidate(); } };
+  el.onfocus = () => {
+    // Focusing the field is what opens the preview: the author is about to
+    // choose a length, so show what is currently in force before they change it.
+    const s = borrowSeg();
+    if (!s) return;
+    const r = which === 'before' ? s.refBefore : s.refAfter;
+    borrowPeek = r ? [[r[0], r[1]]] : [];
+    invalidate();
+  };
+  el.onchange = () => editBorrow(s => {
+    const sec = Math.max(0.25, Math.min(60, Number(el.value) || 0));
+    const len = sec * 1000;
+    const dur = spanDur(state && state.clips[cur]);
+    if (which === 'before') {
+      const b0 = Math.max(0, s.lo - len);
+      s.refBefore = (s.lo - b0 >= 250) ? [b0, s.lo] : null;
+      if (!s.refBefore && s.refAfter) s.side = 1;
+      else if (s.refBefore && s.refAfter) s.side = 2;
+      else if (s.refBefore) s.side = 0;
+    } else {
+      const a1 = Math.min(dur, s.hi + len);
+      s.refAfter = (a1 - s.hi >= 250) ? [s.hi, a1] : null;
+      if (!s.refAfter && s.refBefore) s.side = 0;
+      else if (s.refBefore && s.refAfter) s.side = 2;
+      else if (s.refAfter) s.side = 1;
+    }
+  });
+}
+borrowLen('bbBefore', 'before');
+borrowLen('bbAfter', 'after');
+if ($('bbAmount')) $('bbAmount').onchange = () => editBorrow(s => {
+  s.amount = Math.max(0, Math.min(100, Number($('bbAmount').value) || 0)) / 100;
+});
+if ($('bbTravel')) $('bbTravel').onchange = () => editBorrow(s => {
+  s.travel = borrowNum($('bbTravel').value, 1, 0.25, 3);
+});
+if ($('bbFreq')) $('bbFreq').onchange = () => editBorrow(s => {
+  s.freq = borrowNum($('bbFreq').value, 1, 0.25, 4);
+});
+// The one control that measures again. Everything else in this panel edits what
+// is already frozen, so a neighbour moving afterwards cannot rewrite a piece the
+// author has already looked at and kept -- which is the whole reason the windows
+// are stored rather than derived.
+if ($('bbGen')) $('bbGen').onclick = ev => {
+  ev.stopPropagation();
+  editBorrow(s => {
+    const w = freezeBorrow(s);
+    s.side = (w.before && w.after) ? 2 : (w.before ? 0 : (w.after ? 1 : 2));
+  }, 'page.hist.borrowGen');
+};
 
 function updateSegNote() {
   const el = $('segNote');

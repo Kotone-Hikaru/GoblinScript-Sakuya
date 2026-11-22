@@ -1866,6 +1866,36 @@ fn mixed_tracks(
             });
         }
     }
+    // Borrowed pieces LAST of all, and after the manual pass, for the same
+    // reason: the motion they read from has to be the FINAL motion of the rows
+    // they borrow from. A neighbour that is itself a hand-drawn or borrowed
+    // piece therefore contributes what it actually ended up as, not what the
+    // base model would have written there -- which is what the author sees when
+    // they look at those rows in the page.
+    //
+    // The windows are ABSOLUTE clip milliseconds, frozen when the page generated
+    // the borrow (`Span::ref_before` / `ref_after`) and sent back unchanged
+    // since. Nothing here re-derives them from the neighbouring spans: an edit
+    // to a neighbour must not silently rewrite a result already accepted. The
+    // author regenerates by asking the page to, which re-freezes the windows.
+    for sp in &choice.spans {
+        if sp.model != review::BORROW {
+            continue;
+        }
+        let (lo, hi) = span_rows(&d.times, sp.lo_ms, sp.hi_ms);
+        if hi <= lo {
+            continue;
+        }
+        let win = |r: Option<(f64, f64)>| r.map(|(a, b)| span_rows(&d.times, a, b));
+        let plan = style::BorrowPlan {
+            before: win(sp.ref_before),
+            after: win(sp.ref_after),
+            amount: sp.amount,
+            travel: sp.travel,
+            freq: sp.freq,
+        };
+        mixed.borrow_rows(lo, hi, &plan);
+    }
     // Each ordinary piece's own intensity, about its own mean. Handed BACK to
     // the styler rather than applied here: the level rows are upstream of
     // `extrema_actions`, and a piece scaled past the rails becomes a flat
@@ -5203,6 +5233,14 @@ mod retrack_tests {
                 no_limit: true,
                 no_cuts: false,
                 scale: 1.0,
+                // not a borrowed piece: the borrow fields all sit at their
+                // defaults, which is what an ordinary span means
+                side: 2,
+                ref_before: None,
+                ref_after: None,
+                amount: 1.0,
+                travel: 1.0,
+                freq: 1.0,
             }],
             cuts_ms: Some(cuts1.clone()),
         };
