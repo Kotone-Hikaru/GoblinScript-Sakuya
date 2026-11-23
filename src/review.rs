@@ -939,12 +939,18 @@ fn handle(
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             match parse_ui_prefs(&body) {
-                Ok(w) => {
+                Ok(p) => {
                     let mut s = crate::settings::Settings::load();
                     // Silence leaves the file alone, like `conf_prefs`'s `auto`:
                     // a page that says nothing about the width must not reset it.
-                    if let Some(w) = w {
+                    if let Some(w) = p.width {
                         s.rail_width = Some(w);
+                    }
+                    // Same rule for the OFS-SE bridge: a page that did not
+                    // mention it (every save made by the splitter, for instance)
+                    // must not close a socket someone opened in another window.
+                    if let Some(t) = p.tcode {
+                        s.tcode = Some(t);
                     }
                     s.save();
                     let _ = req.respond(json_response(&ui_prefs_json(&s)));
@@ -1214,7 +1220,16 @@ pub(crate) fn parse_conf_prefs(body: &str) -> Result<ConfPrefs> {
 /// workbench gets. Mixing them would mean a drag on the panel edge rewrites the
 /// record of which models the reviewer trusts.
 pub(crate) fn ui_prefs_json(s: &crate::settings::Settings) -> serde_json::Value {
-    serde_json::json!({ "width": s.rail_width })
+    serde_json::json!({ "width": s.rail_width, "tcode": s.tcode })
+}
+
+/// What came back from the page. Every field is an `Option` because silence is
+/// a statement of its own: the splitter saves `width` alone and must not be
+/// read as "close the preview", and the preview saves `tcode` alone and must
+/// not be read as "reset the column width".
+pub(crate) struct UiPrefs {
+    pub width: Option<u16>,
+    pub tcode: Option<crate::settings::TcodePrefs>,
 }
 
 /// The same coming back from the page: `None` = said nothing about the width.
@@ -1224,25 +1239,87 @@ pub(crate) fn ui_prefs_json(s: &crate::settings::Settings) -> serde_json::Value 
 /// did not come from a drag -- most likely a hand-edited settings file, and
 /// telling the reader so beats silently giving them a different layout from the
 /// one they wrote.
-pub(crate) fn parse_ui_prefs(body: &str) -> Result<Option<u16>> {
+pub(crate) fn parse_ui_prefs(body: &str) -> Result<UiPrefs> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
     let w = match v.get("width") {
-        None | Some(serde_json::Value::Null) => return Ok(None),
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Number(n)) => match n.as_u64() {
-            Some(x) => x,
+            Some(x) => Some(x),
             None => anyhow::bail!("width must be a whole number of pixels"),
         },
         Some(_) => anyhow::bail!("width must be a number or null"),
     };
-    let (lo, hi) = (
-        crate::settings::RAIL_MIN_W as u64,
-        crate::settings::RAIL_MAX_W as u64,
-    );
-    if !(lo..=hi).contains(&w) {
-        anyhow::bail!("width must be within {lo}..{hi}, got {w}");
-    }
-    Ok(Some(w as u16))
+    let width = match w {
+        None => None,
+        Some(w) => {
+            let (lo, hi) = (
+                crate::settings::RAIL_MIN_W as u64,
+                crate::settings::RAIL_MAX_W as u64,
+            );
+            if !(lo..=hi).contains(&w) {
+                anyhow::bail!("width must be within {lo}..{hi}, got {w}");
+            }
+            Some(w as u16)
+        }
+    };
+    let tcode = match v.get("tcode") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(t) => Some(parse_tcode_prefs(t)?),
+    };
+    Ok(UiPrefs { width, tcode })
+}
+
+/// The OFS-SE bridge's corner of the settings file.
+///
+/// The address is checked as a URL here rather than left to the page: the page
+/// builds it from what the reviewer types, and a typo has to come back as a
+/// sentence instead of a socket that fails silently in a console nobody reads.
+/// Only `ws://` and `wss://` are accepted -- `new WebSocket()` refuses anything
+/// else anyway, so allowing it would only move the failure somewhere less clear.
+pub(crate) fn parse_tcode_prefs(
+    v: &serde_json::Value,
+) -> Result<crate::settings::TcodePrefs> {
+    let url = match v.get("url") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else if !(t.starts_with("ws://") || t.starts_with("wss://")) {
+                anyhow::bail!("the TCode address must start with ws:// or wss://, got {t:?}");
+            } else if t.len() > 256 {
+                anyhow::bail!("the TCode address is too long to be one");
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Some(_) => anyhow::bail!("the TCode address must be a string or null"),
+    };
+    let coord = |name: &str| -> Result<Option<i32>> {
+        match v.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Number(n)) => match n.as_i64() {
+                // A window corner is a screen coordinate: whole numbers, and
+                // bounded so a hand-edited file cannot park it where no drag
+                // could ever have put it.
+                Some(x) if (-32768..=32767).contains(&x) => Ok(Some(x as i32)),
+                _ => anyhow::bail!("{name} must be a whole number within -32768..32767"),
+            },
+            Some(_) => anyhow::bail!("{name} must be a number or null"),
+        }
+    };
+    let open = match v.get("open") {
+        None => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => anyhow::bail!("open must be true or false"),
+    };
+    Ok(crate::settings::TcodePrefs {
+        url,
+        x: coord("x")?,
+        y: coord("y")?,
+        open,
+    })
 }
 
 /// What the page needs to (re)draw everything but the tracks themselves. Style
@@ -2227,18 +2304,13 @@ mod tests {
     /// why the return is an `Option`.
     #[test]
     fn a_bench_width_comes_back_as_it_was_sent_or_not_at_all() {
-        assert_eq!(parse_ui_prefs(r#"{"width":412}"#).unwrap(), Some(412));
-        assert_eq!(parse_ui_prefs(r#"{"width":null}"#).unwrap(), None);
-        assert_eq!(parse_ui_prefs("{}").unwrap(), None);
+        let w = |b: &str| parse_ui_prefs(b).unwrap().width;
+        assert_eq!(w(r#"{"width":412}"#), Some(412));
+        assert_eq!(w(r#"{"width":null}"#), None);
+        assert_eq!(w("{}"), None);
         // both ends of the page's own range are legal
-        assert_eq!(
-            parse_ui_prefs(r#"{"width":220}"#).unwrap(),
-            Some(crate::settings::RAIL_MIN_W)
-        );
-        assert_eq!(
-            parse_ui_prefs(r#"{"width":520}"#).unwrap(),
-            Some(crate::settings::RAIL_MAX_W)
-        );
+        assert_eq!(w(r#"{"width":220}"#), Some(crate::settings::RAIL_MIN_W));
+        assert_eq!(w(r#"{"width":520}"#), Some(crate::settings::RAIL_MAX_W));
         // ...and anything outside it did not come from a drag, so it is a 400
         // rather than a silent clamp to a layout nobody chose
         for bad in [
@@ -2248,6 +2320,49 @@ mod tests {
             r#"{"width":"400"}"#,
             r#"{"width":400.5}"#,
             "not json at all",
+        ] {
+            assert!(parse_ui_prefs(bad).is_err(), "must refuse {bad}");
+        }
+    }
+
+    /// The bridge's corner of the same file, and the rule that keeps the two
+    /// kinds of save from stepping on each other: a splitter drag posts `width`
+    /// alone and must leave an open preview open, and the preview posts `tcode`
+    /// alone and must leave the column where it was.
+    #[test]
+    fn the_bridge_address_is_checked_and_the_two_saves_stay_apart() {
+        let p = parse_ui_prefs(
+            r#"{"tcode":{"url":" ws://127.0.0.1:7778 ","x":120,"y":-40,"open":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.width, None, "a tcode save must not touch the width");
+        let t = p.tcode.unwrap();
+        assert_eq!(t.url.as_deref(), Some("ws://127.0.0.1:7778"));
+        assert_eq!((t.x, t.y, t.open), (Some(120), Some(-40), true));
+
+        // a splitter save carries no `tcode` at all, and that silence has to
+        // read as "leave it alone" rather than "close it"
+        let p = parse_ui_prefs(r#"{"width":300}"#).unwrap();
+        assert_eq!(p.width, Some(300));
+        assert!(p.tcode.is_none());
+
+        // `null` is the page saying it never chose either value
+        let p = parse_ui_prefs(r#"{"tcode":null}"#).unwrap();
+        assert!(p.tcode.is_none());
+        let t = parse_ui_prefs(r#"{"tcode":{"url":null}}"#).unwrap().tcode;
+        assert_eq!(t.unwrap().url, None, "an empty address is not an error");
+        // ...and a blank string is the same statement as null, because that is
+        // what an emptied input box sends
+        let t = parse_ui_prefs(r#"{"tcode":{"url":"  "}}"#).unwrap().tcode;
+        assert_eq!(t.unwrap().url, None);
+
+        for bad in [
+            r#"{"tcode":{"url":"127.0.0.1:7778"}}"#,
+            r#"{"tcode":{"url":"http://127.0.0.1:7778"}}"#,
+            r#"{"tcode":{"url":5}}"#,
+            r#"{"tcode":{"x":1.5}}"#,
+            r#"{"tcode":{"x":99999}}"#,
+            r#"{"tcode":{"open":"yes"}}"#,
         ] {
             assert!(parse_ui_prefs(bad).is_err(), "must refuse {bad}");
         }

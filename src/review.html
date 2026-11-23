@@ -611,6 +611,58 @@
            z-index: 40; white-space: nowrap; }
   #toast.on { opacity: 1; }
 
+  /* ---- the OFS-SE bridge ------------------------------------------------
+     A little window over the picture that shows what the script is doing to a
+     device, right now, at the playhead. It does NOT render the device: the
+     model lives in TEMU+ (GPL-3; this binary is MIT and stays that way), so all
+     this does is push TCode at it over a WebSocket and get out of the way.
+     Being a window rather than a column is the point: the reviewer is looking
+     at the video, so the preview has to sit on top of it and be draggable
+     somewhere it is not in the way. */
+  #tcpPanel { position: fixed; z-index: 45; width: 232px;
+              background: var(--panel); border: 2px solid var(--edge);
+              box-shadow: 0 8px 26px rgba(0,0,0,.6);
+              display: flex; flex-direction: column; }
+  #tcpPanel[hidden] { display: none; }
+  /* The bar is the whole drag handle: a border you must find is not a handle. */
+  #tcpBar { display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+            background: var(--panel-2); border-bottom: 1px solid var(--edge);
+            cursor: move; touch-action: none; user-select: none; }
+  #tcpBar .tcp-h { flex: 1 1 auto; font: 700 10px var(--chrome);
+                   letter-spacing: .06em; color: var(--hi-dim); }
+  #tcpBar button { font: 11px var(--chrome); line-height: 1; padding: 2px 5px;
+                   color: var(--ink-soft); background: transparent;
+                   border: 1px solid var(--edge); border-radius: 3px;
+                   cursor: pointer; }
+  #tcpBar button:hover { color: var(--hi-bright); border-color: var(--hi-bright); }
+  #tcpBar button.on { color: var(--hi-bright);
+                      background: color-mix(in srgb, var(--hi) 26%, var(--panel-2)); }
+  #tcpBody { display: flex; flex-direction: column; gap: 5px; padding: 6px; }
+  #tcpBody[hidden] { display: none; }
+  #tcpBody label { display: flex; align-items: center; gap: 6px;
+                   font: 11px var(--chrome); color: var(--ink-soft); }
+  #tcpBody input[type=text] { flex: 1 1 0; min-width: 0; font: 11px var(--chrome);
+                              color: var(--ink); background: var(--panel-2);
+                              border: 1px solid var(--edge); border-radius: 3px;
+                              padding: 1px 4px; }
+  /* The bridge's own readout: the axis values it is sending, live. Monospace and
+     fixed-width digits so the numbers stop dancing as they change. */
+  #tcpAxes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px 8px;
+             font: 11px/1.35 var(--chrome); color: var(--ink-soft);
+             font-variant-numeric: tabular-nums; }
+  #tcpAxes b { color: var(--hi-bright); font-weight: 400; }
+  #tcpState { font: 11px var(--chrome); color: var(--hi-dim); }
+  #tcpState.bad { color: var(--danger-soft); }
+  /* A rail row that opens the window. It wears the same chrome as the knobs'
+     own toggle rows so "there is a second thing here" reads the same way. */
+  .tcprow { display: flex; align-items: center; gap: 6px; margin-top: 6px;
+            font: 11px var(--chrome); color: var(--ink-soft); }
+  .tcprow .tcp-go { font: 11px var(--chrome); padding: 2px 8px;
+                    color: var(--ink); background: var(--panel-2);
+                    border: 1px solid var(--edge); border-radius: 3px;
+                    cursor: pointer; }
+  .tcprow .tcp-go:hover { border-color: var(--hi-bright); color: var(--hi-bright); }
+
   /* A right-click on the bar is where the two layers are easiest to reach, so
      the bar answers with its own menu rather than the browser's. */
   #tlmenu { position: fixed; z-index: 50; min-width: 172px; display: none;
@@ -1184,6 +1236,13 @@
           <div><kbd>x</kbd> <span data-t="page.key.swap">swap the script and the line under it</span></div>
         </div>
       </div>
+      <!-- The device preview lives over the picture, not in here, so the only
+           thing the rail carries is the way to open it. -->
+      <div class="tcprow">
+        <button id="tcpOpen" type="button" class="tcp-go"
+                data-t="page.tcp.open">device preview</button>
+        <span class="hint" data-t="page.tcp.open.hint">what the script does to a device, live</span>
+      </div>
       <div class="rail-foot">
         <button id="reset" type="button" data-t="page.reset">reset to draft</button>
         <button id="done" data-t="page.done">Done — dismiss the goblins</button>
@@ -1192,6 +1251,29 @@
   </div>
 <div id="toast"></div>
 <div id="tlmenu"></div>
+<!-- The OFS-SE bridge window. Hidden until asked for, remembered open/closed
+     and where it was left. The model itself is in TEMU+ -- see the CSS block. -->
+<div id="tcpPanel" hidden>
+  <div id="tcpBar" data-t-title="page.tcp.drag.title"
+       title="drag to move the window">
+    <span class="tcp-h" data-t="page.tcp.head">device preview</span>
+    <button type="button" id="tcpGear" data-t-title="page.tcp.gear.title"
+            title="the address and the axes">⚙</button>
+    <button type="button" id="tcpClose" data-t-title="page.tcp.close.title"
+            title="close (the socket closes with it)">✕</button>
+  </div>
+  <div id="tcpBody">
+    <label for="tcpUrl"><span data-t="page.tcp.url">TEMU+ address</span>
+      <input id="tcpUrl" type="text" spellcheck="false" autocomplete="off"
+             placeholder="ws://127.0.0.1:7778"></label>
+    <div id="tcpAxes">
+      <span>L0 <b id="tcpL0">–</b></span><span>L1 <b id="tcpL1">–</b></span>
+      <span>L2 <b id="tcpL2">–</b></span><span>R0 <b id="tcpR0">–</b></span>
+      <span>R1 <b id="tcpR1">–</b></span><span>R2 <b id="tcpR2">–</b></span>
+    </div>
+    <span id="tcpState">–</span>
+  </div>
+</div>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -2145,6 +2227,23 @@ async function loadUiPrefs() {
   try {
     const j = await (await fetch('/ui_prefs')).json();
     applyRailWidth((j && j.width) ? clampRail(j.width) : 0);
+    // The bridge's remembered corner of the same file. Restoring it here rather
+    // than in its own request keeps one round trip and one place that reads it.
+    const t = j && j.tcode;
+    if (t) {
+      tcp.url = t.url || '';
+      tcp.x = (typeof t.x === 'number') ? t.x : null;
+      tcp.y = (typeof t.y === 'number') ? t.y : null;
+      const box = $('tcpUrl');
+      if (box) box.value = tcp.url;
+      if (t.open) {
+        tcpShow(true);
+        // An address the reviewer left in the box is an intent to be connected
+        // -- reopening the window and then having to press nothing else is what
+        // "it was already running last time" has to mean.
+        if (tcp.url) tcpConnect();
+      }
+    }
   } catch (e) { applyRailWidth(0); }
   // the canvases re-back themselves off a ResizeObserver, so nothing to do here
 }
@@ -2217,6 +2316,9 @@ new ResizeObserver(placeGrips).observe($('shell'));
 addEventListener('resize', () => {
   if (railW) applyRailWidth(clampRail(railW));
   placeGrips();
+  // a window that was parked in the corner of a bigger screen has to come back
+  // into view rather than sit half outside the new one
+  if ($('tcpPanel') && !$('tcpPanel').hidden) tcpPlace();
 });
 
 // the one disclosure: every group's raw numbers in place, folded away by default
@@ -3788,6 +3890,10 @@ function tick(ts) {
       if (at >= 0 && at !== selSeg) { selSeg = at; renderSegs(); }
     }
   }
+  // The device preview runs on its OWN clock, outside the paint budget: a device
+  // wants 60 Hz whether or not this frame was worth redrawing, and the frame the
+  // picture is on is a fact about the <video>, not about the canvas above it.
+  tcpFrame(now, ms);
   requestAnimationFrame(tick);
 }
 
@@ -4032,6 +4138,237 @@ function toast(msg) {
 // one history.
 function pushSegUndo(label, at) { pushHist(label || 'page.hist.piece', at); }
 function pushShotUndo(label, at) { pushHist(label || 'page.hist.shot', at); }
+
+// ---- the OFS-SE bridge ------------------------------------------------------
+// What this does, and deliberately does NOT do: it converts the script under the
+// playhead into TCode and pushes it at whatever is listening -- normally TEMU+
+// with its WebSocket input started, which draws a real OFS-SE model. The model
+// is GPL-3; this binary is MIT and ships none of it, so the seam between the two
+// is a socket and nothing else.
+//
+// TCode's grammar, as the receiver reads it: `<axis><value>` groups separated by
+// spaces, one line per frame, axes L0 (stroke) L1 (forward) L2 (left) R0 (twist)
+// R1 (roll) R2 (pitch), values 0000..9999. Extra digits are ignored -- the
+// receiver takes the first four -- so 0..100 has to be multiplied by 100 first.
+//
+// Only L0 is driven. A funscript is one axis; pretending its single number means
+// six would be inventing motion the author never wrote. The other five stay at
+// their neutral 5000 so a device that powers up mid-session is already home.
+let tcp = {            // the bridge's own state, none of it the server's
+  sock: null,          // the live WebSocket, null when not connected
+  url: '',             // what the address box last committed
+  x: null, y: null,    // the window's corner, null = wherever the default put it
+  last: -1,            // the last value sent, so a still playhead sends nothing
+  sent: 0,             // frames written, for the readout
+};
+const TCP_HZ = 60;     // the rate a device is driven at; 60 is what OSR2 expects
+// One frame short of the period, deliberately: the tick this runs from is the
+// display's, so its deltas are 16.6-16.7 ms against a 16.667 ms period and a
+// strict comparison throws away every second frame -- a 60 Hz feed clocked to 30.
+const TCP_RATE_MS = 1000 / TCP_HZ - 1;
+let tcpLast = 0;       // when the last frame went out, on the rAF clock
+
+/** The readout's six numbers, from the value the bridge would send right now. */
+function tcpPaintAxes(v) {
+  const set = (id, n) => { const el = $(id); if (el) el.textContent = String(n); };
+  set('tcpL0', v);
+  for (const a of ['L1', 'L2', 'R0', 'R1', 'R2']) set('tcp' + a, 5000);
+}
+/** Say what the bridge is doing, in the state line, and colour it when it hurts. */
+function tcpSay(msg, bad) {
+  const el = $('tcpState');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('bad', !!bad);
+}
+/** Rewrite the gear button's lit state: the address row is showing or not. */
+function tcpShowBody(on) {
+  const body = $('tcpBody'), gear = $('tcpGear');
+  if (body) body.hidden = !on;
+  if (gear) gear.classList.toggle('on', !!on);
+}
+/** Open the window. `on` false just hides it -- the socket is closed separately,
+ *  because a reviewer who wants the numbers gone has not asked to stop the
+ *  device. */
+function tcpShow(on) {
+  const p = $('tcpPanel');
+  if (!p) return;
+  p.hidden = !on;
+  if (on) tcpPlace();
+  tcpSave({ open: !!on });
+}
+/** Put the window where it was left, or in the stage's bottom-right corner. */
+function tcpPlace() {
+  const p = $('tcpPanel');
+  if (!p || p.hidden) return;
+  // measure with the position cleared, or a window already placed reports the
+  // corner it is sitting at rather than the size it needs
+  p.style.left = '0px';
+  p.style.top = '0px';
+  const w = p.offsetWidth, h = p.offsetHeight;
+  const maxX = Math.max(0, window.innerWidth - w - 8);
+  const maxY = Math.max(0, window.innerHeight - h - 8);
+  const x = tcp.x === null ? maxX - 12 : tcp.x;
+  const y = tcp.y === null ? maxY - 60 : tcp.y;
+  p.style.left = Math.round(Math.min(maxX, Math.max(0, x))) + 'px';
+  p.style.top = Math.round(Math.min(maxY, Math.max(0, y))) + 'px';
+}
+/** Remember the window's state. Best-effort: a lost corner is not an error. */
+function tcpSave(part) {
+  Object.assign(tcp, part);
+  const body = JSON.stringify({
+    tcode: { url: tcp.url || null, x: tcp.x, y: tcp.y, open: !$('tcpPanel').hidden },
+  });
+  fetch('/ui_prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+    .catch(() => { /* a forgotten window position is not worth a banner */ });
+}
+/** The one line of TCode for a position. */
+function tcpLine(pos) {
+  const v = String(Math.round(Math.max(0, Math.min(100, pos)) * 100)).padStart(4, '0');
+  return 'L0' + v + ' L15000 L25000 R05000 R15000 R25000\n';
+}
+/** The address as a WebSocket one.
+ *
+ *  A reviewer copies "http://127.0.0.1:7778" out of a browser bar, not
+ *  "ws://...", and the browser would silently accept it (it normalises the
+ *  scheme itself). The server's own check is stricter than the browser's, so
+ *  without this the page would connect happily and then fail to remember the
+ *  address -- a working session that does not survive a reload is worse than a
+ *  refused one. Normalise first, so both ends agree on what was said. */
+function tcpAddress(url) {
+  const s = (url || '').trim();
+  if (/^https:\/\//i.test(s)) return 'wss://' + s.slice(8);
+  if (/^http:\/\//i.test(s)) return 'ws://' + s.slice(7);
+  return s;
+}
+/** Open the socket. Returns nothing; the state line is the report. */
+function tcpConnect() {
+  tcpDisconnect();
+  const url = tcpAddress(tcp.url);
+  if (!url) { tcpSay(T('page.tcp.nourl'), true); return; }
+  if (!/^wss?:\/\//i.test(url)) { tcpSay(T('page.tcp.badurl', { why: url.split(':')[0] + ':' }), true); return; }
+  tcp.url = url;
+  const box = $('tcpUrl');
+  if (box) box.value = url;
+  let sock;
+  try { sock = new WebSocket(url); } catch (e) {
+    // `new WebSocket` throws on a malformed URL, which is the only failure that
+    // can be reported synchronously -- the rest arrive as events.
+    tcpSay(T('page.tcp.badurl', { why: e.message }), true);
+    return;
+  }
+  tcp.sock = sock;
+  tcp.last = -1;
+  tcp.sent = 0;
+  tcpSay(T('page.tcp.connecting'));
+  sock.onopen = () => {
+    if (tcp.sock !== sock) return;
+    tcpSay(T('page.tcp.live', { url }));
+    tcpSave({});
+  };
+  sock.onerror = () => {
+    // Browsers say nothing useful here on purpose, so the address is the hint:
+    // the commonest failure by far is TEMU+ not having pressed Start.
+    if (tcp.sock !== sock) return;
+    tcpSay(T('page.tcp.failed', { url }), true);
+  };
+  sock.onclose = () => {
+    if (tcp.sock !== sock) return;
+    tcp.sock = null;
+    tcpSay(T('page.tcp.closed'));
+  };
+}
+function tcpDisconnect() {
+  const sock = tcp.sock;
+  if (!sock) return;
+  tcp.sock = null;      // before close, so onclose does not overwrite the line
+  try { sock.close(); } catch (e) { /* already gone */ }
+  tcpSay(T('page.tcp.off'));
+}
+/** Push one frame if the clock says it is time. Called from `tick`. */
+function tcpFrame(now, ms) {
+  const sock = tcp.sock;
+  if (!sock || sock.readyState !== 1) return;
+  if (now - tcpLast < TCP_RATE_MS) return;
+  tcpLast = now;
+  const p = posAt(ms);
+  if (p === null) return;
+  // The comparison is at TCode's own resolution (1/10000), not at whole percent:
+  // a hundred buckets would hold the same number for ten frames of an ordinary
+  // stroke and quietly turn a 60 Hz feed into a 15 Hz one. The wire format cannot
+  // tell the difference; the device can.
+  const v = Math.round(Math.max(0, Math.min(100, p)) * 100);
+  if (v === tcp.last) { tcpPaintAxes(v); return; }
+  tcp.last = v;
+  try { sock.send(tcpLine(p)); } catch (e) { tcpSay(T('page.tcp.failed', { url: tcp.url }), true); return; }
+  tcp.sent++;
+  tcpPaintAxes(v);
+}
+
+// ---- the bridge's controls ---------------------------------------------------
+// Every listener here is wired once, at load, so the window works whether it was
+// opened by the rail's button or restored from the settings file.
+$('tcpOpen').onclick = () => { tcpShow(true); tcpConnect(); };
+$('tcpClose').onclick = () => {
+  // Closing the window closes the socket too: a device still being driven by a
+  // page nobody is looking at is the kind of surprise that ends in a jammed
+  // machine. Opening it again reconnects (the address stays in the box).
+  tcpDisconnect();
+  tcpShow(false);
+};
+$('tcpGear').onclick = () => tcpShowBody($('tcpBody').hidden);
+const tcpBox = $('tcpUrl');
+// Commit on Enter or on blur, never per keystroke: an address is only an address
+// once it is finished, and every intermediate state of one is a failed socket.
+const tcpCommit = () => {
+  const want = tcpBox.value.trim();
+  if (want === tcp.url && tcp.sock) return;
+  tcp.url = want;
+  tcpSave({});
+  if (want) tcpConnect(); else tcpDisconnect();
+};
+tcpBox.addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { ev.preventDefault(); tcpCommit(); }
+  // Esc puts back what was committed, so a half-typed address is not a trap
+  if (ev.key === 'Escape') { tcpBox.value = tcp.url; tcpBox.blur(); }
+});
+tcpBox.addEventListener('blur', tcpCommit);
+// Dragging the bar moves the window. Pointer capture keeps the drag alive when
+// the cursor outruns the bar, which it will: the bar is 20 px tall.
+let tcpDrag = null;
+$('tcpBar').addEventListener('pointerdown', ev => {
+  if (ev.button !== 0) return;
+  if (ev.target.closest('button')) return;   // the gear and the ✕ are not handles
+  ev.preventDefault();
+  const p = $('tcpPanel');
+  const r = p.getBoundingClientRect();
+  tcpDrag = { dx: ev.clientX - r.left, dy: ev.clientY - r.top };
+  document.body.classList.add('rail-drag');
+  try { ev.target.setPointerCapture(ev.pointerId); } catch (e) { /* an optimisation */ }
+});
+$('tcpBar').addEventListener('pointermove', ev => {
+  if (!tcpDrag) return;
+  const p = $('tcpPanel');
+  const w = p.offsetWidth, h = p.offsetHeight;
+  const x = Math.max(0, Math.min(window.innerWidth - w, ev.clientX - tcpDrag.dx));
+  const y = Math.max(0, Math.min(window.innerHeight - h, ev.clientY - tcpDrag.dy));
+  p.style.left = Math.round(x) + 'px';
+  p.style.top = Math.round(y) + 'px';
+});
+const tcpDrop = () => {
+  if (!tcpDrag) return;
+  tcpDrag = null;
+  document.body.classList.remove('rail-drag');
+  const p = $('tcpPanel');
+  // saved on RELEASE, for the same reason the splitter is
+  tcpSave({ x: Math.round(p.getBoundingClientRect().left),
+            y: Math.round(p.getBoundingClientRect().top) });
+};
+$('tcpBar').addEventListener('pointerup', tcpDrop);
+$('tcpBar').addEventListener('pointercancel', tcpDrop);
+// A hidden window must not leave a socket driving hardware, and a page being
+// dismissed must not either.
+addEventListener('pagehide', () => { tcpDisconnect(); });
 
 // ---- edits ----------------------------------------------------------------
 function segAt(ms) {

@@ -618,5 +618,19 @@
   "fill.fill": "填充",
   "fill.low": "小幅度高潮",
   "fill.mid": "中幅度高潮",
-  "fill.high": "大幅度高潮"
+  "fill.high": "大幅度高潮",
+  "page.tcp.open": "设备预览",
+  "page.tcp.open.hint": "实时看脚本对一个设备做了什么",
+  "page.tcp.head": "设备预览",
+  "page.tcp.drag.title": "拖动可移动窗口",
+  "page.tcp.gear.title": "地址与各轴读数",
+  "page.tcp.close.title": "关闭（连接会一起断开）",
+  "page.tcp.url": "TEMU+ 地址",
+  "page.tcp.nourl": "先填上 TEMU+ 正在监听的地址",
+  "page.tcp.badurl": "这不是一个 WebSocket 地址：{why}",
+  "page.tcp.connecting": "连接中…",
+  "page.tcp.live": "正在驱动 {url}",
+  "page.tcp.failed": "连不上 {url} —— TEMU+ 开了监听吗？",
+  "page.tcp.closed": "连接已断开",
+  "page.tcp.off": "未连接"
 }

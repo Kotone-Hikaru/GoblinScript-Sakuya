@@ -570,5 +570,19 @@
   "fill.fill": "fill",
   "fill.low": "small climax",
   "fill.mid": "medium climax",
-  "fill.high": "large climax"
+  "fill.high": "large climax",
+  "page.tcp.open": "device preview",
+  "page.tcp.open.hint": "what the script does to a device, live",
+  "page.tcp.head": "device preview",
+  "page.tcp.drag.title": "drag to move the window",
+  "page.tcp.gear.title": "the address and the axes",
+  "page.tcp.close.title": "close (the socket closes with it)",
+  "page.tcp.url": "TEMU+ address",
+  "page.tcp.nourl": "type the address TEMU+ is listening on first",
+  "page.tcp.badurl": "that is not a WebSocket address: {why}",
+  "page.tcp.connecting": "connecting\u2026",
+  "page.tcp.live": "driving {url}",
+  "page.tcp.failed": "could not reach {url} \u2014 is TEMU+ listening?",
+  "page.tcp.closed": "the socket closed",
+  "page.tcp.off": "not connected"
 }

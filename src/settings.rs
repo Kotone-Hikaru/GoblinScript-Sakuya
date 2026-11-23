@@ -184,6 +184,50 @@ pub struct Settings {
     /// MORE pure machine time. That is a trade a person should choose, not one
     /// they should discover.
     pub batch_crop: bool,
+    /// The OFS-SE preview: where to push TCode, and where its little window was
+    /// last left.
+    ///
+    /// `None` = the preview has never been opened, which is also what keeps the
+    /// page from drawing a control nobody asked for. The preview itself renders
+    /// in TEMU+ (`github.com/…/TEMU+`, GPL-3) rather than in this binary, so all
+    /// that travels here is a socket address -- see `review.html`'s `#tcpPanel`.
+    pub tcode: Option<TcodePrefs>,
+}
+
+/// Where the review page should send TCode, and how the case was framed.
+///
+/// Everything is optional for the same reason the rest of this file is: a
+/// settings file that predates the preview must still parse, and a field the
+/// page did not mention must not be reset.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct TcodePrefs {
+    /// `ws://host:port` that TEMU+'s WebSocket input listens on. `None` = never
+    /// connected = the page shows the address but does not open a socket.
+    ///
+    /// Validated as a ws:// or wss:// URL when it comes back from the page: the
+    /// page builds it from user typing, and a typo must be refused with a
+    /// sentence rather than attempted as a socket.
+    pub url: Option<String>,
+    /// The bridge window's top-left corner, in CSS pixels from the viewport's.
+    /// `None` = never dragged = the page's own default placement, which parks it
+    /// in the stage's bottom-right where it does not cover the picture's middle.
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    /// Whether the bridge window was left open. Held so a reviewer who keeps it
+    /// up does not have to reopen it on every launch.
+    pub open: bool,
+}
+
+impl Default for TcodePrefs {
+    fn default() -> Self {
+        TcodePrefs {
+            url: None,
+            x: None,
+            y: None,
+            open: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -209,6 +253,7 @@ impl Default for Settings {
             rail_width: None,
             raise_window: None,
             batch_crop: false,
+            tcode: None,
         }
     }
 }
