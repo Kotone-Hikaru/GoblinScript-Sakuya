@@ -195,6 +195,17 @@ pub struct Span {
     /// longer than its window needs. Absent means 1.
     #[serde(default = "one")]
     pub freq: f64,
+    /// Generate this piece the way the FIRST version of the feature did, so an
+    /// author can compare the two side by side (user call, 2026-11-28). That
+    /// path writes the borrowed carrier straight into `level`, which the
+    /// composers then low-pass across the whole clip -- reaching 15 rows past
+    /// each seam, which is why two pieces a couple of seconds apart used to
+    /// rewrite the correct stretch between them -- and it does not borrow the
+    /// reversal head, so the neighbour's shape lands on this piece's own vertex
+    /// times. It also stops `amount` at a plain replacement. Nothing produces
+    /// it unless the page asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<bool>,
 }
 
 /// The biggest piece intensity the panel offers. Refused above this rather than
@@ -1503,7 +1514,15 @@ fn normalize_spans(spans: Vec<Span>, clip: &Clip) -> Vec<Span> {
             if !s.amount.is_finite() {
                 s.amount = 1.0;
             }
-            s.amount = s.amount.clamp(0.0, crate::style::MAX_BORROW_AMOUNT);
+            // The old rules stop `amount` at a plain replacement: the first
+            // version of the feature never extrapolated, and a comparison that
+            // quietly gained a behaviour would not be a comparison.
+            let top = if s.legacy.unwrap_or(false) {
+                1.0
+            } else {
+                crate::style::MAX_BORROW_AMOUNT
+            };
+            s.amount = s.amount.clamp(0.0, top);
             for v in [&mut s.travel, &mut s.freq] {
                 if !v.is_finite() || *v <= 0.0 {
                     *v = 1.0;
@@ -2497,7 +2516,7 @@ mod tests {
         let base = Choice {
             model: "a".into(),
             compare: None,
-            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 }],
+            spans: vec![super::Span { lo_ms: 0.0, hi_ms: 100.0, model: "b".into(), wave: None, no_limit: true, no_cuts: false, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0, legacy: None }],
             cuts_ms: None,
         };
         let parse = |body: &str| super::parse_choice(body, &clip, &base);
@@ -2518,9 +2537,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 },
-                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 },
-                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0 },
+                super::Span { lo_ms: 600.0, hi_ms: 700.0, model: "a".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0, legacy: None },
+                super::Span { lo_ms: 800.0, hi_ms: 900.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0, legacy: None },
+                super::Span { lo_ms: 900.0, hi_ms: 1000.0, model: "b".into(), wave: None, no_limit: true, no_cuts: true, scale: 1.0, side: 2, ref_before: None, ref_after: None, amount: 1.0, travel: 1.0, freq: 1.0, legacy: None },
             ]
         );
         // an empty list is a real answer: back to one model over the whole clip

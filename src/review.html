@@ -858,13 +858,13 @@
           </div>
           <div class="wprow">
             <label for="bbBefore" data-t="page.borrow.sec">s before</label>
-            <input id="bbBefore" class="wpnum" type="number" min="0" max="5" step="0.05">
-            <input id="bbBeforeS" class="wpslider" type="range" min="0" max="5" step="0.05">
+            <input id="bbBefore" class="wpnum" type="number" min="0" max="10" step="0.05">
+            <input id="bbBeforeS" class="wpslider" type="range" min="0" max="10" step="0.05">
           </div>
           <div class="wprow">
             <label for="bbAfter" data-t="page.borrow.sec2">s after</label>
-            <input id="bbAfter" class="wpnum" type="number" min="0" max="5" step="0.05">
-            <input id="bbAfterS" class="wpslider" type="range" min="0" max="5" step="0.05">
+            <input id="bbAfter" class="wpnum" type="number" min="0" max="10" step="0.05">
+            <input id="bbAfterS" class="wpslider" type="range" min="0" max="10" step="0.05">
           </div>
           <div class="wprow">
             <label for="bbAmount" data-t="page.borrow.amount">amount</label>
@@ -883,6 +883,17 @@
             <input id="bbFreq" class="wpnum" type="number" min="0.2" max="3" step="0.05">
             <span data-t="page.borrow.times2">x</span>
             <input id="bbFreqS" class="wpslider" type="range" min="0.2" max="3" step="0.05">
+          </div>
+          <!-- The first version of this feature, kept as a switch so an author
+               can put the two side by side on the same piece. It writes the
+               borrowed carrier straight into the level track, so the whole-clip
+               low-pass carries it 15 rows past each seam -- exactly what used to
+               rewrite the correct stretch between two pieces -- and it leaves the
+               reversal head alone, so the neighbour's shape lands on this piece's
+               own vertex times. Off by default. -->
+          <div class="wprow bbsides">
+            <span class="unlockopt"><input type="checkbox" id="bbLegacy">
+              <label for="bbLegacy" data-t="page.borrow.legacy">the old rules</label></span>
           </div>
           <div class="wprow">
             <span id="bbAt" class="wpnote"></span>
@@ -3992,7 +4003,10 @@ function partitionOf(c) {
                refBefore: e.ref_before || null, refAfter: e.ref_after || null,
                amount: (e.amount == null ? 1 : e.amount),
                travel: (e.travel == null ? 1 : e.travel),
-               freq: (e.freq == null ? 1 : e.freq) });
+               freq: (e.freq == null ? 1 : e.freq),
+               // the old-rules switch. Absent (every span written before it
+               // existed, and every piece the page never toggled) reads as off.
+               legacy: !!e.legacy });
     t = hi;
   }
   if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
@@ -4029,6 +4043,10 @@ function spansPayload() {
                  o.amount = borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT);
                  o.travel = borrowNum(s.travel, 1, 0.2, 3);
                  o.freq = borrowNum(s.freq, 1, 0.2, 3);
+                // Only when it is on: an ordinary piece sends exactly the
+                // shape it always did, so nothing on the wire changes for
+                // authors who never touch the switch.
+                if (s.legacy) o.legacy = true;
                } else if (pieceScale(s) !== 1) {
                  // 1 is the model's own answer, and absent means 1
                  o.scale = pieceScale(s);
@@ -4967,9 +4985,14 @@ function borrowSide(s) {
  *  far back that the footage has nothing to do with it any more. The fields hold
  *  the number; this is only what they start on. */
 const BORROW_DEF_LEN = 1.5;
-/** The top of the two length fields. Past this the neighbour is a different part
- *  of the clip and "read the stretch beside this one" stops being true. */
-const BORROW_MAX_LEN = 5;
+/** What the two length sliders can reach. The fields go past it: an author who
+ *  types 12 means 12, and the number is what the piece actually reads -- the
+ *  slider is only one way to say it. */
+const BORROW_MAX_LEN = 10;
+/** The hardest number a length field will take at all, typed or dragged. Ten
+ *  seconds a side is already a whole shot; past this the "neighbour" is some
+ *  other part of the footage and reading it is not generating a fill. */
+const BORROW_HARD_LEN = 60;
 /** The top of `amount`, in multiples of "be the neighbour" -- mirrors
  *  `style::MAX_BORROW_AMOUNT` on the server, which clamps to the same number. */
 const BORROW_MAX_AMOUNT = 2;
@@ -4987,7 +5010,7 @@ const BORROW_MAX_AMOUNT = 2;
  *  read. So each side takes `min(wanted, available)`. */
 function borrowWindow(s, which, secs) {
   const dur = spanDur(state && state.clips[cur]);
-  const want = Math.min(BORROW_MAX_LEN, Math.max(0, Number(secs) || 0)) * 1000;
+  const want = Math.min(BORROW_HARD_LEN, Math.max(0, Number(secs) || 0)) * 1000;
   if (which === 'before') {
     const back = Math.min(want, s.lo);
     return (back >= 250) ? [s.lo - back, s.lo] : null;
@@ -5071,6 +5094,7 @@ function renderBorrowPanel() {
   setBorrowField('bbAmount', String(Math.round(borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT) * 100)));
   setBorrowField('bbTravel', borrowNum(s.travel, 1, 0.2, 3).toFixed(2));
   setBorrowField('bbFreq', borrowNum(s.freq, 1, 0.2, 3).toFixed(2));
+  if ($('bbLegacy')) $('bbLegacy').checked = !!s.legacy;
   labelBorrowAt(s);
 }
 /** Write one knob's number box AND its slider together. They are one value with
@@ -5577,11 +5601,17 @@ function setBorrowSide(s, want) {
   if (want === 1) s.refBefore = null;
 }
 
-/** Read one length field, in seconds, held to what the slider can reach. */
+/** Read one length field, in seconds.
+ *
+ *  NOT held to the slider track. Typing 12 into the box keeps 12: the field is
+ *  the authority and the slider is a convenience, so a value past its reach
+ *  leaves the handle pinned at the end while the number stands. Only the hard
+ *  ceiling applies, and that one exists because past it the thing on the other
+ *  side of the seam is not a neighbour any more. */
 function borrowLenValue(v) {
   const n = Number(v);
   if (!isFinite(n)) return BORROW_DEF_LEN;
-  return Math.max(0, Math.min(BORROW_MAX_LEN, n));
+  return Math.max(0, Math.min(BORROW_HARD_LEN, n));
 }
 /** Wire one side's number box and slider to the same field.
  *
@@ -5677,6 +5707,12 @@ borrowKnob('bbAmount', 0, BORROW_MAX_AMOUNT * 100,
            (s, v) => { if (s) s.amount = v / 100; }, true);
 borrowKnob('bbTravel', 0.2, 3, (s, v) => { if (s) s.travel = v; }, false);
 borrowKnob('bbFreq', 0.2, 3, (s, v) => { if (s) s.freq = v; }, false);
+// The comparison switch. It only ever changes how the NEXT compose treats this
+// piece -- nothing is measured again, and the windows stay exactly as they are.
+if ($('bbLegacy')) $('bbLegacy').onchange = () => {
+  const on = $('bbLegacy').checked;
+  editBorrow(s => { s.legacy = on; });
+};
 
 // The one control that measures again. Everything else in this panel edits what
 // is already frozen, so a neighbour moving afterwards cannot rewrite a piece the

@@ -1468,6 +1468,9 @@ fn style_cfg(man: &bundle::Manifest, p: &style::Params) -> style::StyleCfg {
         amp_cap_x_rows: Vec::new(),
         amp_cap_f0_rows: Vec::new(),
         manual_ms: Vec::new(),
+        // a plain draft has nothing generated in it; a mixed review fills this
+        // with the guard bands around its generated pieces
+        protect_ms: Vec::new(),
         env_gain_p: man.env_gain_p,
         plat_thr: man.plat_thr,
         plat_lo: man.plat_lo,
@@ -1672,8 +1675,11 @@ fn restyle_mixed(
     cap_f0: &[f64],
     manual_ms: &[crate::wave::ManualSpan],
     pieces: &[style::PieceScale],
+    protect_ms: &[(f64, f64)],
 ) -> Result<(usize, Vec<[i64; 2]>, f64)> {
-    let s = style_draft_with(d, man, params, &[], tracks, cap_x, cap_f0, manual_ms, pieces);
+    let s = style_draft_with(
+        d, man, params, &[], tracks, cap_x, cap_f0, manual_ms, pieces, protect_ms,
+    );
     write_styled(&d.dst, &s, man, params)?;
     Ok((s.actions.len(), s.artifacts, s.art_rate))
 }
@@ -1722,9 +1728,10 @@ fn review_style(
         // The rows the script is written from: the chosen model's tracks over the
         // whole clip, each span's own model spliced in on its rows, with the
         // per-row amplitude bound that follows (each pack keeps its own `amp_cap_x`).
-        let (mixed, cap_x, cap_f0, conf, manual_ms, pieces) = mixed_tracks(d, b, p, choice, &bb)?;
+        let (mixed, cap_x, cap_f0, conf, manual_ms, pieces, protect_ms) =
+            mixed_tracks(d, b, p, choice, &bb)?;
         let (actions, _, _) = restyle_mixed(
-            d, &bb.manifest, p, &mixed, &cap_x, &cap_f0, &manual_ms, &pieces,
+            d, &bb.manifest, p, &mixed, &cap_x, &cap_f0, &manual_ms, &pieces, &protect_ms,
         )?;
         Ok(review::Restyled { actions, conf })
     })
@@ -1798,6 +1805,7 @@ fn mixed_tracks(
     Vec<f64>,
     Vec<crate::wave::ManualSpan>,
     Vec<style::PieceScale>,
+    Vec<(f64, f64)>,
 )> {
     let n = d.tracks.vmarg.len();
     let none = Vec::new();
@@ -1809,12 +1817,16 @@ fn mixed_tracks(
             d.tracks.conf.clone(),
             none,
             Vec::new(),
+            Vec::new(),
         ));
     }
     let mut mixed = d.tracks.clone();
     // the base model's bound over the clip; each span overwrites its own rows
     let mut cap_x = vec![base.manifest.amp_cap_x; n];
     let mut cap_f0 = vec![base.manifest.amp_cap_f0; n];
+    // Generated pieces, in the clip's milliseconds: the styler keeps the
+    // neighbour-averaging stages out of these and off a guard band either side.
+    let mut protect_ms: Vec<(f64, f64)> = Vec::new();
     // Manual pieces, in the clip's milliseconds. Reported back so the styler
     // can keep the model off them (the output-domain intensity scale, and the
     // gap filler, whose whole job is to stamp rhythm over rows that look still
@@ -1899,8 +1911,19 @@ fn mixed_tracks(
             amount: sp.amount,
             travel: sp.travel,
             freq: sp.freq,
+            legacy: sp.legacy.unwrap_or(false),
         };
         mixed.borrow_rows(lo, hi, &plan);
+        // The piece's own rows, plus a guard band on each side, are kept off the
+        // stages that average a row against its neighbours. Without it, the
+        // passage on the far side of the seam gets dragged toward the one just
+        // generated -- which is exactly the "the model's rows near a generated
+        // piece look wrong" report (user call, 2026-11-28). The legacy path is
+        // left without a band on purpose: the first version had none, and its
+        // whole point in staying reachable is to be comparable as it was.
+        if !sp.legacy.unwrap_or(false) {
+            protect_ms.push((sp.lo_ms, sp.hi_ms));
+        }
     }
     // Each ordinary piece's own intensity, about its own mean. Handed BACK to
     // the styler rather than applied here: the level rows are upstream of
@@ -1923,7 +1946,7 @@ fn mixed_tracks(
         })
         .collect();
     let conf = mixed.conf.clone();
-    Ok((mixed, cap_x, cap_f0, conf, manual_ms, pieces))
+    Ok((mixed, cap_x, cap_f0, conf, manual_ms, pieces, protect_ms))
 }
 
 /// The tracks `b`'s model at `seed` would make, WITHOUT disturbing the
@@ -1961,7 +1984,7 @@ fn style_draft(
     params: &style::Params,
     pins: &[style::Action],
 ) -> Styled {
-    style_draft_with(d, man, params, pins, &d.tracks, &[], &[], &[], &[])
+    style_draft_with(d, man, params, pins, &d.tracks, &[], &[], &[], &[], &[])
 }
 
 /// `style_draft` on tracks the caller supplies instead of the draft's own --
@@ -1982,6 +2005,7 @@ fn style_draft_with(
     cap_f0: &[f64],
     manual_ms: &[crate::wave::ManualSpan],
     pieces: &[style::PieceScale],
+    protect_ms: &[(f64, f64)],
 ) -> Styled {
     let mut cfg = style_cfg(man, params);
     if !cap_x.is_empty() {
@@ -1989,6 +2013,7 @@ fn style_draft_with(
         cfg.amp_cap_f0_rows = cap_f0.to_vec();
     }
     cfg.manual_ms = style::manual_pairs(manual_ms);
+    cfg.protect_ms = protect_ms.to_vec();
     // Level styling is carrier-only: no event segmentation, no sub-frame
     // times, no forced apexes -- exactly jepa_infer's non-composed path.
     let (p, sub, force, filled, phase_runs) = match params.style {
@@ -5249,6 +5274,7 @@ mod retrack_tests {
                 amount: 1.0,
                 travel: 1.0,
                 freq: 1.0,
+                legacy: None,
             }],
             cuts_ms: Some(cuts1.clone()),
         };

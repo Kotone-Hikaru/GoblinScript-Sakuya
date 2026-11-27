@@ -632,5 +632,6 @@
   "page.tcp.live": "正在驱动 {url}",
   "page.tcp.failed": "连不上 {url} —— TEMU+ 开了监听吗？",
   "page.tcp.closed": "连接已断开",
-  "page.tcp.off": "未连接"
+  "page.tcp.off": "未连接",
+  "page.borrow.legacy": "旧版规则"
 }

@@ -643,6 +643,14 @@ pub struct BorrowPlan {
     /// How fast to walk the source window. 1 plays it at its own speed; above
     /// 1 packs it in tighter, so it wraps more often.
     pub freq: f64,
+    /// The first version of this feature, kept reachable so an author can see
+    /// what changed (user call, 2026-11-28). It writes the borrowed carrier
+    /// straight into `level`, which the composers then low-pass across the whole
+    /// clip -- so its reach is 15 rows past each seam -- and it leaves `rev`
+    /// alone, so the neighbour's shape lands on this piece's own vertices. Both
+    /// are the defects the current path exists to fix; `amount` also stops at 1
+    /// because extrapolation came later. Nothing new should set this.
+    pub legacy: bool,
 }
 
 impl Tracks {
@@ -722,7 +730,7 @@ impl Tracks {
         // vertices, which is the "same points, shifted" look the workbench
         // reported. Only valid when this track carries one and the piece is at
         // least one row long.
-        let borrow_rev = self.rev.is_some() && len > 0;
+        let borrow_rev = self.rev.is_some() && len > 0 && !plan.legacy;
         let mut rt = vec![0.0f64; len];
         let mut rb = vec![0.0f64; len];
         for i in 0..len {
@@ -775,11 +783,20 @@ impl Tracks {
         }
         // The borrowed carrier is offset-aligned onto the piece's own: row `lo`
         // is what the level head said this passage sits at, and a splice that
-        // ignored that would teleport the pen at the first row. Then it is
-        // stored beside the tracks, weighted by the same seam ramp as the
-        // strokes, for the composers to blend in after their low-pass.
+        // ignored that would teleport the pen at the first row.
         let lift = self.level[lo] - lv[0];
-        if self.borrow_level.len() != n {
+        // ... and where it GOES depends on which path this is.
+        //
+        // The current path stores it beside the tracks (`borrow_level` /
+        // `borrow_w`) for the composers to blend in after their low-pass. The
+        // legacy path writes `level` itself, exactly as the first version did:
+        // the whole-clip `box_same(level, kd)` then carries the change 15 rows
+        // past each seam, which is the fault it was kept around to demonstrate
+        // (user call, 2026-11-28).
+        if plan.legacy {
+            self.borrow_level = Vec::new();
+            self.borrow_w = Vec::new();
+        } else if self.borrow_level.len() != n {
             self.borrow_level = vec![0.0; n];
             self.borrow_w = vec![0.0; n];
         }
@@ -787,7 +804,13 @@ impl Tracks {
         // above 1 the difference is EXTRAPOLATED: at 2 the stroke travels twice
         // as far from the piece's own as the neighbour's does. That is the only
         // reading of "amount 150%" that is not a clamp pretending to be a knob.
-        let amount = plan.amount.clamp(0.0, MAX_BORROW_AMOUNT);
+        // The legacy path predates extrapolation, so it stops at a plain
+        // replacement.
+        let amount = if plan.legacy {
+            plan.amount.clamp(0.0, 1.0)
+        } else {
+            plan.amount.clamp(0.0, MAX_BORROW_AMOUNT)
+        };
         for i in 0..len {
             // Full strength in the middle, easing to nothing at each seam.
             let edge = i.min(len - 1 - i);
@@ -795,8 +818,12 @@ impl Tracks {
             let r = lo + i;
             self.vmarg[r] += t * (vm[i] - self.vmarg[r]);
             self.env[r] += t * (ev[i] - self.env[r]);
-            self.borrow_level[r] += t * (lv[i] + lift - self.borrow_level[r]);
-            self.borrow_w[r] = (self.borrow_w[r] + t).min(1.0);
+            if plan.legacy {
+                self.level[r] += t * (lv[i] + lift - self.level[r]);
+            } else {
+                self.borrow_level[r] += t * (lv[i] + lift - self.borrow_level[r]);
+                self.borrow_w[r] = (self.borrow_w[r] + t).min(1.0);
+            }
         }
         // The reversal head is written straight into the track: the decoder
         // reads it raw, no low-pass runs over it, so a borrowed row cannot reach
@@ -844,6 +871,18 @@ pub struct StyleCfg {
     /// What still applies is output-domain only: extrema, RDP, seams, and the
     /// speed cap -- the device's own limits, not the model's opinion.
     pub manual_ms: Vec<(f64, f64)>,
+    /// Rows that were GENERATED from their neighbours, in milliseconds on the
+    /// clip's clock. Empty = nothing was generated.
+    ///
+    /// A generated passage is somebody else's motion spliced into this one, so
+    /// the stages that drag a row toward its neighbours -- `depth_uniformize`'s
+    /// running median, `level_lock`'s ramp into free rows, the gap filler --
+    /// have no business reaching across its seams: the neighbour they would
+    /// average in is the passage the author just replaced. The guard band is
+    /// `DECODE_SMOOTH_S` on each side, which is exactly the reach of the
+    /// low-pass those stages exist to work with, so nothing outside the band can
+    /// carry an influence in (user call, 2026-11-28).
+    pub protect_ms: Vec<(f64, f64)>,
     /// The hedge curve's exponent.
     pub env_gain_p: f64,
     pub plat_thr: f64,
@@ -1759,6 +1798,40 @@ fn manual_rows(times: &[f64], spans: &[(f64, f64)], n: usize) -> Vec<(usize, usi
     out
 }
 
+/// Mark the rows a set of millisecond spans covers, as a per-row flag.
+///
+/// Same partition as `manual_rows`, plus a guard band of `DECODE_SMOOTH_S` on
+/// each side: that is the reach of the low-pass the model-reading stages work
+/// through, so a band that wide is exactly what it takes to keep a neighbour's
+/// influence from crossing a seam. Clamped to `n`, and a span already at a clip
+/// edge simply gets a band on the side that exists.
+fn blocked_rows(times: &[f64], spans: &[(f64, f64)], n: usize) -> Vec<bool> {
+    let mut out = vec![false; n];
+    if spans.is_empty() || n == 0 {
+        return out;
+    }
+    let hz = row_hz_of(times).unwrap_or(30.0);
+    let band = rows_at(DECODE_SMOOTH_S, hz, false);
+    for &(a, b) in spans {
+        let lo = times.partition_point(|&t| t < a).min(n).saturating_sub(band);
+        let hi = times
+            .partition_point(|&t| t < b)
+            .min(n)
+            .saturating_add(band)
+            .min(n);
+        if hi > lo {
+            out[lo..hi].fill(true);
+        }
+    }
+    out
+}
+
+/// Rows per second implied by the row clock, from its first few intervals.
+fn row_hz_of(times: &[f64]) -> Option<f64> {
+    let dt = times.windows(2).take(8).map(|w| w[1] - w[0]).find(|d| *d > 0.0)?;
+    Some(1000.0 / dt)
+}
+
 /// Stamp the hand-drawn rows back over the composed level.
 ///
 /// THE COVERAGE RULE. Every stage above this one reads the MODEL's heads --
@@ -1936,13 +2009,22 @@ fn level_lock(
     rail_track: bool,
     shift_cap: f64,
     fps: f64,
+    blocked: &[bool],
 ) -> Vec<f64> {
     let smooth = rows_at(LOCK_SMOOTH_S, fps, true);
     let edge = rows_at(LOCK_EDGE_S, fps, false);
     let n = p.len();
     let m = local_mean(p, smooth);
     let mut out = p.to_vec();
-    let free: Vec<bool> = kind.iter().map(|&k| k == 0).collect();
+    // A ramp row is borrowed from the free rows beside a dwell. A blocked row is
+    // never free to borrow: it is the guard band around a generated passage, and
+    // its whole job is to keep this lock from dragging the passage the author
+    // just replaced into the rows on the far side of the seam.
+    let free: Vec<bool> = kind
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| k == 0 && !blocked.get(i).copied().unwrap_or(false))
+        .collect();
     let mut claimed = vec![false; n]; // a ramp row is borrowed once
     for (a, b) in runs(&kind.iter().map(|&k| k != 0).collect::<Vec<_>>()) {
         let rail = if kind[a] > 0 { rail_hi } else { rail_lo };
@@ -2080,6 +2162,7 @@ fn depth_uniformize(
     force: &[(usize, i8)],
     kr: usize,
     prm: &DepthParams,
+    blocked: &[bool],
 ) -> Vec<f64> {
     let dose = prm.dose.clamp(0.0, 1.0);
     if dose <= 0.0 {
@@ -2087,6 +2170,18 @@ fn depth_uniformize(
     }
     let win_ms = prm.window_s.max(0.0) * 1000.0;
     let mut out = p.to_vec();
+    // Prefix count of blocked rows, so "is there a wall between rows x and y" is
+    // an O(1) question. A wall is a row in the guard band around a generated
+    // passage: the median below must not see vertices across one.
+    let rows = p.len();
+    let mut bpref = vec![0usize; rows + 1];
+    for i in 0..rows {
+        bpref[i + 1] = bpref[i] + usize::from(blocked.get(i).copied().unwrap_or(false));
+    }
+    let walled = |x: usize, y: usize| -> bool {
+        let (a, b) = if x <= y { (x, y) } else { (y, x) };
+        bpref[(b + 1).min(rows)] > bpref[(a + 1).min(rows)]
+    };
     for w in shot_edges.windows(2) {
         let (lo, hi) = (w[0], w[1]);
         if hi - lo < 3 {
@@ -2130,13 +2225,24 @@ fn depth_uniformize(
         for pol in [1i8, -1i8] {
             let pts: Vec<usize> =
                 ext.iter().filter(|&&(_, q)| q == pol).map(|&(i, _)| i).collect();
-            let (mut a, mut b) = (0usize, 0usize);
-            for &i in &pts {
+            for (k, &i) in pts.iter().enumerate() {
                 let t = times_ms[lo + i];
-                while times_ms[lo + pts[a]] < t - win_ms / 2.0 {
-                    a += 1;
+                // Grow the window outward from this vertex and STOP at a guard
+                // band: a median taken across one would let the passage the
+                // author just generated pull the correct rows on the far side of
+                // the seam toward itself (user call, 2026-11-28).
+                let mut a = k;
+                while a > 0
+                    && times_ms[lo + pts[a - 1]] >= t - win_ms / 2.0
+                    && !walled(lo + pts[a - 1], lo + pts[a])
+                {
+                    a -= 1;
                 }
-                while b < pts.len() && times_ms[lo + pts[b]] <= t + win_ms / 2.0 {
+                let mut b = k + 1;
+                while b < pts.len()
+                    && times_ms[lo + pts[b]] <= t + win_ms / 2.0
+                    && !walled(lo + pts[b - 1], lo + pts[b])
+                {
                     b += 1;
                 }
                 let mut w: Vec<f64> = pts[a..b].iter().map(|&j| seg[j]).collect();
@@ -2157,6 +2263,20 @@ fn depth_uniformize(
             anchors.push((i, seg[i], target[i]));
         }
         anchors.push((n - 1, seg[n - 1], seg[n - 1]));
+        // The guard band's own rows are fixed anchors too: the remap of the run
+        // that contains one must not stretch it, or the band would be "protected"
+        // from the median and dragged by the interpolation instead.
+        for i in 0..n {
+            let here = blocked.get(lo + i).copied().unwrap_or(false);
+            let edge = i == 0 || i + 1 == n
+                || blocked.get(lo + i - 1).copied().unwrap_or(false) != here
+                || blocked.get(lo + i + 1).copied().unwrap_or(false) != here;
+            if here && edge {
+                anchors.push((i, seg[i], seg[i]));
+            }
+        }
+        anchors.sort_by_key(|&(i, _, _)| i);
+        anchors.dedup_by_key(|&mut (i, _, _)| i);
         // remap each run onto its relocated endpoints
         for aw in anchors.windows(2) {
             let (i0, o0, t0) = aw[0];
@@ -2569,12 +2689,17 @@ pub fn compose(
         }
     }
 
+    // Rows in the guard band around a generated passage. Nothing downstream may
+    // reach across them: they are the seam the author just replaced, and every
+    // stage below works by dragging a row toward its neighbours.
+    let blocked = blocked_rows(times_ms, &cfg.protect_ms, t.vmarg.len());
+
     // Regularize stroke depth toward the per-polarity running median (identity
     // when off). Runs on the built strokes but BEFORE the plateau park:
     // uniformity moves stroke reach, the level lock then pins the dwells --
     // reordering would let uniformity drag a just-parked plateau off its rail.
     let p = if let Some(dp) = &cfg.depth {
-        depth_uniformize(&p, shot_edges, times_ms, &force_kind, kr, dp)
+        depth_uniformize(&p, shot_edges, times_ms, &force_kind, kr, dp, &blocked)
     } else {
         p
     };
@@ -2586,22 +2711,18 @@ pub fn compose(
     let p = match (&dk, &band) {
         (Some(k), Some((blo, bhi))) => level_lock(
             &p, k, blo, bhi, t.plat.as_ref(), cfg.plat_soft, cfg.plat_rail_track,
-            cfg.plat_shift_cap, cfg.fps,
+            cfg.plat_shift_cap, cfg.fps, &blocked,
         ),
         (Some(k), None) => level_lock(
             &p, k, &lv, &lv, t.plat.as_ref(), cfg.plat_soft, cfg.plat_rail_track,
-            cfg.plat_shift_cap, cfg.fps,
+            cfg.plat_shift_cap, cfg.fps, &blocked,
         ),
         (None, _) => p,
     };
     let (mut p, filled) = if cfg.filler_gap_s > 0.0 {
-        fill_still_spans(
-            &p,
-            &t.vmarg,
-            &t.level,
-            cfg,
-            &manual_rows(times_ms, &cfg.manual_ms, t.vmarg.len()),
-        )
+        let mut protect = manual_rows(times_ms, &cfg.manual_ms, t.vmarg.len());
+        protect.extend(manual_rows(times_ms, &cfg.protect_ms, t.vmarg.len()));
+        fill_still_spans(&p, &t.vmarg, &t.level, cfg, &protect)
     } else {
         (p, Vec::new())
     };
@@ -2817,21 +2938,26 @@ pub fn compose_level_full(
     // depth uniformity regularizes whatever strokes exist, and the filler
     // replaces detected gaps in whatever carrier is there. Same order as
     // compose (uniformity first, filler last); level has no lock between.
+    let blocked = blocked_rows(times_ms, &cfg.protect_ms, t.vmarg.len());
     let p = if let Some(dp) = &cfg.depth {
         // the carrier has no event segmentation, so its written vertices ARE
         // the smoothed flips -- there are no called apexes to add
-        depth_uniformize(&p, shot_edges, times_ms, &[], rows_at(cfg.rev_smooth_s, cfg.fps, true), dp)
+        depth_uniformize(
+            &p,
+            shot_edges,
+            times_ms,
+            &[],
+            rows_at(cfg.rev_smooth_s, cfg.fps, true),
+            dp,
+            &blocked,
+        )
     } else {
         p
     };
     let (mut p, filled) = if cfg.filler_gap_s > 0.0 {
-        fill_still_spans(
-            &p,
-            &t.vmarg,
-            &t.level,
-            cfg,
-            &manual_rows(times_ms, &cfg.manual_ms, t.vmarg.len()),
-        )
+        let mut protect = manual_rows(times_ms, &cfg.manual_ms, t.vmarg.len());
+        protect.extend(manual_rows(times_ms, &cfg.protect_ms, t.vmarg.len()));
+        fill_still_spans(&p, &t.vmarg, &t.level, cfg, &protect)
     } else {
         (p, Vec::new())
     };
@@ -3893,8 +4019,8 @@ mod tests {
         let p = vec![50.0; n];
         let kind: Vec<i8> = (0..n).map(|i| if (20..40).contains(&i) { 1 } else { 0 }).collect();
         let rail = vec![90.0; n];
-        let free = level_lock(&p, &kind, &rail, &rail, None, (0.0, 0.0), false, 0.0, 30.0);
-        let capped = level_lock(&p, &kind, &rail, &rail, None, (0.0, 0.0), false, 25.0, 30.0);
+        let free = level_lock(&p, &kind, &rail, &rail, None, (0.0, 0.0), false, 0.0, 30.0, &[]);
+        let capped = level_lock(&p, &kind, &rail, &rail, None, (0.0, 0.0), false, 25.0, 30.0, &[]);
         assert!((free[30] - 90.0).abs() < 1e-9); // full walk to the rail
         assert!((capped[30] - 75.0).abs() < 1e-9); // 50 + 25, no further
         assert!(capped.iter().zip(&p).all(|(c, o)| (c - o).abs() <= 25.0 + 1e-9));
@@ -4038,6 +4164,7 @@ mod tests {
             amount: 1.0,
             travel: 1.0,
             freq: 1.0,
+            legacy: false,
         };
         let p2 = super::BorrowPlan {
             before: Some((90, 105)),
@@ -4045,6 +4172,7 @@ mod tests {
             amount: 1.0,
             travel: 1.0,
             freq: 1.0,
+            legacy: false,
         };
         assert!(b.borrow_rows(60, 75, &p1));
         assert!(b.borrow_rows(105, 120, &p2));
@@ -4117,6 +4245,7 @@ mod tests {
             amp_cap_f0: 0.0,
             amp_cap_x_rows: Vec::new(),
             manual_ms: Vec::new(),
+            protect_ms: Vec::new(),
             amp_cap_f0_rows: Vec::new(),
             env_gain_p: 0.6,
             plat_thr: 0.5,
@@ -4336,7 +4465,7 @@ mod tests {
         let p = vec![50.0, 80.0, 50.0, 30.0, 50.0, 90.0, 50.0];
         let t: Vec<f64> = (0..p.len()).map(|i| i as f64 * 66.67).collect();
         let out =
-            depth_uniformize(&p, &[0, p.len()], &t, &[], 3, &DepthParams { dose: 0.0, window_s: 10.0 });
+            depth_uniformize(&p, &[0, p.len()], &t, &[], 3, &DepthParams { dose: 0.0, window_s: 10.0 }, &[]);
         assert_eq!(out, p);
     }
 
@@ -4353,7 +4482,7 @@ mod tests {
         } // rows: peak 80 @4, valley 50 @8, peak 100 @12
         let t: Vec<f64> = (0..p.len()).map(|i| i as f64 * 66.67).collect();
         let n = p.len();
-        let out = depth_uniformize(&p, &[0, n], &t, &[], 3, &DepthParams { dose: 1.0, window_s: 1000.0 });
+        let out = depth_uniformize(&p, &[0, n], &t, &[], 3, &DepthParams { dose: 1.0, window_s: 1000.0 }, &[]);
         assert!((out[4] - 90.0).abs() < 1e-6, "top1: {out:?}");
         assert!((out[12] - 90.0).abs() < 1e-6, "top2: {out:?}");
         assert!((out[8] - 50.0).abs() < 1e-6, "valley: {out:?}");
@@ -4382,10 +4511,58 @@ mod tests {
         } // peaks at rows 4, 12, 20
         let t: Vec<f64> = (0..p.len()).map(|i| i as f64 * 66.67).collect();
         let n = p.len();
-        let out = depth_uniformize(&p, &[0, n], &t, &[], 3, &DepthParams { dose: 1.0, window_s: 1000.0 });
+        let out = depth_uniformize(&p, &[0, n], &t, &[], 3, &DepthParams { dose: 1.0, window_s: 1000.0 }, &[]);
         assert!((out[4] - 80.0).abs() < 1e-6, "matched top moved: {out:?}");
         assert!((out[12] - 80.0).abs() < 1e-6, "matched top moved: {out:?}");
         assert!((out[20] - 80.0).abs() < 1e-6, "outlier not aligned: {out:?}");
+    }
+
+    /// The guard band around a generated passage is a WALL for the depth
+    /// median: a piece the author just generated must not pull the correct
+    /// rows on the far side of its seam toward its own depth (user call,
+    /// 2026-11-28).
+    ///
+    /// Same fixture as the outlier test -- tops at 80, 80 and 100 in one
+    /// window -- with a band between the last two. Without the band the 100
+    /// comes down to the pair's 80; with it each island keeps its own answer,
+    /// which is the point: the piece is somebody else's motion spliced in, and
+    /// the stages that even things out have no business crossing its seam.
+    #[test]
+    fn a_guard_band_stops_the_depth_median_at_the_seam() {
+        let mut p = vec![50.0];
+        for (a, b) in [
+            (50.0, 80.0),
+            (80.0, 50.0),
+            (50.0, 80.0),
+            (80.0, 50.0),
+            (50.0, 100.0),
+            (100.0, 50.0),
+        ] {
+            for j in 1..=4 {
+                p.push(a + (b - a) * j as f64 / 4.0);
+            }
+        } // peaks at rows 4, 12, 20
+        let t: Vec<f64> = (0..p.len()).map(|i| i as f64 * 66.67).collect();
+        let n = p.len();
+        let prm = DepthParams { dose: 1.0, window_s: 1000.0 };
+
+        // no band: the 100 is evened down to the pair, which is the behaviour
+        // the band exists to stop at a seam
+        let open = depth_uniformize(&p, &[0, n], &t, &[], 3, &prm, &[]);
+        assert!((open[20] - 80.0).abs() < 1e-6, "no band, nothing evened: {open:?}");
+
+        // a band on the ramps between the second and the third top
+        let mut blocked = vec![false; n];
+        for b in &mut blocked[14..=18] {
+            *b = true;
+        }
+        let out = depth_uniformize(&p, &[0, n], &t, &[], 3, &prm, &blocked);
+        assert!((out[4] - 80.0).abs() < 1e-6, "first top moved: {out:?}");
+        assert!((out[12] - 80.0).abs() < 1e-6, "second top moved: {out:?}");
+        assert!(
+            (out[20] - 100.0).abs() < 1e-6,
+            "the far side of the band was pulled to the near side: {out:?}"
+        );
     }
 
     /// A one-row spike is a reversal the 3-row box CANNOT see -- it reaches the
@@ -4413,11 +4590,11 @@ mod tests {
 
         // undeclared, the spike is invisible: the shot around it evens out and
         // the one stroke that most needed evening keeps its own reach
-        let blind = depth_uniformize(&p, &[0, n], &t, &[], 3, &prm);
+        let blind = depth_uniformize(&p, &[0, n], &t, &[], 3, &prm, &[]);
         assert!((blind[9] - 100.0).abs() < 1e-6, "apex seen without a call: {blind:?}");
 
         // declared, it joins the top median (80, 80, 100) and comes to it
-        let out = depth_uniformize(&p, &[0, n], &t, &[(9, 1)], 3, &prm);
+        let out = depth_uniformize(&p, &[0, n], &t, &[(9, 1)], 3, &prm, &[]);
         assert!((out[9] - 80.0).abs() < 1e-6, "apex not regularized: {out:?}");
         assert!((out[4] - 80.0).abs() < 1e-6, "slow top dragged: {out:?}");
         assert!((out[13] - 80.0).abs() < 1e-6, "slow top dragged: {out:?}");
@@ -4442,7 +4619,7 @@ mod tests {
         let n = p.len();
         let t: Vec<f64> = (0..n).map(|i| i as f64 * 33.33).collect();
         let out =
-            depth_uniformize(&p, &[0, n], &t, &[], 3, &DepthParams { dose: 1.0, window_s: 1000.0 });
+            depth_uniformize(&p, &[0, n], &t, &[], 3, &DepthParams { dose: 1.0, window_s: 1000.0 }, &[]);
         // both tops land on the median
         assert!((out[4] - 79.0).abs() < 1e-6, "shallow top: {out:?}");
         assert!((out[11] - 79.0).abs() < 1e-6, "deep top: {out:?}");
@@ -4787,7 +4964,7 @@ mod borrow_tests {
 
     fn plan(before: Option<(usize, usize)>, after: Option<(usize, usize)>,
             amount: f64, travel: f64, freq: f64) -> BorrowPlan {
-        BorrowPlan { before, after, amount, travel, freq }
+        BorrowPlan { before, after, amount, travel, freq, legacy: false }
     }
 
     /// The ramp is the point: full strength is reached on the 4th row from a
