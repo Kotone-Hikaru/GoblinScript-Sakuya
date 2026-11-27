@@ -2458,6 +2458,14 @@ pub fn compose(
             }
         });
 
+    // Where the generated pieces sit, in rows. The event decode inside the
+    // shot loop reads a whole shot as ONE sequence, and that sequence IS the
+    // segmentation -- so a piece whose borrowed `rev` disagrees with its
+    // neighbours at the seam would re-derive every vertex in the shot,
+    // including the correct piece sitting between two of them. The decode is
+    // therefore cut at the pieces' own edges, so each writer's rhythm stays
+    // inside its own rows.
+    let piece_rows = manual_rows(times_ms, &cfg.protect_ms, t.vmarg.len());
     for w in shot_edges.windows(2) {
         let (lo, hi) = (w[0], w[1]);
         let n = hi - lo;
@@ -2478,40 +2486,68 @@ pub fn compose(
         let mut seg_dirs: Option<Vec<f64>> = None;
         if viterbi {
             let (rt_g, rb_g) = t.rev.as_ref().unwrap();
-            let (vrows, vkinds) = match &gap_var {
-                Some(gv) => alternating_events_rows_var(
-                    &rt_g[lo..hi],
-                    &rb_g[lo..hi],
-                    &rev_bias[lo..hi],
-                    &gv[lo..hi],
-                ),
-                None => alternating_events_rows(
-                    &rt_g[lo..hi],
-                    &rb_g[lo..hi],
-                    &rev_bias[lo..hi],
-                    cfg.rev_gap_rows,
-                ),
-            };
-            let keep: Vec<usize> = vrows
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|&(_, r)| r + 1 <= n - 1)
-                .map(|(i, _)| i)
-                .collect();
-            if let Some(ph) = phase.as_mut() {
-                let rows: Vec<usize> = keep.iter().map(|&i| vrows[i]).collect();
-                let kinds: Vec<i8> = keep.iter().map(|&i| vkinds[i]).collect();
-                ph.add(&rows, &kinds, &sign_track(&s), cfg.fps);
+            // The decode reads a whole shot as ONE sequence, and that sequence
+            // IS the segmentation. A generated piece brings its own reversal
+            // events -- `borrow_rows` swaps them in -- so leaving it inside the
+            // shot's single decode moves every vertex in that shot, the correct
+            // writing on the far side of the piece included. Each writer's rows
+            // are therefore decoded on their own; `cross` and `seg_dirs` are
+            // merged back in row order, which is what the stroke loop consumes.
+            let mut edges: Vec<usize> = vec![0, n];
+            for &(a, b) in &piece_rows {
+                for r in [a, b] {
+                    if r > lo && r < hi {
+                        edges.push(r - lo);
+                    }
+                }
             }
-            if !keep.is_empty() {
-                cross = keep.iter().map(|&i| vrows[i] + 1).collect();
-                let mut d: Vec<f64> =
-                    keep.iter().map(|&i| vkinds[i] as f64).collect();
-                d.push(-(vkinds[*keep.last().unwrap()] as f64));
+            edges.sort_unstable();
+            edges.dedup();
+            let mut events: Vec<(usize, i8)> = Vec::new();
+            for w in edges.windows(2) {
+                let (c0, c1) = (w[0], w[1]);
+                if c1 <= c0 + 1 {
+                    continue;
+                }
+                let (vrows, vkinds) = match &gap_var {
+                    Some(gv) => alternating_events_rows_var(
+                        &rt_g[lo + c0..lo + c1],
+                        &rb_g[lo + c0..lo + c1],
+                        &rev_bias[lo + c0..lo + c1],
+                        &gv[lo + c0..lo + c1],
+                    ),
+                    None => alternating_events_rows(
+                        &rt_g[lo + c0..lo + c1],
+                        &rb_g[lo + c0..lo + c1],
+                        &rev_bias[lo + c0..lo + c1],
+                        cfg.rev_gap_rows,
+                    ),
+                };
+                let m = c1 - c0;
+                let keep: Vec<usize> = vrows
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(_, r)| r + 1 <= m - 1)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(ph) = phase.as_mut() {
+                    let rows: Vec<usize> = keep.iter().map(|&i| vrows[i]).collect();
+                    let kinds: Vec<i8> = keep.iter().map(|&i| vkinds[i]).collect();
+                    ph.add(&rows, &kinds, &sign_track(&s[c0..c1]), cfg.fps);
+                }
+                for &i in &keep {
+                    events.push((c0 + vrows[i], vkinds[i]));
+                }
+            }
+            events.sort_by_key(|&(r, _)| r);
+            if !events.is_empty() {
+                cross = events.iter().map(|&(r, _)| r + 1).collect();
+                let mut d: Vec<f64> = events.iter().map(|&(_, k)| k as f64).collect();
+                d.push(-(events.last().unwrap().1 as f64));
                 seg_dirs = Some(d);
                 force.extend(cross.iter().map(|&c| lo + c - 1));
-                force_kind.extend(keep.iter().map(|&i| (lo + vrows[i], vkinds[i])));
+                force_kind.extend(events.iter().map(|&(r, k)| (lo + r, k)));
             }
         }
         // Re-localize each crossing to the reversal-event head's local
@@ -5193,13 +5229,6 @@ mod borrow_tests {
                 "vmarg {}", t.vmarg[19]);
     }
 
-    /// The end the author actually cares about: the vertices land somewhere
-    /// else. A generated passage handing back the same points at the same times
-    /// is the complaint this whole path exists to answer, and it is what a
-    /// borrow that skips `rev` produces -- the motion is the neighbour's but
-    /// `compose` takes its segmentation from `rev` (the shipped bundle sets
-    /// `rev_source = "viterbi"`), so every crossing stays exactly where the
-    /// misread passage had it.
     #[test]
     fn a_generated_piece_puts_its_vertices_somewhere_else() {
         let n = 120;
