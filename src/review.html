@@ -573,6 +573,9 @@
     position: absolute; top: 7px; height: 4px; left: 0; width: 0; z-index: 1;
     background: var(--hi-bright); pointer-events: none;
   }
+  /* A tag on one end of a sampling window. Two numbers sit on one row there,
+     so each needs a word in front of it or the row is two anonymous boxes. */
+  .bbtag { flex: 0 0 auto; font-size: 10px; color: var(--ink-soft); }
   .wpnote { font-size: 10px; color: var(--ink-soft); opacity: .8; }
   .wpnote.bad { color: var(--danger-soft); opacity: 1; }
   #wpThumb { width: 100%; height: 70px; border: 1px solid var(--edge);
@@ -856,16 +859,30 @@
             <span class="unlockopt"><input type="radio" name="bbSide" id="bbSide2">
               <label for="bbSide2" data-t="page.borrow.both">both, crossfaded</label></span>
           </div>
+          <!-- Each side is a WINDOW with two ends, not a length with one. A
+               length alone pins one end to the seam, so nudging it slid the
+               other end across a stroke and the fill came out flat -- the
+               author could see the wrong end and had no control that moved it.
+               Both ends are counted the SAME way on both sides: seconds away
+               from the seam, so a handle means one thing wherever it appears.
+               The step is a hundredth because a stroke is 0.2-0.5 s and the
+               two ends have to be placeable between the same pair of them. -->
           <div class="wprow">
-            <label for="bbBefore" data-t="page.borrow.sec">s before</label>
-            <input id="bbBefore" class="wpnum" type="number" min="0" max="10" step="0.05">
-            <input id="bbBeforeS" class="wpslider" type="range" min="0" max="10" step="0.05">
+            <label data-t="page.borrow.sec">s before</label>
+            <span class="bbtag" data-t="page.borrow.near">near</span>
+            <input id="bbBeforeNear" class="wpnum" type="number" min="0" max="10" step="0.01">
+            <span class="bbtag" data-t="page.borrow.far">far</span>
+            <input id="bbBeforeFar" class="wpnum" type="number" min="0" max="10" step="0.01">
           </div>
+          <div class="wprow"><div id="bbDualB" class="wpdup"></div></div>
           <div class="wprow">
-            <label for="bbAfter" data-t="page.borrow.sec2">s after</label>
-            <input id="bbAfter" class="wpnum" type="number" min="0" max="10" step="0.05">
-            <input id="bbAfterS" class="wpslider" type="range" min="0" max="10" step="0.05">
+            <label data-t="page.borrow.sec2">s after</label>
+            <span class="bbtag" data-t="page.borrow.near">near</span>
+            <input id="bbAfterNear" class="wpnum" type="number" min="0" max="10" step="0.01">
+            <span class="bbtag" data-t="page.borrow.far">far</span>
+            <input id="bbAfterFar" class="wpnum" type="number" min="0" max="10" step="0.01">
           </div>
+          <div class="wprow"><div id="bbDualA" class="wpdup"></div></div>
           <div class="wprow">
             <label for="bbAmount" data-t="page.borrow.amount">amount</label>
             <input id="bbAmount" class="wpnum" type="number" min="0" max="200" step="5">
@@ -2330,6 +2347,7 @@ addEventListener('resize', () => {
   // a window that was parked in the corner of a bigger screen has to come back
   // into view rather than sit half outside the new one
   if ($('tcpPanel') && !$('tcpPanel').hidden) tcpPlace();
+  borrowPaintEnds();
 });
 
 // the one disclosure: every group's raw numbers in place, folded away by default
@@ -4466,16 +4484,26 @@ function setSegModel(i, model) {
  *  stored windows are absolute milliseconds, so they end up pointing at the
  *  wrong footage, and nothing else in this panel re-measures them. */
 function freezeBorrow(s, fromPanel) {
-  const from = (id, side) => {
-    const box = fromPanel ? $(id) : null;
-    return box ? borrowLenValue(box.value) : borrowLenOf(s, side);
+  const from = (which) => {
+    const cur = borrowEnds(s, which);
+    if (!fromPanel) return cur;
+    const pre = which === 'before' ? 'bbBefore' : 'bbAfter';
+    const farBox = $(pre + 'Far');
+    const nearBox = $(pre + 'Near');
+    return {
+      far: farBox ? borrowLenValue(farBox.value) : cur.far,
+      near: nearBox ? borrowLenValue(nearBox.value) : cur.near,
+    };
   };
+  const b = from('before');
+  const a = from('after');
   const w = {
-    before: borrowWindow(s, 'before', from('bbBefore', 'before')),
-    after: borrowWindow(s, 'after', from('bbAfter', 'after')),
+    before: borrowWindow(s, 'before', b.far, b.near),
+    after: borrowWindow(s, 'after', a.far, a.near),
   };
   s.refBefore = w.before;
   s.refAfter = w.after;
+  borrowPaintEnds();
   return w;
 }
 /** This piece's own intensity, 0-5. Off the model's OUTPUT rather than off an
@@ -4979,61 +5007,226 @@ function borrowSide(s) {
   const k = Number(s && s.side);
   return (k === 0 || k === 1 || k === 2) ? k : 2;
 }
-/** How long a window asks to be, in seconds, when nothing says otherwise.
- *  A piece is usually the stretch the razor cut out, and a second and a half of
- *  the neighbour either side is enough to carry its rhythm without reaching so
- *  far back that the footage has nothing to do with it any more. The fields hold
- *  the number; this is only what they start on. */
-const BORROW_DEF_LEN = 1.5;
-/** What the two length sliders can reach. The fields go past it: an author who
- *  types 12 means 12, and the number is what the piece actually reads -- the
- *  slider is only one way to say it. */
+/** How far a window reaches when nothing says otherwise, in seconds away from
+ *  the seam. A piece is usually the stretch the razor cut out, and a second and
+ *  a half of the neighbour either side is enough to carry its rhythm without
+ *  reaching so far back that the footage has nothing to do with it any more. */
+const BORROW_DEF_FAR = 1.5;
+/** Where the other end of that window starts: right at the seam. */
+const BORROW_DEF_NEAR = 0;
+/** The shortest window worth reading. Under a quarter second it is one stroke,
+ *  which makes the piece a stutter -- worse than not borrowing at all. */
+const BORROW_MIN_LEN = 0.25;
+/** What the two handles can reach. The fields go past it: an author who types
+ *  12 means 12, and the number is what the piece actually reads -- the slider
+ *  is only one way to say it. */
 const BORROW_MAX_LEN = 10;
-/** The hardest number a length field will take at all, typed or dragged. Ten
+/** The hardest number a window field will take at all, typed or dragged. Ten
  *  seconds a side is already a whole shot; past this the "neighbour" is some
  *  other part of the footage and reading it is not generating a fill. */
 const BORROW_HARD_LEN = 60;
+/** The finest step the window fields take. A stroke runs 0.2-0.5 s, so an end
+ *  has to be placeable to about a hundredth of a second -- at a twentieth the
+ *  author is choosing between two settings that both cut through a stroke. */
+const BORROW_STEP = 0.01;
 /** The top of `amount`, in multiples of "be the neighbour" -- mirrors
  *  `style::MAX_BORROW_AMOUNT` on the server, which clamps to the same number. */
 const BORROW_MAX_AMOUNT = 2;
 
-/** The window a piece says it wants on one side, in milliseconds, or null when
- *  that side cannot be read at all: the seam is at the clip's own edge, or the
- *  neighbour left is under a quarter second (a window that short would make the
- *  piece a stutter of one stroke, which is worse than not borrowing it).
+/** The two ends of one side's window, in seconds away from the seam: `far` is
+ *  the end further from the piece, `near` the end nearer to it.
+ *
+ *  Read back out of the STORED window, which is absolute milliseconds -- that
+ *  is what the server keeps, and deriving one length from it instead would
+ *  throw away the one thing the author just spent a gesture placing. */
+function borrowEnds(s, which) {
+  const edge = which === 'before' ? s.lo : s.hi;
+  const r = which === 'before' ? s.refBefore : s.refAfter;
+  if (!r) return { far: BORROW_DEF_FAR, near: BORROW_DEF_NEAR };
+  const d0 = which === 'before' ? edge - r[0] : r[0] - edge;
+  const d1 = which === 'before' ? edge - r[1] : r[1] - edge;
+  return { far: Math.max(d0, d1) / 1000, near: Math.min(d0, d1) / 1000 };
+}
+/** The stretch a piece would read on one side, in the clip's own clock, from a
+ *  pair of handle positions. Null only when that side has nothing left to read:
+ *  the seam sits on the clip's own edge.
  *
  *  What it ASKS for and what it GETS are not the same thing. Near the ends of a
- *  clip the neighbour is shorter than the field asks for, and taking the shorter
+ *  clip the neighbour is shorter than the fields ask for, and taking the shorter
  *  one is the whole point -- the first piece of a clip has its entire neighbour
  *  behind it, and refusing it because the piece in front happens to be the same
  *  length would leave the one piece most likely to need this with nothing to
- *  read. So each side takes `min(wanted, available)`. */
-function borrowWindow(s, which, secs) {
+ *  read. So the far end takes `min(wanted, available)` and the near end follows
+ *  it in, which is why the pair is ordered rather than trusted. */
+function borrowWindow(s, which, far, near) {
+  if (!s) return null;
   const dur = spanDur(state && state.clips[cur]);
-  const want = Math.min(BORROW_HARD_LEN, Math.max(0, Number(secs) || 0)) * 1000;
-  if (which === 'before') {
-    const back = Math.min(want, s.lo);
-    return (back >= 250) ? [s.lo - back, s.lo] : null;
-  }
-  const fwd = Math.min(want, dur - s.hi);
-  return (fwd >= 250) ? [s.hi, s.hi + fwd] : null;
+  const room = which === 'before' ? s.lo : dur - s.hi;
+  if (room < BORROW_MIN_LEN * 1000) return null;
+  const farS = borrowLenValue(far);
+  const nearS = borrowLenValue(near);
+  const a = Math.min(room, Math.max(BORROW_MIN_LEN, farS) * 1000);
+  const b = Math.min(a - BORROW_MIN_LEN * 1000,
+                     Math.max(0, Math.min(nearS, farS - BORROW_MIN_LEN)) * 1000);
+  return which === 'before' ? [s.lo - a, s.lo - b] : [s.hi + b, s.hi + a];
 }
-/** The length in force on one side: the frozen window's own span, or the value
- *  the field would open on. After a razor cut the piece is a different length,
- *  so a stored number is the only thing that can honestly say what is being
- *  read -- and it is what the field shows. */
-function borrowLenOf(s, which) {
-  const r = which === 'before' ? s.refBefore : s.refAfter;
-  return r ? (r[1] - r[0]) / 1000 : BORROW_DEF_LEN;
-}
-/** The two windows this piece would read right now, at the lengths the panel
+/** The two windows this piece would read right now, at the numbers the panel
  *  shows. Used for the readout and for the peek overlay -- never for the value
  *  the server sees, which is the pair stored on the span. */
 function borrowWindows(s) {
+  const b = borrowEnds(s, 'before');
+  const a = borrowEnds(s, 'after');
   return {
-    before: borrowWindow(s, 'before', borrowLenOf(s, 'before')),
-    after: borrowWindow(s, 'after', borrowLenOf(s, 'after')),
+    before: borrowWindow(s, 'before', b.far, b.near),
+    after: borrowWindow(s, 'after', a.far, a.near),
   };
+}
+/** Put a pair of ends on the span and let the side follow the windows: a piece
+ *  reading both sides is a crossfade, one reading a single side is that side. */
+function setBorrowEnds(s, which, far, near) {
+  const w = borrowWindow(s, which, far, near);
+  if (which === 'before') s.refBefore = w; else s.refAfter = w;
+  if (s.refBefore && s.refAfter) s.side = 2;
+  else if (s.refBefore) s.side = 0;
+  else if (s.refAfter) s.side = 1;
+}
+/** A sampling slider is DRAWN, like the wave band's own: its track is
+ *  0..BORROW_MAX_LEN seconds and a hand's centre runs from half a hand in to
+ *  half a hand from the end, so one owner has every pixel and one hit test can
+ *  say which end was taken. */
+let borrowDrag = null;
+function borrowX(sec, w) {
+  const span = Math.max(1, w - DUP_THUMB);
+  return DUP_THUMB / 2 + (Math.max(0, Math.min(BORROW_MAX_LEN, sec)) / BORROW_MAX_LEN) * span;
+}
+function borrowSec(px, w) {
+  const span = Math.max(1, w - DUP_THUMB);
+  const v = ((px - DUP_THUMB / 2) / span) * BORROW_MAX_LEN;
+  return Math.max(0, Math.min(BORROW_MAX_LEN, v));
+}
+function borrowPaintEnds() {
+  const s = borrowSeg();
+  for (const which of ['before', 'after']) {
+    const host = $('bbDual' + (which === 'before' ? 'B' : 'A'));
+    if (!host) continue;
+    const fill = host.querySelector('.wpfill');
+    const hFar = host.querySelector('.wphand[data-hand="far"]');
+    const hNear = host.querySelector('.wphand[data-hand="near"]');
+    if (!fill || !hFar || !hNear) continue;
+    const w = host.getBoundingClientRect().width;
+    if (!w) continue;
+    const live = (borrowDrag && borrowDrag.which === which) ? borrowDrag.ends
+      : (s ? borrowEnds(s, which) : { far: BORROW_DEF_FAR, near: BORROW_DEF_NEAR });
+    const a = borrowX(live.near, w), b = borrowX(live.far, w);
+    hNear.style.left = a + 'px';
+    hFar.style.left = b + 'px';
+    fill.style.left = a + 'px';
+    fill.style.width = Math.max(0, b - a) + 'px';
+  }
+}
+/** Wire one side's drawn slider. Drag moves the hands and paints the peek
+ *  overlay; the span is written once, on release -- a slider that posted on
+ *  every pixel would re-compose the script a hundred times for one gesture. */
+function borrowDual(which) {
+  const host = $('bbDual' + (which === 'before' ? 'B' : 'A'));
+  if (!host) return;
+  const fill = document.createElement('div');
+  fill.className = 'wpfill';
+  const hFar = document.createElement('div');
+  hFar.className = 'wphand';
+  hFar.dataset.hand = 'far';
+  const hNear = document.createElement('div');
+  hNear.className = 'wphand';
+  hNear.dataset.hand = 'near';
+  host.append(hNear, hFar, fill);
+  const boxes = () => which === 'before'
+    ? { far: $('bbBeforeFar'), near: $('bbBeforeNear') }
+    : { far: $('bbAfterFar'), near: $('bbAfterNear') };
+  const read = () => {
+    const s = borrowSeg();
+    return s ? borrowEnds(s, which) : { far: BORROW_DEF_FAR, near: BORROW_DEF_NEAR };
+  };
+  const write = (far, near) => {
+    const bx = boxes();
+    if (bx.far) bx.far.value = far.toFixed(2);
+    if (bx.near) bx.near.value = near.toFixed(2);
+  };
+  const showPeek = (far, near) => {
+    const s = borrowSeg();
+    if (!s) return;
+    const w = borrowWindow(s, which, far, near);
+    borrowPeek = w ? [w] : [];
+    invalidate();
+  };
+  const clearPeek = () => { if (borrowPeek.length) { borrowPeek = []; invalidate(); } };
+  host.onpointerdown = e => {
+    const s = borrowSeg();
+    if (!s) return;
+    const box = host.getBoundingClientRect();
+    const x = e.clientX - box.left;
+    const held = read();
+    const grabR = DUP_THUMB / 2 + 2;
+    const xa = borrowX(held.near, box.width), xb = borrowX(held.far, box.width);
+    const grab = (Math.abs(x - xa) <= grabR) ? 'near'
+      : (Math.abs(x - xb) <= grabR) ? 'far' : 'band';
+    borrowDrag = { which, grab, x0: e.clientX, far0: held.far, near0: held.near, ends: held };
+    try { host.setPointerCapture(e.pointerId); } catch (err) { /* best effort */ }
+    host.style.cursor = grab === 'band' ? 'grabbing' : 'ew-resize';
+    e.preventDefault();
+  };
+  host.onpointermove = e => {
+    const box = host.getBoundingClientRect();
+    const grabR = DUP_THUMB / 2 + 2;
+    if (!borrowDrag || borrowDrag.which !== which) {
+      // no grab: a bare move only says what a press HERE would take. It must
+      // never write -- a pointer merely crossing the track would rewrite the
+      // windows out from under the author.
+      const held = read();
+      const x = e.clientX - box.left;
+      host.style.cursor = (Math.abs(x - borrowX(held.near, box.width)) <= grabR
+        || Math.abs(x - borrowX(held.far, box.width)) <= grabR) ? 'ew-resize' : 'grab';
+      return;
+    }
+    const d = borrowDrag;
+    const v = borrowSec(e.clientX - box.left, box.width);
+    let far = d.far0, near = d.near0;
+    if (d.grab === 'far') {
+      far = Math.max(near + BORROW_MIN_LEN, v);
+    } else if (d.grab === 'near') {
+      near = Math.max(0, Math.min(far - BORROW_MIN_LEN, v));
+    } else {
+      // A pull on the middle carries the window whole. Clamping the ends
+      // separately would let one arrive early and silently narrow the window --
+      // the hand asked to move it, not reshape it.
+      const span = Math.max(1, box.width - DUP_THUMB);
+      const dd = ((e.clientX - d.x0) / span) * BORROW_MAX_LEN;
+      const travel = Math.max(-d.near0, Math.min(dd, BORROW_MAX_LEN - d.far0));
+      near = d.near0 + travel;
+      far = d.far0 + travel;
+    }
+    far = Math.max(BORROW_MIN_LEN, Math.min(BORROW_HARD_LEN, far));
+    near = Math.max(0, Math.min(far - BORROW_MIN_LEN, near));
+    d.ends = { far, near };
+    write(far, near);
+    borrowPaintEnds();
+    showPeek(far, near);
+  };
+  const letGo = e => {
+    if (!borrowDrag || borrowDrag.which !== which) return;
+    const done = borrowDrag.ends;
+    borrowDrag = null;
+    host.style.cursor = 'grab';
+    try { host.releasePointerCapture(e.pointerId); } catch (err) { /* best effort */ }
+    editBorrow(s => setBorrowEnds(s, which, done.far, done.near));
+    clearPeek();
+    borrowPaintEnds();
+  };
+  host.onpointerup = letGo;
+  host.onpointercancel = letGo;
+  host.onlostpointercapture = () => {
+    if (borrowDrag && borrowDrag.which === which) borrowDrag = null;
+  };
+  host.style.cursor = 'grab';
 }
 function editBorrow(fn, label) {
   const s = borrowSeg();
@@ -5087,15 +5280,18 @@ function renderBorrowPanel() {
   $('bbSide0').checked = side === 0;
   $('bbSide1').checked = side === 1;
   $('bbSide2').checked = side === 2;
-  const before = borrowLenOf(s, 'before');
-  const after = borrowLenOf(s, 'after');
-  setBorrowField('bbBefore', before.toFixed(2));
-  setBorrowField('bbAfter', after.toFixed(2));
+  const b = borrowEnds(s, 'before');
+  const a = borrowEnds(s, 'after');
+  setBorrowField('bbBeforeFar', b.far.toFixed(2));
+  setBorrowField('bbBeforeNear', b.near.toFixed(2));
+  setBorrowField('bbAfterFar', a.far.toFixed(2));
+  setBorrowField('bbAfterNear', a.near.toFixed(2));
   setBorrowField('bbAmount', String(Math.round(borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT) * 100)));
   setBorrowField('bbTravel', borrowNum(s.travel, 1, 0.2, 3).toFixed(2));
   setBorrowField('bbFreq', borrowNum(s.freq, 1, 0.2, 3).toFixed(2));
   if ($('bbLegacy')) $('bbLegacy').checked = !!s.legacy;
   labelBorrowAt(s);
+  borrowPaintEnds();
 }
 /** Write one knob's number box AND its slider together. They are one value with
  *  two handles, so a repaint that moved only one of them would leave the panel
@@ -5592,43 +5788,52 @@ for (const [id, want] of [['bbSide0', 0], ['bbSide1', 1], ['bbSide2', 2]]) {
 function setBorrowSide(s, want) {
   s.side = borrowSide({ side: want });
   if ((want === 0 || want === 2) && !s.refBefore) {
-    s.refBefore = borrowWindow(s, 'before', borrowLenOf(s, 'before'));
+    const e = borrowEnds(s, 'before');
+    s.refBefore = borrowWindow(s, 'before', e.far, e.near);
   }
   if ((want === 1 || want === 2) && !s.refAfter) {
-    s.refAfter = borrowWindow(s, 'after', borrowLenOf(s, 'after'));
+    const e = borrowEnds(s, 'after');
+    s.refAfter = borrowWindow(s, 'after', e.far, e.near);
   }
   if (want === 0) s.refAfter = null;
   if (want === 1) s.refBefore = null;
 }
 
-/** Read one length field, in seconds.
+/** Read one window field, in seconds.
  *
  *  NOT held to the slider track. Typing 12 into the box keeps 12: the field is
- *  the authority and the slider is a convenience, so a value past its reach
+ *  the authority and the track is a convenience, so a value past its reach
  *  leaves the handle pinned at the end while the number stands. Only the hard
  *  ceiling applies, and that one exists because past it the thing on the other
- *  side of the seam is not a neighbour any more. */
+ *  side of the seam is not a neighbour any more. Rounded to the field's own
+ *  step so a dragged 0.8371 does not sit in the box as a number nobody can
+ *  retype. */
 function borrowLenValue(v) {
   const n = Number(v);
-  if (!isFinite(n)) return BORROW_DEF_LEN;
-  return Math.max(0, Math.min(BORROW_HARD_LEN, n));
+  if (!isFinite(n)) return BORROW_DEF_FAR;
+  const q = Math.round(n / BORROW_STEP) * BORROW_STEP;
+  return Math.max(0, Math.min(BORROW_HARD_LEN, q));
 }
-/** Wire one side's number box and slider to the same field.
+/** Wire one number box to one end of one window.
  *
- *  Both write the frozen window, and both write it the same way, so there is one
- *  answer to "how long is it reading" no matter which of the two was used. The
- *  peek overlay follows the value being chosen rather than the value in force --
- *  that is the whole point of showing it while a hand is on the control -- and it
- *  is cleared when the control is let go, so it never sits over the script.
- */
-function borrowLen(id, which) {
+ *  Typing writes the same field a drag does, so there is one answer to "what is
+ *  it reading" no matter which of the two was used -- and the other end of the
+ *  pair is read first, because moving one end past the other has to be read as
+ *  a clip and not as a window turned inside out. The peek overlay follows the
+ *  number being chosen rather than the number in force, which is the whole
+ *  point of showing it while a hand is on the control, and it is cleared when
+ *  the control is let go so it never sits over the script. */
+function borrowSecBox(id, which, key) {
   const box = $(id);
-  const sl = $(id + 'S');
-  if (!box && !sl) return;
-  const peek = v => {
+  if (!box) return;
+  const live = () => {
+    const s = borrowSeg();
+    return s ? borrowEnds(s, which) : { far: BORROW_DEF_FAR, near: BORROW_DEF_NEAR };
+  };
+  const showPeek = (far, near) => {
     const s = borrowSeg();
     if (!s) return;
-    const w = borrowWindow(s, which, borrowLenValue(v));
+    const w = borrowWindow(s, which, far, near);
     borrowPeek = w ? [w] : [];
     invalidate();
   };
@@ -5640,37 +5845,35 @@ function borrowLen(id, which) {
     borrowPeek = r ? [[r[0], r[1]]] : [];
     invalidate();
   };
-  // Drag: the overlay tracks the number, no commit -- a slider that posted on
-  // every pixel would rewrite the script a hundred times for one gesture.
-  for (const el of [box, sl]) {
-    if (!el) continue;
-    el.oninput = () => {
-      const v = borrowLenValue(el.value);
-      if (box && box !== el) box.value = v.toFixed(2);
-      if (sl && sl !== el) sl.value = String(v);
-      peek(v);
-    };
-    el.onfocus = showInForce;
-    el.onpointerdown = showInForce;
-    el.onblur = clearPeek;
-    el.onpointerup = clearPeek;
-    // Release: one commit, one post, and the side is whatever the windows now are.
-    el.onchange = () => {
-      const v = borrowLenValue(el.value);
-      editBorrow(s => {
-        const w = borrowWindow(s, which, v);
-        if (which === 'before') s.refBefore = w; else s.refAfter = w;
-        if (s.refBefore && s.refAfter) s.side = 2;
-        else if (s.refBefore) s.side = 0;
-        else if (s.refAfter) s.side = 1;
-        else s.side = 2;
-      });
-      clearPeek();
-    };
-  }
+  box.oninput = () => {
+    const held = live();
+    const v = borrowLenValue(box.value);
+    const far = key === 'far' ? Math.max(BORROW_MIN_LEN, v) : held.far;
+    const near = key === 'near' ? v : held.near;
+    showPeek(far, near);
+  };
+  box.onfocus = showInForce;
+  box.onpointerdown = showInForce;
+  box.onblur = clearPeek;
+  // Release: one commit, one post, and the side is whatever the windows now are.
+  box.onchange = () => {
+    const s = borrowSeg();
+    if (!s) return;
+    const held = borrowEnds(s, which);
+    const v = borrowLenValue(box.value);
+    const far = key === 'far' ? Math.max(BORROW_MIN_LEN, v) : held.far;
+    const near = key === 'near' ? v : held.near;
+    editBorrow(sp => setBorrowEnds(sp, which, far, near));
+    clearPeek();
+    borrowPaintEnds();
+  };
 }
-borrowLen('bbBefore', 'before');
-borrowLen('bbAfter', 'after');
+borrowSecBox('bbBeforeNear', 'before', 'near');
+borrowSecBox('bbBeforeFar', 'before', 'far');
+borrowSecBox('bbAfterNear', 'after', 'near');
+borrowSecBox('bbAfterFar', 'after', 'far');
+borrowDual('before');
+borrowDual('after');
 
 /** The three one-number knobs, each a box and a slider on the same value. */
 function borrowKnob(id, lo, hi, apply, asPercent) {

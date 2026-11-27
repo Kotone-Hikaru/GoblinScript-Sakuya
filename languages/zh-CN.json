@@ -598,6 +598,8 @@
   "page.borrow.len": "取",
   "page.borrow.sec": "秒（前）",
   "page.borrow.sec2": "秒（后）",
+  "page.borrow.near": "近",
+  "page.borrow.far": "远",
   "page.borrow.amount": "比例",
   "page.borrow.pct": "%",
   "page.borrow.travel": "幅度",

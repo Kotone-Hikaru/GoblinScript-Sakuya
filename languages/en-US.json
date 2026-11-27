@@ -550,6 +550,8 @@
   "page.borrow.len": "take",
   "page.borrow.sec": "s before",
   "page.borrow.sec2": "s after",
+  "page.borrow.near": "near",
+  "page.borrow.far": "far",
   "page.borrow.amount": "amount",
   "page.borrow.pct": "%",
   "page.borrow.travel": "reach",
