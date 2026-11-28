@@ -154,13 +154,15 @@ carries two extra models, trained here rather than shipped by upstream -- see
 [the two anime models](#the-two-anime-models), which also says why you should
 keep using the default one unless your footage looks like their training set.
 
-Three of these are about drafting -- how a script is cut into pieces, how a piece
-can be drawn rather than modelled, and how the GPU is kept usable while it works.
-The last three are about the other half of the job, the hours spent *watching and
+Four of these are about drafting -- how a script is cut into pieces, how a piece
+can be drawn rather than modelled, how a passage the models read badly can be
+written from the passages beside it, and how the GPU is kept usable while it
+works. Three are about the other half of the job, the hours spent *watching and
 deciding*: covering a picture that should not be read over your shoulder, judging
 a batch's crops in one sitting, and a window that comes forward when it needs you.
-They are the cheapest things here, and the first one is worth knowing before you
-open a video at work.
+The last is a way to watch the script move on a device while you cut it. They are
+the cheapest things here, and the first of that second group is worth knowing
+before you open a video at work.
 
 ### The spanning bench
 
@@ -209,6 +211,87 @@ reaches exactly 0 and 100 instead of stopping a row short. Two switches per
 piece let it ignore the speed cap (**ignore limits**) and the video's shot cuts
 (**ignore cuts**) -- the latter on by default, since a cut in the footage is not
 a cut in your drawing.
+
+### Generating a piece from its neighbours
+
+A passage the models read badly -- a shot the perception could not make sense of,
+a stretch where the motion is too small to measure -- used to leave two options:
+re-draft it with another model, or draw it by hand. There is now a third: read
+the passages on either side and write this one from their shape.
+
+**generate from the neighbours** sits in the piece's right-click menu and in the
+panel that follows the selection. Each side has its own window, and **both ends of
+that window are placeable**: *near* is how far out from the seam the reading
+starts, *far* is how far it reaches, at 0.01 s steps. That pair is what makes it
+usable rather than a toy -- with a length alone the near end is nailed to the
+seam, and a stroke lying right on it drags the whole passage toward the flat part
+of the frame. The values are frozen when the piece is generated, in absolute
+milliseconds, so editing a neighbour afterwards cannot quietly rewrite a result
+the author has already looked at and kept. **freeze the windows** re-measures.
+
+What is borrowed is not only the motion. Three things move:
+
+* `vmarg` and `env` -- the strokes: how far each one travels, and the size of the
+  envelope around it.
+* the **carrier height**, held *beside* the tracks rather than written into
+  `level`. The composers low-pass `level` across the whole clip, so a change
+  there reaches 15 rows -- half a second -- past each seam and rewrites the
+  correct passage on the other side. Held beside it and blended in after the
+  low-pass, the neighbour's shape arrives where the author can see it and stops
+  at the edge of the piece.
+* the **reversal head**, when the bundle decodes its segmentation from it.
+  Without this the neighbour's shape lands on this piece's own vertex times, and
+  the passage looks like the old one shifted upward -- which is exactly the
+  report that made this half of the feature exist. With it the vertices move to
+  where the neighbour's reversals say they belong.
+
+The piece is also **kept out of the stages that average a row against its
+neighbours** -- the depth median and the level rail's ramp -- for a guard band of
+one second on each side, which is the reach of the low-pass those stages are
+built around. And the event decode itself is **cut at the piece's edges**: a
+sequence decode run over a whole shot moves every vertex in that shot when one
+passage in it changes, so it is run per stretch between generated pieces instead.
+
+Three knobs finish it. **amount**: 0 keeps the piece as it was, 1 gives it the
+neighbour's motion, and above 1 the difference is extrapolated -- at 2 the stroke
+travels twice as far from the piece's own as the neighbour's does, which is the
+only reading of "amount 150%" that is not a clamp pretending to be a knob.
+**travel** and **speed** scale the borrowed stroke's reach and its rate, 0.2 to 3.
+
+Measured on a 319.8 s clip, two pieces generated two seconds apart with a correct
+two seconds between them: the guard band drops the rows moved near each seam from
+15 to **none**, and cutting the decode at the piece edges drops the rows moved
+elsewhere in the same shot from 20 to **5**, the unaffected middle to 3 rows of at
+most 6 units. The vertices inside the generated pieces are genuinely re-timed --
+12 to 13 of them land on instants the original script never used.
+
+### A window onto the device
+
+A script is judged by how it *feels*, and a funscript under a video is not that.
+**device preview** in the rail opens a small floating window that drives real
+hardware from the playhead: it reads the position the current script holds at the
+video's time and streams it, sixty times a second, as
+[TCode](https://discuss.eroscripts.com/t/temu-tcode-3d-emulator/341132) -- the
+line protocol OSR2 and SR6 devices speak, and that every emulator of one
+understands.
+
+It is a bridge, not a viewer. The address is a `ws://` or `wss://` endpoint
+(TEMU+ listens on `ws://127.0.0.1:7778` once its WebSocket input is started), the
+panel shows the six axes live so you can see what is being told to the device,
+and the whole thing -- address, corner of the screen, whether it opens with the
+page -- is remembered in `settings.json`. Nothing is written and nothing extra is
+sampled: the number comes from the same interpolator the page draws with, so what
+the device does is what the script says. The window is draggable, closes to a
+single row in the rail, and drops its socket when the page goes away.
+
+Only `L0`, the stroke, is driven; the other five axes are held at the middle. A
+funscript is one number per moment and `L0` is the one it means, so driving the
+rest would be inventing motion the script does not contain.
+
+The alternative was to embed the emulator itself, and that was rejected on
+licence grounds rather than effort: the reference implementation is GPL-3.0 while
+this project is MIT, so baking it in would relicense the whole binary. Speaking
+its protocol needs none of that, and the same stream drives real hardware.
 
 ### A GPU throttle
 
@@ -386,6 +469,27 @@ the training was done and the evidence is real, not because it is recommended.
 Use `--model anime-v1` (or pick it in the review page) if your footage is anime
 or MMD. If it is not, leave the default alone.
 
+### Two models from the community
+
+The bundle also carries two models trained by **hartschteiler** on
+[eroScripts](https://discuss.eroscripts.com/t/temu-tcode-3d-emulator/341132)'s
+forum and shared there as a standalone bundle: `0.6.0-Community` (their
+`V3-lagfit` trunk, epoch 30) and `0.6.0-Community-v3fine` (their `TestV3fine`,
+epoch 5, which is what their launcher runs).
+
+On their own holdout -- 600 clips, about 200 hours of free scripts -- they report
+better averages than the `v0.6.0` arm they trained against: `corr` 0.554 to 0.620,
+`mae` 18.6 to 16.9, `kappa` 0.559 to 0.589. Read that as *their* measurement on
+*their* holdout; nothing here re-ran it, and the numbers are not comparable with
+the anime table above.
+
+The two were folded into this bundle rather than shipped as a second download,
+and that needed no re-export: their encoder and transnet are the same weights as
+this bundle's, initializer for initializer (194 and 82 of them, no differences),
+so only the three per-pack graphs are new. `TestV3fineExport` is byte-identical
+to `TestV3fine` and is carried once. The credit is theirs; the work done here was
+renaming, re-packing and checking the graphs line up.
+
 ### Smaller changes
 
 * The **#strip** has two transports: *play*, where it follows the video and a
@@ -434,8 +538,15 @@ or MMD. If it is not, leave the default alone.
   picker's wordmark, the error log, the `--serve` handshake), so they cannot
   disagree. A build with no repository -- a source tarball, no baseline tag --
   falls back to `.0` with a build warning rather than failing.
-* Every new string ships in both English and Chinese (147 keys added on top of
-  the fork's base, counted from `languages/en-US.json`).
+* The **piece rows on the left follow the playhead** while the video plays, the
+  same way the model menu under the picture always has. A half-typed number in a
+  row stops that row being redrawn, so an edit in progress is never stolen.
+* Camera-cut **easing defaults to off**. It was on, and on footage with hard cuts
+  a little easing is the wrong answer more often than the right one; `--cut-ease
+  250` still has it.
+* Every new string ships in both English and Chinese; `languages/en-US.json` is
+  the authority for what exists, and `zh-CN.json` carries the same set plus the
+  translated command-line help.
 
 ## What you need
 
