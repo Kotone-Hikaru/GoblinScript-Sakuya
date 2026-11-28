@@ -586,6 +586,5 @@
   "page.tcp.live": "driving {url}",
   "page.tcp.failed": "could not reach {url} \u2014 is TEMU+ listening?",
   "page.tcp.closed": "the socket closed",
-  "page.tcp.off": "not connected",
-  "page.borrow.legacy": "the old rules"
+  "page.tcp.off": "not connected"
 }

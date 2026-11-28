@@ -901,17 +901,6 @@
             <span data-t="page.borrow.times2">x</span>
             <input id="bbFreqS" class="wpslider" type="range" min="0.2" max="3" step="0.05">
           </div>
-          <!-- The first version of this feature, kept as a switch so an author
-               can put the two side by side on the same piece. It writes the
-               borrowed carrier straight into the level track, so the whole-clip
-               low-pass carries it 15 rows past each seam -- exactly what used to
-               rewrite the correct stretch between two pieces -- and it leaves the
-               reversal head alone, so the neighbour's shape lands on this piece's
-               own vertex times. Off by default. -->
-          <div class="wprow bbsides">
-            <span class="unlockopt"><input type="checkbox" id="bbLegacy">
-              <label for="bbLegacy" data-t="page.borrow.legacy">the old rules</label></span>
-          </div>
           <div class="wprow">
             <span id="bbAt" class="wpnote"></span>
             <span class="wpsp"></span>
@@ -4021,10 +4010,7 @@ function partitionOf(c) {
                refBefore: e.ref_before || null, refAfter: e.ref_after || null,
                amount: (e.amount == null ? 1 : e.amount),
                travel: (e.travel == null ? 1 : e.travel),
-               freq: (e.freq == null ? 1 : e.freq),
-               // the old-rules switch. Absent (every span written before it
-               // existed, and every piece the page never toggled) reads as off.
-               legacy: !!e.legacy });
+               freq: (e.freq == null ? 1 : e.freq) });
     t = hi;
   }
   if (t < dur) out.push({ lo: t, hi: dur, model: c.model, gap: true });
@@ -4061,10 +4047,6 @@ function spansPayload() {
                  o.amount = borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT);
                  o.travel = borrowNum(s.travel, 1, 0.2, 3);
                  o.freq = borrowNum(s.freq, 1, 0.2, 3);
-                // Only when it is on: an ordinary piece sends exactly the
-                // shape it always did, so nothing on the wire changes for
-                // authors who never touch the switch.
-                if (s.legacy) o.legacy = true;
                } else if (pieceScale(s) !== 1) {
                  // 1 is the model's own answer, and absent means 1
                  o.scale = pieceScale(s);
@@ -5289,7 +5271,6 @@ function renderBorrowPanel() {
   setBorrowField('bbAmount', String(Math.round(borrowNum(s.amount, 1, 0, BORROW_MAX_AMOUNT) * 100)));
   setBorrowField('bbTravel', borrowNum(s.travel, 1, 0.2, 3).toFixed(2));
   setBorrowField('bbFreq', borrowNum(s.freq, 1, 0.2, 3).toFixed(2));
-  if ($('bbLegacy')) $('bbLegacy').checked = !!s.legacy;
   labelBorrowAt(s);
   borrowPaintEnds();
 }
@@ -5910,13 +5891,6 @@ borrowKnob('bbAmount', 0, BORROW_MAX_AMOUNT * 100,
            (s, v) => { if (s) s.amount = v / 100; }, true);
 borrowKnob('bbTravel', 0.2, 3, (s, v) => { if (s) s.travel = v; }, false);
 borrowKnob('bbFreq', 0.2, 3, (s, v) => { if (s) s.freq = v; }, false);
-// The comparison switch. It only ever changes how the NEXT compose treats this
-// piece -- nothing is measured again, and the windows stay exactly as they are.
-if ($('bbLegacy')) $('bbLegacy').onchange = () => {
-  const on = $('bbLegacy').checked;
-  editBorrow(s => { s.legacy = on; });
-};
-
 // The one control that measures again. Everything else in this panel edits what
 // is already frozen, so a neighbour moving afterwards cannot rewrite a piece the
 // author has already looked at and kept -- which is the whole reason the windows

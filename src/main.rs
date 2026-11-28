@@ -1911,19 +1911,14 @@ fn mixed_tracks(
             amount: sp.amount,
             travel: sp.travel,
             freq: sp.freq,
-            legacy: sp.legacy.unwrap_or(false),
         };
         mixed.borrow_rows(lo, hi, &plan);
         // The piece's own rows, plus a guard band on each side, are kept off the
         // stages that average a row against its neighbours. Without it, the
         // passage on the far side of the seam gets dragged toward the one just
         // generated -- which is exactly the "the model's rows near a generated
-        // piece look wrong" report (user call, 2026-11-28). The legacy path is
-        // left without a band on purpose: the first version had none, and its
-        // whole point in staying reachable is to be comparable as it was.
-        if !sp.legacy.unwrap_or(false) {
-            protect_ms.push((sp.lo_ms, sp.hi_ms));
-        }
+        // piece look wrong" report (user call, 2026-11-28).
+        protect_ms.push((sp.lo_ms, sp.hi_ms));
     }
     // Each ordinary piece's own intensity, about its own mean. Handed BACK to
     // the styler rather than applied here: the level rows are upstream of
@@ -5274,8 +5269,7 @@ mod retrack_tests {
                 amount: 1.0,
                 travel: 1.0,
                 freq: 1.0,
-                legacy: None,
-            }],
+                }],
             cuts_ms: Some(cuts1.clone()),
         };
         review_style(&mut d, &b, &p, &spanned, &compare).unwrap();

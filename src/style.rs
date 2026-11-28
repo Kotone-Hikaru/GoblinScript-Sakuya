@@ -643,14 +643,6 @@ pub struct BorrowPlan {
     /// How fast to walk the source window. 1 plays it at its own speed; above
     /// 1 packs it in tighter, so it wraps more often.
     pub freq: f64,
-    /// The first version of this feature, kept reachable so an author can see
-    /// what changed (user call, 2026-11-28). It writes the borrowed carrier
-    /// straight into `level`, which the composers then low-pass across the whole
-    /// clip -- so its reach is 15 rows past each seam -- and it leaves `rev`
-    /// alone, so the neighbour's shape lands on this piece's own vertices. Both
-    /// are the defects the current path exists to fix; `amount` also stops at 1
-    /// because extrapolation came later. Nothing new should set this.
-    pub legacy: bool,
 }
 
 impl Tracks {
@@ -730,7 +722,7 @@ impl Tracks {
         // vertices, which is the "same points, shifted" look the workbench
         // reported. Only valid when this track carries one and the piece is at
         // least one row long.
-        let borrow_rev = self.rev.is_some() && len > 0 && !plan.legacy;
+        let borrow_rev = self.rev.is_some() && len > 0;
         let mut rt = vec![0.0f64; len];
         let mut rb = vec![0.0f64; len];
         for i in 0..len {
@@ -785,18 +777,11 @@ impl Tracks {
         // is what the level head said this passage sits at, and a splice that
         // ignored that would teleport the pen at the first row.
         let lift = self.level[lo] - lv[0];
-        // ... and where it GOES depends on which path this is.
-        //
-        // The current path stores it beside the tracks (`borrow_level` /
-        // `borrow_w`) for the composers to blend in after their low-pass. The
-        // legacy path writes `level` itself, exactly as the first version did:
-        // the whole-clip `box_same(level, kd)` then carries the change 15 rows
-        // past each seam, which is the fault it was kept around to demonstrate
-        // (user call, 2026-11-28).
-        if plan.legacy {
-            self.borrow_level = Vec::new();
-            self.borrow_w = Vec::new();
-        } else if self.borrow_level.len() != n {
+        // It goes beside the tracks (`borrow_level` / `borrow_w`), not into
+        // `level`: the composers low-pass `level` across the whole clip, so a
+        // borrowed carrier written there would reach 15 rows past each seam and
+        // rewrite the correct passage on the other side of it.
+        if self.borrow_level.len() != n {
             self.borrow_level = vec![0.0; n];
             self.borrow_w = vec![0.0; n];
         }
@@ -804,13 +789,7 @@ impl Tracks {
         // above 1 the difference is EXTRAPOLATED: at 2 the stroke travels twice
         // as far from the piece's own as the neighbour's does. That is the only
         // reading of "amount 150%" that is not a clamp pretending to be a knob.
-        // The legacy path predates extrapolation, so it stops at a plain
-        // replacement.
-        let amount = if plan.legacy {
-            plan.amount.clamp(0.0, 1.0)
-        } else {
-            plan.amount.clamp(0.0, MAX_BORROW_AMOUNT)
-        };
+        let amount = plan.amount.clamp(0.0, MAX_BORROW_AMOUNT);
         for i in 0..len {
             // Full strength in the middle, easing to nothing at each seam.
             let edge = i.min(len - 1 - i);
@@ -818,12 +797,8 @@ impl Tracks {
             let r = lo + i;
             self.vmarg[r] += t * (vm[i] - self.vmarg[r]);
             self.env[r] += t * (ev[i] - self.env[r]);
-            if plan.legacy {
-                self.level[r] += t * (lv[i] + lift - self.level[r]);
-            } else {
-                self.borrow_level[r] += t * (lv[i] + lift - self.borrow_level[r]);
-                self.borrow_w[r] = (self.borrow_w[r] + t).min(1.0);
-            }
+            self.borrow_level[r] += t * (lv[i] + lift - self.borrow_level[r]);
+            self.borrow_w[r] = (self.borrow_w[r] + t).min(1.0);
         }
         // The reversal head is written straight into the track: the decoder
         // reads it raw, no low-pass runs over it, so a borrowed row cannot reach
@@ -4200,7 +4175,6 @@ mod tests {
             amount: 1.0,
             travel: 1.0,
             freq: 1.0,
-            legacy: false,
         };
         let p2 = super::BorrowPlan {
             before: Some((90, 105)),
@@ -4208,7 +4182,6 @@ mod tests {
             amount: 1.0,
             travel: 1.0,
             freq: 1.0,
-            legacy: false,
         };
         assert!(b.borrow_rows(60, 75, &p1));
         assert!(b.borrow_rows(105, 120, &p2));
@@ -5000,7 +4973,7 @@ mod borrow_tests {
 
     fn plan(before: Option<(usize, usize)>, after: Option<(usize, usize)>,
             amount: f64, travel: f64, freq: f64) -> BorrowPlan {
-        BorrowPlan { before, after, amount, travel, freq, legacy: false }
+        BorrowPlan { before, after, amount, travel, freq }
     }
 
     /// The ramp is the point: full strength is reached on the 4th row from a
